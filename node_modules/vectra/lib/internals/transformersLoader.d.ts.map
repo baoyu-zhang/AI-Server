@@ -1,0 +1,1 @@
+{"version":3,"file":"transformersLoader.d.ts","sourceRoot":"","sources":["../../src/internals/transformersLoader.ts"],"names":[],"mappings":"AAAA;;;;;;;;;;GAUG;AACH,KAAK,mBAAmB,GAAG,cAAc,2BAA2B,CAAC,CAAC;AAatE;;;GAGG;AACH,wBAAsB,gBAAgB,IAAI,OAAO,CAAC,mBAAmB,CAAC,CAErE;AAED;;;;GAIG;AACH,wBAAgB,sBAAsB,CAClC,EAAE,EAAE,CAAC,MAAM,OAAO,CAAC,mBAAmB,CAAC,CAAC,GAAG,SAAS,GACrD,IAAI,CAeN"}

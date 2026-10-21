@@ -1,0 +1,30 @@
+{
+  "name": "server",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "test:agui": "node test-agui-protocol.mjs"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@ag-ui/encoder": "^1.0.3",
+    "@ai-sdk/deepseek": "^3.0.67",
+    "@ai-sdk/openai": "^4.0.96",
+    "@deepseek-kit/tokenizer": "^0.0.1",
+    "@xenova/transformers": "^2.17.2",
+    "ai": "^7.0.143",
+    "axios": "^1.20.0",
+    "cors": "^2.8.6",
+    "dotenv": "^18.0.8",
+    "express": "^5.3.0",
+    "js-tiktoken": "^1.0.21",
+    "markdown-it": "^15.0.3",
+    "multer": "^2.4.0",
+    "pdf-parse": "^2.4.5",
+    "vectra": "^0.15.0"
+  }
+}

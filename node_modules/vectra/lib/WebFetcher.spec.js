@@ -1,0 +1,263 @@
+"use strict";
+var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, generator) {
+    function adopt(value) { return value instanceof P ? value : new P(function (resolve) { resolve(value); }); }
+    return new (P || (P = Promise))(function (resolve, reject) {
+        function fulfilled(value) { try { step(generator.next(value)); } catch (e) { reject(e); } }
+        function rejected(value) { try { step(generator["throw"](value)); } catch (e) { reject(e); } }
+        function step(result) { result.done ? resolve(result.value) : adopt(result.value).then(fulfilled, rejected); }
+        step((generator = generator.apply(thisArg, _arguments || [])).next());
+    });
+};
+var __importDefault = (this && this.__importDefault) || function (mod) {
+    return (mod && mod.__esModule) ? mod : { "default": mod };
+};
+Object.defineProperty(exports, "__esModule", { value: true });
+const node_assert_1 = __importDefault(require("node:assert"));
+const mocha_1 = require("mocha");
+const sinon_1 = __importDefault(require("sinon"));
+const WebFetcher_1 = require("./WebFetcher");
+(0, mocha_1.describe)("WebFetcher", () => {
+    let sandbox;
+    let fetchStub;
+    let lastUrl;
+    let lastInit;
+    function makeFetchResponse(status, data, contentType) {
+        return {
+            status,
+            statusText: status >= 400 ? `HTTP ${status}` : 'OK',
+            ok: status >= 200 && status < 300,
+            headers: new Headers({ 'content-type': contentType }),
+            text: () => __awaiter(this, void 0, void 0, function* () { return data; }),
+            json: () => __awaiter(this, void 0, void 0, function* () { return JSON.parse(data); }),
+        };
+    }
+    (0, mocha_1.beforeEach)(() => {
+        sandbox = sinon_1.default.createSandbox();
+        fetchStub = sandbox.stub(globalThis, 'fetch').callsFake((input, init) => __awaiter(void 0, void 0, void 0, function* () {
+            lastUrl = typeof input === 'string' ? input : input.url;
+            lastInit = init;
+            return makeFetchResponse(200, 'ok', 'text/plain');
+        }));
+        lastUrl = undefined;
+        lastInit = undefined;
+    });
+    (0, mocha_1.afterEach)(() => {
+        sandbox.restore();
+    });
+    (0, mocha_1.it)("constructor uses defaults and merges config", () => {
+        const fetcherDefault = new WebFetcher_1.WebFetcher();
+        node_assert_1.default.strictEqual(fetcherDefault["_config"].htmlToMarkdown, true);
+        node_assert_1.default.strictEqual(fetcherDefault["_config"].summarizeHtml, false);
+        const custom = {
+            htmlToMarkdown: false,
+            summarizeHtml: true,
+            headers: { Accept: "custom/type", "User-Agent": "custom-agent" },
+            requestConfig: { signal: AbortSignal.timeout(123) },
+        };
+        const fetcher = new WebFetcher_1.WebFetcher(custom);
+        node_assert_1.default.strictEqual(fetcher["_config"].htmlToMarkdown, false);
+        node_assert_1.default.strictEqual(fetcher["_config"].summarizeHtml, true);
+        node_assert_1.default.deepStrictEqual(fetcher["_config"].headers, {
+            Accept: "custom/type",
+            "User-Agent": "custom-agent",
+        });
+        node_assert_1.default.ok(fetcher["_config"].requestConfig);
+    });
+    (0, mocha_1.it)("throws on HTTP error (>=400)", () => __awaiter(void 0, void 0, void 0, function* () {
+        fetchStub.resolves(makeFetchResponse(404, '<html></html>', 'text/html'));
+        const fetcher = new WebFetcher_1.WebFetcher();
+        yield node_assert_1.default.rejects(() => fetcher.fetch("https://example.com/404", () => __awaiter(void 0, void 0, void 0, function* () { return true; })), /Site returned an HTTP status of 404/);
+    }));
+    (0, mocha_1.it)("throws on invalid content-type", () => __awaiter(void 0, void 0, void 0, function* () {
+        fetchStub.resolves(makeFetchResponse(200, '…', 'image/png'));
+        const fetcher = new WebFetcher_1.WebFetcher();
+        yield node_assert_1.default.rejects(() => fetcher.fetch("https://example.com/img", () => __awaiter(void 0, void 0, void 0, function* () { return true; })), /Site returned an invalid content type of image\/png/);
+    }));
+    (0, mocha_1.it)("handles text/html with htmlToMarkdown=true with tables, alignments, and link rewriting", () => __awaiter(void 0, void 0, void 0, function* () {
+        const html = `
+      <html><body>
+        <script>evil()</script>
+        <a href="/rel">relative</a>
+        <a href="//cdn.example.com/lib.js">proto-rel</a>
+        <table>
+          <thead>
+            <tr>
+              <th align="left">H1</th>
+              <th align="right">H2</th>
+              <th align="center">H3</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Cell&nbsp;1</td>
+              <td>Cell\t2</td>
+              <td>Cell\n3</td>
+            </tr>
+          </tbody>
+        </table>
+        <table>
+          <tbody>
+            <tr><th>A</th><th>B</th></tr>
+            <tr><td>a</td><td>b</td></tr>
+          </tbody>
+        </table>
+      </body></html>
+    `;
+        fetchStub.resolves(makeFetchResponse(200, html, 'text/html'));
+        const fetcher = new WebFetcher_1.WebFetcher({ htmlToMarkdown: true });
+        const calls = [];
+        const onDocument = (uri, text, docType) => __awaiter(void 0, void 0, void 0, function* () {
+            calls.push([uri, text, docType]);
+            return true;
+        });
+        const ok = yield fetcher.fetch("https://example.com/page", onDocument);
+        node_assert_1.default.strictEqual(ok, true);
+        node_assert_1.default.strictEqual(calls.length, 1);
+        const [uri, md, docType] = calls[0];
+        node_assert_1.default.strictEqual(uri, "https://example.com/page");
+        node_assert_1.default.strictEqual(docType, "md");
+        node_assert_1.default.ok(!String(md).includes("<script>"));
+        node_assert_1.default.ok(String(md).includes("https://example.com/rel"));
+        node_assert_1.default.ok(String(md).includes("https://cdn.example.com/lib.js"));
+        node_assert_1.default.ok(String(md).includes("| H1 | H2 | H3 |"));
+        node_assert_1.default.ok(String(md).includes("| :-- | --: | :-: |"));
+        node_assert_1.default.ok(String(md).includes("| Cell 1 | Cell 2 | Cell 3 |"));
+        node_assert_1.default.ok(String(md).includes("| A | B |"));
+    }));
+    (0, mocha_1.it)("handles text/html with htmlToMarkdown=false (passes raw html, docType 'html')", () => __awaiter(void 0, void 0, void 0, function* () {
+        const html = "<html><body><p>content</p></body></html>";
+        fetchStub.resolves(makeFetchResponse(200, html, 'text/html'));
+        const fetcher = new WebFetcher_1.WebFetcher({ htmlToMarkdown: false });
+        const calls = [];
+        const onDocument = (uri, text, docType) => __awaiter(void 0, void 0, void 0, function* () {
+            calls.push([uri, text, docType]);
+            return true;
+        });
+        const ok = yield fetcher.fetch("https://example.com/raw", onDocument);
+        node_assert_1.default.strictEqual(ok, true);
+        node_assert_1.default.strictEqual(calls.length, 1);
+        const [_, text, docType] = calls[0];
+        node_assert_1.default.strictEqual(docType, "html");
+        node_assert_1.default.strictEqual(text, html);
+    }));
+    (0, mocha_1.it)("handles application/json; charset=… (docType 'json')", () => __awaiter(void 0, void 0, void 0, function* () {
+        const json = '{"a":1}';
+        fetchStub.resolves(makeFetchResponse(200, json, 'application/json; charset=utf-8'));
+        const fetcher = new WebFetcher_1.WebFetcher();
+        const calls = [];
+        const onDocument = (...args) => __awaiter(void 0, void 0, void 0, function* () {
+            calls.push(args);
+            return true;
+        });
+        const ok = yield fetcher.fetch("https://example.com/data", onDocument);
+        node_assert_1.default.strictEqual(ok, true);
+        node_assert_1.default.strictEqual(calls[0][2], "json");
+        node_assert_1.default.strictEqual(calls[0][1], json);
+    }));
+    (0, mocha_1.it)("handles application/xml (docType 'xml')", () => __awaiter(void 0, void 0, void 0, function* () {
+        const xml = "<root/>";
+        fetchStub.resolves(makeFetchResponse(200, xml, 'application/xml'));
+        const fetcher = new WebFetcher_1.WebFetcher();
+        const calls = [];
+        const onDocument = (...args) => __awaiter(void 0, void 0, void 0, function* () {
+            calls.push(args);
+            return true;
+        });
+        const ok = yield fetcher.fetch("https://example.com/xml", onDocument);
+        node_assert_1.default.strictEqual(ok, true);
+        node_assert_1.default.strictEqual(calls[0][2], "xml");
+        node_assert_1.default.strictEqual(calls[0][1], xml);
+    }));
+    (0, mocha_1.it)("handles application/javascript (docType 'javascript')", () => __awaiter(void 0, void 0, void 0, function* () {
+        const js = "console.log('hi');";
+        fetchStub.resolves(makeFetchResponse(200, js, 'application/javascript'));
+        const fetcher = new WebFetcher_1.WebFetcher();
+        const calls = [];
+        const onDocument = (...args) => __awaiter(void 0, void 0, void 0, function* () {
+            calls.push(args);
+            return true;
+        });
+        const ok = yield fetcher.fetch("https://example.com/app.js", onDocument);
+        node_assert_1.default.strictEqual(ok, true);
+        node_assert_1.default.strictEqual(calls[0][2], "javascript");
+        node_assert_1.default.strictEqual(calls[0][1], js);
+    }));
+    (0, mocha_1.it)("handles text/plain (docType undefined)", () => __awaiter(void 0, void 0, void 0, function* () {
+        const text = "plain";
+        fetchStub.resolves(makeFetchResponse(200, text, 'text/plain'));
+        const fetcher = new WebFetcher_1.WebFetcher();
+        const calls = [];
+        const onDocument = (...args) => __awaiter(void 0, void 0, void 0, function* () {
+            calls.push(args);
+            return true;
+        });
+        const ok = yield fetcher.fetch("https://example.com/txt", onDocument);
+        node_assert_1.default.strictEqual(ok, true);
+        node_assert_1.default.strictEqual(calls[0][2], undefined);
+        node_assert_1.default.strictEqual(calls[0][1], text);
+    }));
+    (0, mocha_1.it)("sets Host and Alt-Used to request hostname; merges and does not mutate caller headers", () => __awaiter(void 0, void 0, void 0, function* () {
+        let capturedUrl;
+        let capturedInit;
+        fetchStub.callsFake((url, init) => __awaiter(void 0, void 0, void 0, function* () {
+            capturedUrl = url;
+            capturedInit = init;
+            return makeFetchResponse(200, 'ok', 'text/plain');
+        }));
+        const userHeaders = {
+            Accept: "custom/type",
+            "User-Agent": "custom-agent",
+        };
+        const fetcher = new WebFetcher_1.WebFetcher({ headers: userHeaders });
+        const onDocument = () => __awaiter(void 0, void 0, void 0, function* () { return true; });
+        const url = "https://host.example.com/path?q=1";
+        const ok = yield fetcher.fetch(url, onDocument);
+        node_assert_1.default.strictEqual(ok, true);
+        node_assert_1.default.strictEqual(capturedUrl, url);
+        node_assert_1.default.ok(capturedInit);
+        node_assert_1.default.ok(capturedInit.headers);
+        const headers = capturedInit.headers;
+        node_assert_1.default.strictEqual(headers.Host, "host.example.com");
+        node_assert_1.default.strictEqual(headers["Alt-Used"], "host.example.com");
+        node_assert_1.default.strictEqual(headers.Accept, "custom/type");
+        node_assert_1.default.strictEqual(headers["User-Agent"], "custom-agent");
+        node_assert_1.default.strictEqual(userHeaders.Host, undefined);
+        node_assert_1.default.strictEqual(userHeaders["Alt-Used"], undefined);
+    }));
+    (0, mocha_1.it)("merges requestConfig options into fetch call", () => __awaiter(void 0, void 0, void 0, function* () {
+        let capturedInit;
+        fetchStub.callsFake((_url, init) => __awaiter(void 0, void 0, void 0, function* () {
+            capturedInit = init;
+            return makeFetchResponse(200, 'ok', 'text/plain');
+        }));
+        const fetcher = new WebFetcher_1.WebFetcher({
+            requestConfig: { keepalive: true },
+        });
+        const ok = yield fetcher.fetch("https://example.com", () => __awaiter(void 0, void 0, void 0, function* () { return true; }));
+        node_assert_1.default.strictEqual(ok, true);
+        node_assert_1.default.strictEqual(capturedInit.keepalive, true);
+    }));
+    (0, mocha_1.it)("htmlToMarkdown trims overly long header text when first space/newline index > 64", () => {
+        const fetcher = new WebFetcher_1.WebFetcher();
+        const longText = "a".repeat(70) + " rest\nmore";
+        const html = `<html><body><p>${longText}</p></body></html>`;
+        const md = fetcher["htmlToMarkdown"](html, "https://example.com");
+        node_assert_1.default.ok(!md.startsWith("a".repeat(70)));
+        node_assert_1.default.ok(md.includes("rest"));
+    });
+    (0, mocha_1.it)("htmlToMarkdown leaves short content unchanged", () => {
+        const fetcher = new WebFetcher_1.WebFetcher();
+        const html = `<html><body><p>short text</p></body></html>`;
+        const md = fetcher["htmlToMarkdown"](html, "https://example.com");
+        node_assert_1.default.ok(md.includes("short text"));
+    });
+    (0, mocha_1.it)("propagates onDocument return value (true/false)", () => __awaiter(void 0, void 0, void 0, function* () {
+        fetchStub.resolves(makeFetchResponse(200, 'ok', 'text/plain'));
+        const fetcher = new WebFetcher_1.WebFetcher();
+        const yes = yield fetcher.fetch("https://example.com/yes", () => __awaiter(void 0, void 0, void 0, function* () { return true; }));
+        const no = yield fetcher.fetch("https://example.com/no", () => __awaiter(void 0, void 0, void 0, function* () { return false; }));
+        node_assert_1.default.strictEqual(yes, true);
+        node_assert_1.default.strictEqual(no, false);
+    }));
+});
+//# sourceMappingURL=WebFetcher.spec.js.map
