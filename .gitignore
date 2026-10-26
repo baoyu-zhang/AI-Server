@@ -1,0 +1,17 @@
+# 密钥文件（最重要，防止api key泄露）
+.env
+
+# 依赖
+node_modules
+
+# 日志
+*.log
+npm-debug.log*
+
+# 向量库、上传文件缓存（本地RAG生成的，不要上传github）
+vectra_db/
+vector-index/
+uploads/
+
+# mac垃圾文件
+.DS_Store
