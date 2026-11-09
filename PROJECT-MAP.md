@@ -11,13 +11,12 @@
 
 | 文件 | 行数 | 分类 | 是否进入线上链路 | 一句话职责 |
 |---|---|---|---|---|
-| `index.js` | 963 | 运行时 | 是（入口） | HTTP 服务、工具定义、AG-UI 协议适配 |
-| `chat-core.js` | 332 | 运行时 | 是 | 两个聊天端点共用的主链路：裁剪/附件/选模型/发起流 |
+| `index.js` | 855 | 运行时 | 是（入口） | HTTP 服务、工具定义、AG-UI 协议适配 |
+| `chat-core.js` | 332 | 运行时 | 是 | 聊天主链路：裁剪/附件/选模型/发起流 |
 | `rag-vector.js` | 403 | 运行时 | 是 | 向量 + BM25 双路检索与 RRF 融合 |
 | `rag-utils.js` | 197 | 运行时 | 是 | 文档解析、清洗、三级分块 |
 | `session-files.js` | 158 | 运行时 | 是 | 会话级临时附件（内存，不进知识库） |
-| `test-agui-protocol.mjs` | 830 | 测试 | 否（需服务在跑） | AG-UI 事件序列的契约测试，8 个用例 |
-| `test-long-chat.js` | 63 | 测试 | 否 | 长上下文冒烟脚本，只打旧端点 |
+| `test-agui-protocol.mjs` | 880 | 测试 | 否（需服务在跑） | AG-UI 事件序列的契约测试，9 个用例 |
 | `eval/ingest-corpus.js` | 110 | 评测 | 否 | 从固定语料重建向量库 |
 | `eval/run-eval.js` | 166 | 评测 | 否 | 跑 20 题评测，输出 hit@k / MRR |
 | `eval/compare.js` | 84 | 评测 | 否 | 两次评测逐题对比，区分"救回"和"弄坏" |
@@ -33,7 +32,7 @@
 
 ## 二、运行时文件详解
 
-### 1. `index.js`（963 行）— 入口与协议层
+### 1. `index.js`（855 行）— 入口与协议层
 
 **职责**：Express 服务、工具定义、AG-UI 协议事件编码、RAG 管理端点。
 
@@ -43,7 +42,7 @@
 |---|---|---|
 | 工具集合 | `isAttachmentQuery` / `mergeByRank` / `createTools` / `createFrontendTools` / `createApprovalTools` | 模型能调用的全部能力 |
 | 协议层 | `aguiToChatMessages` / `/agui` 路由 | AG-UI 输入转 AI SDK 消息、事件流下发 |
-| 资源管理 | `/api/upload-doc` 等 11 个端点 | 文档入库、文档列表、会话附件 |
+| 资源管理 | `/api/upload-doc` 等 6 个端点 | 文档入库、文档列表、会话附件 |
 
 **关键函数**
 
@@ -61,7 +60,7 @@
 
 ### 2. `chat-core.js`（332 行）— 聊天主链路
 
-**职责**：`/api/chat` 与 `/agui` 共用的一段逻辑，避免两套代码各自漂移。
+**职责**：`/agui` 的实现主体——把 AG-UI 还原出的消息变成一次模型调用。协议（事件编码、SSE 帧）留在 `index.js` 的适配层，这里一行都不出现，所以以后换协议不用动这个文件。
 
 `prepareChatStream()` 是唯一出口，内部五步：
 
@@ -160,28 +159,25 @@ node test-agui-protocol.mjs --list  # 列出用例
 node test-agui-protocol.mjs --case=text,rag
 ```
 
-8 个用例覆盖的能力：
+9 个用例覆盖的能力：
 
 | 用例 | 断言什么 |
 |---|---|
-| `text` | 基础文本流：RUN_STARTED / 快照 / TEXT_MESSAGE_CHUNK / RUN_FINISHED |
+| `text` | 基础文本流：RUN_STARTED / STATE_SNAPSHOT / TEXT_MESSAGE_CHUNK / RUN_FINISHED；断言**不**下发 MESSAGES_SNAPSHOT（服务端无状态） |
 | `server_tool` | 服务端工具：START → ARGS → END → RESULT 闭环 |
 | `frontend_tool` | 前端工具只下发调用不给结果（挂起语义） |
 | `interrupt` | 审批中断：`outcome=interrupt` 与字段契约 |
 | `resume_allow` | resume 允许：执行工具、回传结果、重复 resume 幂等 |
 | `resume_reject` | resume 拒绝：不产生副作用 |
 | `rag` | 检索工具：TOOL_CALL_RESULT 与 `/sources` 状态增量 |
+| `long_context` | 历史超过 token 上限时触发裁剪（`CUSTOM:trim_notice`）且仍能正常完成 |
 | `bad_request` | 缺 messages 返回 400 |
 
 **知识点**：SSE 帧解析（`data: ` 前缀、`\n\n` 分隔、跨 chunk 的半帧拼接）、契约测试与快照测试的区别、幂等性验证、用 `randomUUID` 隔离测试数据。
 
 **解决的问题**：协议层改动最容易悄悄破坏前端——事件少一个、顺序反了，前端不报错但界面就是不对。这个脚本把"协议正确"变成可回归的。
 
-### `test-long-chat.js`（63 行）
-
-构造 8 轮对话（约 17 条消息）+ 一次带工具调用的提问，打到 `/api/chat`，打印所有 SSE 事件。
-
-**注意**：它打的是旧端点 `/api/chat`，不是 `/agui`。属于一次性排障脚本，用来复现"长对话是否触发裁剪、裁剪后是否 400"。不是自动化测试，没有断言。
+> `long_context` 替代了原来的 `test-long-chat.js`。旧脚本打的是已删除的 `/api/chat`，而且只 `console.log` 事件、没有断言，跑完还得人眼判断。现在它读 `.env` 的 `MAX_CONTEXT_TOKENS` 自动算填充轮数（默认上限 6000 时约 9 轮），断言服务端确实下发了 `CUSTOM:trim_notice` 且 `droppedMessages > 0`。
 
 ---
 
@@ -209,23 +205,30 @@ node test-agui-protocol.mjs --case=text,rag
 
 ---
 
-## 五、端点清单与真实使用情况
+## 五、端点清单
+
+单协议：**只有 `/agui` 一个聊天入口**，其余 5 个都是资源管理端点，全部有前端调用方。
 
 | 端点 | 前端是否调用 | 说明 |
 |---|---|---|
-| `POST /agui` | **是（主链路）** | ChatEngine 走这里，AG-UI 协议 |
+| `POST /agui` | **是（主链路）** | ChatEngine 走这里，AG-UI 协议，唯一的聊天入口 |
 | `GET /api/documents` | **是** | 左侧文档栏 |
-| `POST /api/upload-doc` | **是** | 上传并解析，返回 chunks |
-| `POST /api/embedding-add` | **是** | 把 chunks 入库（同名先删后插） |
+| `POST /api/upload-doc` | **是** | 上传 → 解析 → 切块 → 覆盖同名旧片段 → 入库，一次完成 |
 | `POST /api/documents/delete` | **是** | 按文件名删全部片段 |
-| `POST /api/session-files/upload` | **是** | 会话附件上传 |
+| `POST /api/session-files/upload` | **是** | 会话附件上传（文档解析成文本、图片转 base64，都不进知识库） |
 | `POST /api/session-files/delete` | **是** | 删会话附件 |
-| `POST /api/chat` | 否 | 早期自研 SSE 端点，只剩 `test-long-chat.js` 在用 |
-| `POST /api/search-knowledge` | 否 | 独立检索调试接口 |
-| `GET /api/vector-list` | 否 | 列出全部向量条目（调试） |
-| `POST /api/vector-clear` | 否 | 清库（调试） |
 
-**文档上传是两段式**：`/api/upload-doc` 在服务端解析出 `chunks` 后返回给浏览器，浏览器再 POST 给 `/api/embedding-add`。这样做的代价是 text 来回传两遍、且前端理论上可以篡改 chunks 绕过解析。更合理的做法是一个端点内完成"解析 → 切块 → 入库"。这是当前已知的设计债。
+**已删除的 5 个端点及原因**
+
+| 端点 | 删除原因 |
+|---|---|
+| `POST /api/chat` | 早期自研 SSE 端点。同时维护两套协议，每次改裁剪/附件逻辑都要做两遍回归，收益小于成本。长上下文诊断能力已迁到 `test-agui-protocol.mjs` 的 `long_context` 用例 |
+| `POST /api/embedding-add` | 接收前端传来的 `chunks` 直接入库，等于绕过文件解析——任何人都能往知识库写任意文本（语料投毒），还能用同名覆盖已有文档。现已并入 `/api/upload-doc` |
+| `POST /api/search-knowledge` | 无调用方。`npm run inspect` 信息更全（带 `dense#N` / `bm25#N` 双路排名） |
+| `GET /api/vector-list` | 无调用方。`GET /api/documents` + `npm run inspect` 已覆盖 |
+| `POST /api/vector-clear` | 无调用方，且**没有鉴权**——部署到公网后一次 POST 就能清空知识库。清库改为本地删 `vector-index/` 目录或重跑 `npm run eval:ingest` |
+
+**为什么不需要 `/api/embedding-add` 这种"纯文本入库"接口**：`eval/ingest-corpus.js` 需要绕过文件解析时，是直接 `require('../rag-vector')` 调 `batchInsertEmbedding` 的，走进程内调用，不需要开一个 HTTP 口子把写权限交给浏览器。
 
 ---
 
@@ -286,7 +289,7 @@ node eval/compare.js rrf 你的tag                   # 对照上一次，看退�
 npm run test:agui
 ```
 
-**哪些文件可以删**：`test-long-chat.js`（一次性排障）、`/api/chat` 端点（前端已不用）。删前确认没有别的脚本依赖。
+**已经没有可以删的文件了**：`test-long-chat.js` 与 5 个无调用方的端点已在这次清理中移除，`uploads/`、`vector-index/` 是运行时数据且已 gitignore。以后新增端点时，先确认它有调用方——两个入口都叫"聊天"时，代价是双份回归。
 
 **哪些文件别动**：`chat-core.js` 里 `streamText` 不能加 `await`；`rag-vector.js` 里新增/删除片段必须调 `invalidateBm25()`；`index.js` 里前端工具同名必须以服务端为准。这三处都是"改错了不报错、但功能静默失效"的位置。
 
