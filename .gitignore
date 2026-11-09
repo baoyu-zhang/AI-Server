@@ -8,7 +8,9 @@ node_modules
 *.log
 npm-debug.log*
 
-# 向量库、上传文件缓存（本地RAG生成的，不要上传github）
+# 向量库、上传文件缓存（本地 RAG 运行时产物，不进仓库）
+# 注意：只写在这里不够。文件一旦被提交过，git 就不再理会 ignore 规则，
+# 必须执行 git rm -r --cached uploads vector-index 把它从索引里摘掉（--cached 不删磁盘文件）。
 vectra_db/
 vector-index/
 uploads/
@@ -16,7 +18,4 @@ uploads/
 # mac垃圾文件
 .DS_Store
 
-# 向量库与上传目录
-vector-index/
-uploads/
 dist/
