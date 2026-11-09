@@ -1,9 +1,7 @@
 require('dotenv').config() // 加载 .env 中的环境变量（DEEPSEEK_API_KEY）
 const express = require('express') // 引入 Express 框架
-const { streamText, tool, stepCountIs, jsonSchema } = require('ai') // 引入 AI SDK：流式生成、工具定义、步数限制、JSON Schema 适配
-const { createDeepSeek } = require('@ai-sdk/deepseek') // 引入 DeepSeek 模型提供方
+const { tool, jsonSchema } = require('ai') // 引入 AI SDK 的工具定义与 JSON Schema 适配（流式主链路已抽到 chat-core.js）
 const { z } = require('zod') // 引入 zod，用于声明工具入参结构
-const { getEncoding } = require('js-tiktoken') // 引入 BPE 分词器，用于统计 token 数量（cl100k_base 编码）
 const multer = require('multer')
 const { randomUUID } = require('node:crypto') // 生成 AG-UI 的 threadId / runId / messageId
 const { EventEncoder } = require('@ag-ui/encoder') // AG-UI 官方 SSE 事件编码器
@@ -11,7 +9,8 @@ const fs = require('fs') // 用于清理解析后的临时文件
 const path = require('path') // 用于解析上传文件的后缀名
 const { UPLOAD_DIR, ALLOWED_EXTS, IMAGE_EXTS, extractFileText, splitTextIntoChunks } = require('./rag-utils')
 const { initVectorStore, batchInsertEmbedding, searchVector, getAllItems, getDocuments, deleteDocument, clearVectorIndex } = require('./rag-vector')
-const { addSessionFile, addSessionImage, deleteSessionFile, getSessionFiles, getSessionImages, searchSessionFiles } = require('./session-files')
+const { addSessionFile, addSessionImage, deleteSessionFile, getSessionFiles, searchSessionFiles } = require('./session-files')
+const { prepareChatStream, MAX_CONTEXT_TOKENS } = require('./chat-core') // 两个端点共用的聊天主链路（裁剪/附件/选模型/streamText）
 const app = express() // 创建 Express 应用实例
 const PORT = process.env.PORT || 3000 // 服务端口：优先取环境变量，默认 3000
 app.use(express.json()) // 注册 JSON 请求体解析中间件
@@ -24,116 +23,7 @@ if (!DEEPSEEK_API_KEY) { // 校验 API Key 是否缺失
   process.exit(1) // 终止进程，避免带着错误配置继续运行
 }
 
-const deepseek = createDeepSeek({ // 创建 DeepSeek 客户端
-  apiKey: DEEPSEEK_API_KEY // 传入 API Key 用于鉴权
-})
-
-
-
-// ===== 统计 token：DeepSeek 未提供官方 npm 分词库，这里用 cl100k_base 编码做近似统计 =====
-const tokenizer = getEncoding('cl100k_base') // 初始化分词器（首次调用会加载词表，后续复用）
-
-/**
- * 估算单段文本的 token 数量
- * @param {string} text - 输入的文本
- * @returns {number} - 计算得到的 token 数量
- */
-
-function getTextToken(text) {
-  if (!text) return 0
-  return tokenizer.encode(String(text)).length
-}
-
-/**
- * 取出单条消息用于统计 token 的文本。
- * content 可能是字符串，也可能是结构化 parts（tool-call / tool-result / 图片）。
- */
-function modelMessageText(message) {
-  const content = message?.content
-  if (typeof content === 'string') return content
-  if (!Array.isArray(content)) return ''
-  return content
-    .map(part => {
-      if (typeof part === 'string') return part
-      if (part?.type === 'text') return part.text || ''
-      if (part?.type === 'tool-call') return `${part.toolName}${JSON.stringify(part.input ?? {})}`
-      if (part?.type === 'tool-result') {
-        const value = part.output?.value
-        return typeof value === 'string' ? value : JSON.stringify(value ?? '')
-      }
-      return '' // 图片等非文本 part 不计入
-    })
-    .join('')
-}
-
-/**
- * 统计messages数组中所有文本的token数量
- * @param {Array} messages - 输入的文本
- * @returns {number} - 计算得到的token数量
- */
-
-function countMessagesToken(messages) {
-  let totalToken = 0
-  for (let msg of messages) {
-    const roleToken = getTextToken(msg.role)
-    const contentToken = getTextToken(modelMessageText(msg))
-    totalToken += roleToken + contentToken
-    // 消息结构额外预留固定token开销
-    totalToken += 8
-  }
-  return totalToken
-}
-
-/**
- * 消息token裁剪
- * @param {Array} messages - 输入的文本
- * @param {number} maxTokenLimit - 目标token数量上限
- * @returns {{trimmedMessages: Array, isTrimmed: boolean}} - 裁剪后的消息的消息数组  
- */
-
-function trimMessages(messages, maxTokenLimit = 6000) {
-  const msgList = structuredClone(messages)
-  let isTrimmed = false // 是否发生过裁剪
-  // 超出上限时不断移除最早的消息，直到满足上限或只剩最后 2 条
-  while (countMessagesToken(msgList) > maxTokenLimit && msgList.length > 10) {
-    msgList.shift()
-    isTrimmed = true
-    // 裁剪可能把带 tool-call 的 assistant 丢掉，只留下悬空的 tool 结果；
-    // 模型接口会拒绝悬空结果，这里把开头的 tool 消息一并清掉
-    while (msgList.length && msgList[0]?.role === 'tool') msgList.shift()
-  }
-  return {
-    trimmedMessages: msgList,
-    isTrimmed
-  }
-}
-
-
-// ========== 会话附件上下文 ==========
-/**
- * 生成附件清单系统提示。
- * 聊天请求里只有文本，模型本身看不到附件；把本次会话的附件清单和内容预览作为 instructions 注入，
- * 模型才知道用户上传了什么，也才会在“这是什么”这类短问题下去检索附件。
- */
-function buildAttachmentSystemPrompt(sessionId) {
-  if (!sessionId) return ''
-  const files = getSessionFiles(sessionId)
-  if (!files.length) return ''
-  const list = files
-    .map((file, index) => {
-      const size = `${(file.size / 1024).toFixed(1)} KB`
-      if (file.kind === 'image') {
-        return `【附件${index + 1}】${file.fileName}（${size}，图片）\n说明：图片已随消息一起提供，可直接查看图片内容回答。`
-      }
-      return `【附件${index + 1}】${file.fileName}（${size}，共 ${file.chunkCount} 个片段）\n内容预览：${file.preview}`
-    })
-    .join('\n\n')
-  return `用户在本次对话中上传了以下附件（仅本次会话有效）：\n\n${list}\n\n处理规则：
-1. 用户询问“这是什么”“总结一下”“帮我看看”等涉及附件的问题时，文本附件必须先调用 searchKnowledgeBase 工具检索原文，再基于检索结果回答；图片附件已随消息提供，直接查看图片回答即可。
-2. 回答附件内容时以原文或图片实际内容为准，说明内容来自哪个附件，不要编造。
-3. 如果文本附件解析不到有效文本（例如扫描版 PDF），如实告诉用户，并建议提供文字版。
-4. 用户明确要求删除某个附件时，调用 deleteSessionFile 并在入参里传完整文件名；该工具会先暂停等待用户确认。`
-}
+// 模型客户端、token 统计、上下文裁剪、附件注入、streamText 调用都已移到 chat-core.js
 
 // 判断用户问题是否在问本次附件；短问题（如“这是什么”）也按附件意图处理
 function isAttachmentQuery(query, files) {
@@ -144,98 +34,108 @@ function isAttachmentQuery(query, files) {
   return q.length <= 6
 }
 
-/**
- * 把本次会话的图片附件挂到最后一条 user 消息上。
- * DeepSeek 只允许 user 消息携带图片，所以图片统一跟随当前提问发送；
- * 没有图片时原样返回，纯文本文档对话不受影响。
- */
-function attachImagesToLastUserMessage(messages, images) {
-  if (!images.length) return messages
-  const list = messages.map(message => ({ ...message }))
-  const lastUserIndex = list.map(message => message.role).lastIndexOf('user')
-  if (lastUserIndex < 0) return list
-  const content = String(list[lastUserIndex].content || '')
-  list[lastUserIndex] = {
-    role: 'user',
-    content: [
-      { type: 'text', text: content },
-      ...images.map(image => ({
-        type: 'file', // v7 推荐用 file part 承载图片，image part 已标记废弃
-        mediaType: image.mimeType,
-        data: { type: 'data', data: image.base64 }
-      }))
-    ]
-  }
-  return list
-}
-
 // ========== 工具集合：按会话构建 ==========
-// 会话级临时附件需要 sessionId 才能检索，所以这里用工厂函数，每个请求生成一份工具
+// 工具分三类，差别不在"功能"，而在"谁执行、什么时候执行"：
+//   ① 服务端工具（本函数）：有 execute，流内立即执行，结果自动回填给模型继续生成
+//   ② 前端工具（createFrontendTools）：无 execute，本轮结束，浏览器执行后下一轮 run 带回结果
+//   ③ 审批工具（createApprovalTools）：无 execute，收尾转成 interrupt，用户 resume 后才执行
+//
+// 为什么用工厂函数而不是模块级常量对象：
+// 附件检索需要 sessionId。若做成常量，这个 id 只能靠全局变量传递，
+// 多请求并发时会串号（A 用户检索到 B 用户的附件）。工厂函数把状态收进闭包，天然隔离。
 function createTools(sessionId) {
   return {
-    getCurrentTime: tool({ // 工具1：获取服务器当前时间
-      description: '获取服务器当前时间，当用户问现在几点、当前日期时使用', // 工具说明，帮助模型判断调用时机
-      inputSchema: z.object({}), // 入参结构：该工具无需参数
-      execute: async () => { // 工具的实际执行逻辑
-        const now = new Date() // 获取当前时间对象
-        return now.toLocaleString('zh-CN') // 转成中文格式字符串并返回给模型
+    // ---- ① 服务端工具：模型调完立刻拿到结果 ----
+    getCurrentTime: tool({
+      // description 是模型判断"要不要调用"的唯一依据，不是给人看的注释。
+      // 写清"用户问现在几点、当前日期时使用"，模型才知道何时触发；
+      // 只写"获取当前时间"这种同义反复，会让它在无关问题上也乱调。
+      description: '获取服务器当前时间，当用户问现在几点、当前日期时使用',
+      inputSchema: z.object({}), // 无参数也要显式声明空对象，等于告诉模型"不要编参数"
+      // 返回值直接进模型上下文，所以返回可读文本而不是时间戳
+      execute: async () => new Date().toLocaleString('zh-CN')
+    }),
+
+    calculator: tool({
+      description: '数学计算器，用于计算加减乘除，用户有数学计算时调用',
+      // 用 zod 声明入参：AI SDK 会转成 JSON Schema 交给模型。
+      // 类型和 enum 约束在这里做，模型就不容易给出 op:'加' 这种非法入参；
+      // .describe() 也会一起下发，同样是给模型看的参数说明。
+      inputSchema: z.object({
+        a: z.number().describe('第一个数字'),
+        b: z.number().describe('第二个数字'),
+        op: z.enum(['+', '-', '*', '/']).describe('运算符')
+      }),
+      // 注意这里"返回错误文本"而不是抛异常：
+      // execute 抛错会让这一轮对话直接失败；返回错误文本，模型能读到并自己换参数重试。
+      execute: async ({ a, b, op }) => {
+        let res
+        switch (op) {
+          case '+': res = a + b; break
+          case '-': res = a - b; break
+          case '*': res = a * b; break
+          case '/':
+            if (b === 0) return '错误：除数不能为0'
+            res = a / b; break
+          default:
+            return '错误：运算符仅支持 + - * /'
+        }
+        return `计算结果：${a} ${op} ${b} = ${res}`
       }
     }),
 
-    calculator: tool({ // 工具2：四则运算计算器
-      description: '数学计算器，用于计算加减乘除，用户有数学计算时调用', // 工具说明，帮助模型判断调用时机
-      inputSchema: z.object({ // 声明工具入参结构
-        a: z.number().describe('第一个数字'), // 参数 a：数字类型
-        b: z.number().describe('第二个数字'), // 参数 b：数字类型
-        op: z.enum(['+', '-', '*', '/']).describe('运算符') // 参数 op：仅允许四种运算符
-      }),
-      execute: async ({ a, b, op }) => { // 接收模型给出的结构化参数
-        let res // 存放计算结果
-        switch (op) { // 根据运算符走不同分支
-          case '+': res = a + b; break // 加法
-          case '-': res = a - b; break // 减法
-          case '*': res = a * b; break // 乘法
-          case '/': // 除法分支
-            if (b === 0) return '错误：除数不能为0' // 除数为 0 时返回错误信息
-            res = a / b; break // 正常除法
-          default: // 兜底分支
-            return '错误：运算符仅支持 + - * /' // 非法运算符时返回错误信息
-        }
-        return `计算结果：${a} ${op} ${b} = ${res}` // 把结果拼成可读文本返回
-      }
-    }),
-    searchKnowledgeBase: tool({ // 工具3：知识库 + 本次会话附件检索
+    // ---- ① 里最复杂的一个：双数据源检索 ----
+    searchKnowledgeBase: tool({
+      // 这段 description 是全项目对效果影响最大的文本，写法上刻意做了"双向约束"：
+      //   正向：列出必须调用的场景（附件问题、简历类问题）；
+      //   反向：明确"无关时不要调用"。
+      // 只写正向会导致模型逢问题必检索——问"你好"也去翻知识库，既慢又容易答偏。
       description: `在知识库文档和本次会话附件中检索原文。以下情况必须调用：
             1. 用户上传了附件，并询问附件内容（如“这是什么”“总结一下”“帮我看看这份文件”“发票金额是多少”）；
             2. 用户询问和简历、个人信息、项目经历、技能、工作年限相关的问题。
             回答文档内容时不要编造信息；如果问题和文档、附件都无关，不要调用这个工具，直接回答。`,
       inputSchema: z.object({
         query: z.string().describe("用户的检索关键词/问题，用来在知识库做语义检索"),
+        // 上限卡在 5 不是随手写的：topK 直接决定回填给模型的文本量，
+        // 模型偶尔会贪心地要 20 条，一次就把上下文预算吃光。
         topK: z.number().int().min(1).max(5).default(3).describe("返回几条匹配片段")
       }),
-      // 工具执行回调：模型调用工具时，执行这里
+      // 工具执行回调：模型调用工具时执行这里。返回值会作为 tool-result 进入下一轮上下文
       async execute({ query, topK }) {
         console.log(`🔍 Agent调用知识库检索，query：${query}`)
-        // 并行检索：知识库（长期） + 本次会话附件（临时），合并后按相似度排序
+        // 两个数据源互相独立，必须并行：串行会让检索耗时直接翻倍（知识库是磁盘向量库，附件是内存检索）
         const [kbResult, sessionResult] = await Promise.all([
           searchVector(query, topK),
           searchSessionFiles(sessionId, query, topK)
         ])
+        // 打上来源标记，前端据此把引用渲染成"本次附件 / 知识库"两种标签
         const knowledge = kbResult.map(item => ({ ...item, sourceType: 'knowledge' }))
         const attachments = sessionResult.map(item => ({ ...item, sourceType: 'attachment' }))
         let searchResult
+        // 合并策略分两种，这是本工具最容易被忽略的设计：
+        //   附件意图：附件优先占位，不足的再用知识库补。
+        //     否则长期知识库的片段永远压过"用户刚上传的那份文件"，用户会觉得"它根本没看我的文件"。
+        //   普通意图：一律按相似度排序，谁更相关谁在前。
         if (attachments.length && isAttachmentQuery(query, getSessionFiles(sessionId))) {
-          // 附件意图：先给附件片段（已按相似度降序），不足 topK 再用知识库补足，避免被知识库挤占
           searchResult = [...attachments.slice(0, topK), ...knowledge].slice(0, topK)
         } else {
           searchResult = [...knowledge, ...attachments].sort((a, b) => b.score - a.score).slice(0, topK)
         }
+        // 空结果也必须是合法返回：让模型明确知道"查了但没有"，而不是让它自由发挥编一个答案
         if (!searchResult.length) return { text: '知识库和本次会话附件中都没有检索到相关内容', sources: [] }
-        // text 给模型阅读；sources 给前端渲染【引用来源】。对象由 SSE 以 JSON 传输，不会被转义成字面 \n
+        // 返回值有两个通道，别混：
+        //   text   → 拼成一段话给模型读（模型看不到 sources 结构）
+        //   sources → 结构化对象给前端渲染【引用来源】，走 JSON 序列化，不会被转义成字面 \n
         return {
+          // ① 给模型读的文本。三个细节都是刻意的：
+          //   【片段N】让模型能说"根据片段2"，人也能对上号；
+          //   写出相似度，低分时模型自己会更谨慎（这是最便宜的"置信度提示"）；
+          //   标出来源文件名，避免模型把附件内容说成知识库内容。
           text: searchResult
             .map((item, i) => `【片段${i + 1}】相似度：${item.score.toFixed(3)}\n来源：${item.fileName}${item.sourceType === 'attachment' ? '（本次会话附件）' : ''}\n${item.content}`)
             .join('\n\n'),
+          // ② 给前端渲染的结构化数据。score 用 Number 包一层保持数字类型
+          //   （toFixed 返回字符串，前端拿去做排序/阈值判断会变成字符串比较，'0.9' < '0.85' 这种坑）
           sources: searchResult.map(item => ({
             fileName: item.fileName,
             score: Number(item.score.toFixed(3)),
@@ -249,43 +149,67 @@ function createTools(sessionId) {
 }
 
 // ========== 前端工具：定义由浏览器下发，执行也在浏览器 ==========
-// 这里只转换定义、不提供 execute：模型发出 tool-call 后本轮即结束，
-// 由客户端本地执行，再通过下一轮 run 把 tool 结果带回来继续生成
+// 关键点：这里构造的 tool 一律不带 execute。
+// AI SDK 的语义是——没有 execute 的工具，模型发出 tool-call 后本轮就结束，
+// 把"谁来执行"交给外部；客户端执行完，再通过下一轮 run 把 tool 结果带回来继续生成。
+// 这正是浏览器侧 Agent loop 的实现方式（对应前端 App.vue 的 driveAgent）。
 function createFrontendTools(definitions, serverTools) {
   const tools = {}
   for (const definition of Array.isArray(definitions) ? definitions : []) {
     const name = typeof definition?.name === 'string' ? definition.name.trim() : ''
-    // 同名以服务端工具优先，避免前端覆盖服务端能力
+    // 同名一律以服务端工具优先，这是安全边界而不是代码风格：
+    // definitions 来自请求体，属于不可信输入。若允许覆盖，
+    // 前端就能下发一个同名 searchKnowledgeBase 把服务端检索能力劫持掉。
     if (!name || serverTools[name] || tools[name]) continue
+    // 参数结构来自浏览器运行时，是普通 JSON 对象，没有 zod schema 可用，
+    // 所以走 jsonSchema() 适配；缺失时给一个空对象结构，某些 provider 不接受 inputSchema 为空。
     const parameters = definition.parameters && typeof definition.parameters === 'object'
       ? definition.parameters
       : { type: 'object', properties: {} }
     tools[name] = tool({
-      description: definition.description || name,
+      description: definition.description || name, // 没写描述就退回工具名，至少让模型有个标识
       inputSchema: jsonSchema(parameters)
+      // 这里没有 execute —— 见本节开头，不是漏写
     })
   }
   return tools
 }
 
 // ========== 需要人工确认的工具（AG-UI interrupt / resume） ==========
-// 故意不提供 execute：模型发出调用后本轮结束，服务端以 RUN_FINISHED 的 interrupt 结果暂停，
-// 等客户端用 resume 回传用户决定后，下一轮 run 再真正执行并继续生成
-const INTERRUPT_PREFIX = 'int_'
+// 同样是"故意不提供 execute"，但动机和前端工具不同：
+// 前端工具是"执行方在别处"，审批工具是"执行要等一个人点头"。
+//
+// 为什么不在 execute 里 await 用户点击：
+//   ① 会占住这条 HTTP 长连接，用户不急、去吃饭，连接就一直挂着；
+//   ② 用户关页面/刷新，Promise 永远不 resolve，这次 run 变成僵尸；
+//   ③ 服务端无法水平扩展（哪个实例拿着这个 Promise？）。
+// interrupt/resume 把"等待"变成协议状态：本轮正常结束并返回 interrupt，
+// 用户决定后用新请求 resume，服务端因此完全无状态。
+const INTERRUPT_PREFIX = 'int_' // interrupt id 由服务端自己生成，用它承载 toolCallId
 const APPROVAL_TOOL_NAME = 'deleteSessionFile'
 
 function createApprovalTools() {
   return {
     [APPROVAL_TOOL_NAME]: tool({
+      // 描述里"只有在用户明确要求删除附件时才调用"是第二道闸：
+      // 第一道是 interrupt（执行前必暂停），这一道降低误触发概率——删除不可恢复，值得写死。
       description: '删除本次会话中已上传的某个附件。删除不可恢复，调用后会暂停并等待用户确认；只有在用户明确要求删除附件时才调用',
       inputSchema: z.object({
+        // 强调"必须是清单里的完整文件名"：模型容易把文件名截断或改写成"简历.pdf"，
+        // 到 resume 阶段按名字精确匹配时会找不到文件。
         fileName: z.string().describe('要删除的附件文件名，必须是附件清单里出现的完整文件名')
       })
     })
   }
 }
 
-/** 在历史消息里找出某个工具调用的名称与入参，供 resume 时执行审批操作 */
+/**
+ * 在历史消息里找出某个工具调用的名称与入参，供 resume 时执行审批操作。
+ *
+ * 为什么需要它：resume 请求只带 interruptId，不带原始入参。
+ * 服务端无状态，必须从历史消息里把"当时模型想删哪个文件"重新翻出来。
+ * 只扫 assistant 消息，因为 tool-call 只会挂在 assistant 上。
+ */
 function findToolCall(messages, toolCallId) {
   for (const message of messages || []) {
     if (message?.role !== 'assistant') continue
@@ -293,7 +217,7 @@ function findToolCall(messages, toolCallId) {
       if (call?.id === toolCallId) {
         return {
           name: call.function?.name,
-          input: parseToolArguments(call.function?.arguments)
+          input: parseToolArguments(call.function?.arguments) // AG-UI 里入参是 JSON 字符串，要解析
         }
       }
     }
@@ -301,11 +225,15 @@ function findToolCall(messages, toolCallId) {
   return null
 }
 
-/** 执行用户已确认的审批工具 */
+/**
+ * 执行用户已确认的审批工具。
+ * 三道校验都不是多余的：resume 的 interruptId 来自客户端，属于不可信输入。
+ */
 function executeApprovalTool(toolName, input, sessionId) {
-  if (toolName !== APPROVAL_TOOL_NAME) return `操作失败：未知的审批工具 ${toolName}`
+  if (toolName !== APPROVAL_TOOL_NAME) return `操作失败：未知的审批工具 ${toolName}` // 白名单：防止伪造中断去调别的工具
   const fileName = String(input?.fileName || '').trim()
   if (!fileName) return '删除失败：缺少文件名'
+  // 只在本会话附件里找：防止构造一个别的会话的文件名来越权删除
   const file = getSessionFiles(sessionId).find(item => item.fileName === fileName)
   if (!file) return `删除失败：本次会话中没有名为「${fileName}」的附件`
   return deleteSessionFile(sessionId, file.fileId)
@@ -322,31 +250,19 @@ app.post('/api/chat', async (req, res) => { // 定义 POST /api/chat 路由
     console.log('sessionId', sessionId)
     if (!messages) return res.status(400).send('缺少messages') // 参数校验：缺少消息时返回 400
     const tools = createTools(sessionId) // 按会话构建工具，检索时带上本次会话的临时附件
-    const { trimmedMessages, isTrimmed } = trimMessages(messages, 1000) // 裁剪消息，目标 token 上限 6000
-    // 把本次会话附件清单注入上下文，否则模型不知道用户上传了什么
-    const attachmentPrompt = buildAttachmentSystemPrompt(sessionId)
-    // 图片附件作为多模态内容附在最后一条用户消息上，并切换到支持视觉的模型
-    const images = getSessionImages(sessionId)
-    const modelMessages = attachImagesToLastUserMessage(trimmedMessages, images)
-    console.log('原始消息数量：', messages.length)
-    console.log('裁剪后消息数量：', trimmedMessages.length, '是否裁剪：', isTrimmed, '图片数量：', images.length)
-    const result = await streamText({ // 调用模型，拿到流式结果对象
-      model: deepseek(images.length ? 'deepseek-flash' : 'deepseek-reasoner'), // 有图片时用视觉模型，否则保持推理模型
-      instructions: attachmentPrompt || undefined, // 附件清单作为系统指令注入
-      messages: modelMessages, // ✅ 传给模型的是裁剪后的消息（含图片）
-      tools, // 注入上面定义的工具列表
-      stopWhen: stepCountIs(5), // 最多连续执行 5 步工具调用，防止死循环
-      // 监听每一步ReAct事件，打印日志（关键！看Agent循环）
-      onStepFinish: (step) => {
-        console.log('\n📌 ReAct 单步完成：')
-        console.log('当前步数：', step.stepNumber)
-        console.log('工具调用：', step.toolCalls)
-        console.log('工具返回：', step.toolResults)
-      },
+    // 裁剪上下文 + 注入附件清单 + 挂载图片 + 选模型，全部由 chat-core 统一处理
+    const { result, meta } = prepareChatStream({
+      messages,
+      sessionId,
+      tools,
+      logTag: 'chat', // 单步日志前缀，和 /agui 的日志区分开
       onFinish() {
         res.write(`data: ${JSON.stringify({ type: 'end' })}\n\n`)
       }
     })
+    console.log('原始消息数量：', meta.inputCount, '模型：', meta.modelId)
+    console.log('裁剪后消息数量：', meta.inputCount - meta.droppedCount, '是否裁剪：', meta.isTrimmed, '图片数量：', meta.imageCount, 'token 估算：', meta.tokenCount)
+    const { isTrimmed } = meta // 供下面的裁剪提示使用
 
     res.setHeader('Content-Type', 'text/plain; charset=utf-8') // 声明响应为 UTF-8 纯文本流
     res.setHeader('Cache-Control', 'no-cache') // 禁止缓存，保证实时性
@@ -487,52 +403,6 @@ function aguiToChatMessages(messages) {
   return chatMessages
 }
 
-/**
- * 历史消息规范化为 MESSAGES_SNAPSHOT 消息：
- * 去掉空内容，assistant 保留 toolCalls，保证快照能直接回放成对话。
- */
-function toSnapshotMessages(messages) {
-  const snapshot = []
-
-  for (const message of messages || []) {
-    if (!message || !message.role) continue
-    const id = message.id || `msg_snap_${snapshot.length}`
-    const text = aguiMessageText(message)
-
-    if (message.role === 'assistant') {
-      const toolCalls = (Array.isArray(message.toolCalls) ? message.toolCalls : [])
-        .filter(call => call?.id && call?.function?.name)
-        .map(call => ({
-          id: call.id,
-          type: 'function',
-          function: {
-            name: call.function.name,
-            arguments:
-              typeof call.function.arguments === 'string'
-                ? call.function.arguments
-                : JSON.stringify(call.function.arguments ?? {})
-          }
-        }))
-      // 只有工具调用的 assistant 消息没有正文，但必须保留，否则工具结果会悬空
-      if (!text.trim() && !toolCalls.length) continue
-      snapshot.push({ id, role: 'assistant', content: text, ...(toolCalls.length ? { toolCalls } : {}) })
-      continue
-    }
-
-    if (message.role === 'tool') {
-      if (!message.toolCallId) continue
-      snapshot.push({ id, role: 'tool', content: text, toolCallId: message.toolCallId })
-      continue
-    }
-
-    if (message.role === 'user' && text.trim()) {
-      snapshot.push({ id, role: 'user', content: text })
-    }
-  }
-
-  return snapshot
-}
-
 /** 工具返回值转成 TOOL_CALL_RESULT 需要的字符串 */
 function toolOutputText(output) {
   if (typeof output === 'string') return output
@@ -613,9 +483,11 @@ app.post('/agui', async (req, res) => {
     reasoningOpen = true
   }
 
-  // 正文改用 TEXT_MESSAGE_CHUNK：客户端会自动合成 START / CONTENT / END，
-  // 服务端只需维护本地状态，收尾由后续非 chunk 事件（STEP_FINISHED / RUN_FINISHED）触发
+  // 正文改用 TEXT_MESSAGE_CHUNK：客户端会自动合成 START / CONTENT，
+  // 结束统一由 closeText 显式发 TEXT_MESSAGE_END，避免依赖客户端自行推断
   const closeText = () => {
+    if (!textOpen) return
+    if (currentAssistantId) send({ type: 'TEXT_MESSAGE_END', messageId: currentAssistantId })
     textOpen = false
   }
 
@@ -665,19 +537,22 @@ app.post('/agui', async (req, res) => {
     const tools = { ...serverTools, ...approvalTools, ...frontendTools }
     const frontendToolNames = Object.keys(frontendTools)
     if (frontendToolNames.length) console.log('[agui] 前端工具：%s', frontendToolNames.join(', '))
+    // AG-UI 结构化历史还原成 AI SDK 消息，再交给 chat-core 统一处理
     const chatMessages = aguiToChatMessages(aguiMessages)
-    const { trimmedMessages, isTrimmed } = trimMessages(chatMessages, 1000)
-    const droppedMessages = chatMessages.length - trimmedMessages.length
-    // 附件清单注入 + 图片挂到最后一条 user 消息，与 /api/chat 保持一致
-    const attachmentPrompt = buildAttachmentSystemPrompt(sessionId)
-    const images = getSessionImages(sessionId)
-    const modelMessages = attachImagesToLastUserMessage(trimmedMessages, images)
-    console.log('[agui] threadId=%s runId=%s 消息=%d 裁剪后=%d 图片=%d', threadId, runId, chatMessages.length, trimmedMessages.length, images.length)
+    // 裁剪上下文 + 注入附件清单 + 挂载图片 + 选模型（与 /api/chat 完全同一套逻辑）
+    const { result, meta } = prepareChatStream({
+      messages: chatMessages,
+      sessionId,
+      tools,
+      abortSignal: abortController.signal, // 客户端断开时中止模型流
+      logTag: 'agui'
+    })
+    const { isTrimmed, droppedCount } = meta
+    console.log('[agui] threadId=%s runId=%s 消息=%d 裁剪后=%d 图片=%d 模型=%s', threadId, runId, meta.inputCount, meta.inputCount - droppedCount, meta.imageCount, meta.modelId)
 
     send({ type: 'RUN_STARTED', threadId, runId })
-    // 线程消息快照：把服务端确认的完整历史下发给客户端，
-    // AG-UI 客户端据此校准线程消息；本地已有历史时各端自行决定是否采用
-    send({ type: 'MESSAGES_SNAPSHOT', messages: toSnapshotMessages(aguiMessages) })
+    // 不再下发 MESSAGES_SNAPSHOT：服务端无状态，历史以客户端 RunAgentInput.messages 为准。
+    // 该事件语义是“整段消息列表替换”，只在服务端真的改写历史（如会话存储/压缩）时才发。
     send({ type: 'STATE_SNAPSHOT', snapshot: { ...priorState, phase: 'running', sources: priorSources } })
     // 续跑开始：先把用户确认后的工具结果回传，前端据此把待确认卡片标记为完成
     for (const item of resumeOutputs) {
@@ -693,24 +568,9 @@ app.post('/agui', async (req, res) => {
       send({
         type: 'CUSTOM',
         name: 'trim_notice',
-        value: { content: '对话过长，已精简早期上下文', droppedMessages, maxTokenLimit: 1000 }
+        value: { content: '对话过长，已精简早期上下文', droppedMessages: droppedCount, maxTokenLimit: MAX_CONTEXT_TOKENS }
       })
     }
-
-    const result = streamText({
-      model: deepseek(images.length ? 'deepseek-flash' : 'deepseek-reasoner'),
-      instructions: attachmentPrompt || undefined,
-      messages: modelMessages,
-      tools,
-      stopWhen: stepCountIs(5),
-      abortSignal: abortController.signal,
-      onStepFinish: (step) => {
-        console.log('\n📌 ReAct 单步完成：')
-        console.log('当前步数：', step.stepNumber)
-        console.log('工具调用：', step.toolCalls)
-        console.log('工具返回：', step.toolResults)
-      }
-    })
 
     for await (const part of result.fullStream) {
       if (closed) break
@@ -796,6 +656,9 @@ app.post('/agui', async (req, res) => {
       } else if (part.type === 'error') {
         console.error('[agui] 流式错误', part.error)
         hasError = true
+        // 出错前先把还开着的文本/思考流收口，客户端才不会留下"永远生成中"的气泡
+        closeText()
+        closeReasoning()
         send({
           type: 'RUN_ERROR',
           message: part.error instanceof Error ? part.error.message : String(part.error),
@@ -805,6 +668,8 @@ app.post('/agui', async (req, res) => {
         break
       } else if (part.type === 'abort') {
         console.log('[agui] 模型流已中止：', part.reason)
+        closeText()
+        closeReasoning()
       }
     }
 
