@@ -1,0 +1,17 @@
+{
+  "name": "agui-demo",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "server": "node server.mjs",
+    "dev": "vite",
+    "verify": "node verify.mjs"
+  },
+  "dependencies": {
+    "@ag-ui/client": "1.0.3",
+    "@ag-ui/encoder": "1.0.3"
+  },
+  "devDependencies": {
+    "vite": "^7.0.0"
+  }
+}
