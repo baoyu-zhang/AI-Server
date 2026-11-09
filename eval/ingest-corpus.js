@@ -38,7 +38,11 @@ const CORPUS = [
   { file: path.join(UPLOADS, '1792486147254-电脑300元发票.pdf'), name: '电脑300元发票.pdf', group: '个人材料' },
 
   // ---- 资料包中的技术文档（主题互不重叠）----
-  { file: path.join(LIB, 'API调用大模型.pdf'), name: 'API调用大模型.pdf', group: '技术文档' },
+  // 注意：`API调用大模型.pdf` 已被剔除，不进语料。
+  // 原因（有实测依据，不是感觉）：它是一份 21 段的厂商 API 链接清单，句子结构高度同质、
+  // 信息密度极低，在向量空间里几乎和任何技术问题都"看起来相关"。
+  // 基线评测里它在 4 道错题（#3 #8 #16 #19）中霸占 top1 或 top3，属于典型的"磁铁文档"，
+  // 会持续污染排名——加多少排序算法都只是在给噪声排序。详见 eval/results/baseline.json。
   { file: path.join(LIB, 'AI大模型提示词技巧.pdf'), name: 'AI大模型提示词技巧.pdf', group: '技术文档' },
   { file: path.join(LIB, '8种主流Agent框架.pdf'), name: '8种主流Agent框架.pdf', group: '技术文档' },
   { file: path.join(LIB, '大模型部署：Rerank 模型的部署及使用.pdf'), name: 'Rerank模型的部署及使用.pdf', group: '技术文档' },
