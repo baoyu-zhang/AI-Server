@@ -570,13 +570,8 @@ const cases = [
       }
       if (!assertRunBasics(res)) return
 
-      const snapshot = findEvent(res.events, 'MESSAGES_SNAPSHOT')
-      const snapMessages = Array.isArray(snapshot?.messages) ? snapshot.messages : []
-      const snapshotTool = snapMessages.find(
-        message => message.role === 'tool' && message.toolCallId === toolCallId
-      )
-      check('MESSAGES_SNAPSHOT 包含 resumed 工具结果', Boolean(snapshotTool), snapMessages)
-      check('快照中的结果为“已删除附件”', String(snapshotTool?.content || '').includes('已删除附件'), snapshotTool)
+      // 服务端无状态，不下发 MESSAGES_SNAPSHOT；resume 的结果通过 TOOL_CALL_RESULT 回传，
+      // 直接断言该事件即可（比读快照更贴近协议语义）。
 
       const results = resultsOf(res.events, toolCallId)
       if (!check('回传 TOOL_CALL_RESULT', results.length === 1, results)) return
