@@ -13,6 +13,7 @@
  *   BASE_URL=http://localhost:3000 node test-agui-protocol.mjs
  */
 
+import 'dotenv/config' // 读 .env 的 MAX_CONTEXT_TOKENS，让“长上下文”用例的填充量跟着服务端配置走
 import { randomUUID } from 'node:crypto'
 
 const BASE_URL = (process.env.BASE_URL || 'http://localhost:3000').replace(/\/+$/, '')
@@ -290,7 +291,7 @@ function assertRunBasics(res, { threadId, runId } = {}) {
 const cases = [
   {
     name: 'text',
-    title: '基础文本流：RUN_STARTED / 快照 / TEXT_MESSAGE_CHUNK / RUN_FINISHED',
+    title: '基础文本流：RUN_STARTED / STATE_SNAPSHOT / TEXT_MESSAGE_CHUNK / RUN_FINISHED',
     async run() {
       const threadId = newSessionId('t_text')
       const runId = `r_${randomUUID()}`
@@ -307,14 +308,10 @@ const cases = [
       }
       if (!assertRunBasics(res, { threadId, runId })) return
 
-      const snapshot = findEvent(res.events, 'MESSAGES_SNAPSHOT')
-      const snapMessages = Array.isArray(snapshot?.messages) ? snapshot.messages : []
-      check('携带 MESSAGES_SNAPSHOT', Boolean(snapshot), brief(res.events))
-      check(
-        '快照包含本次用户消息',
-        snapMessages.some(message => message.role === 'user' && String(message.content).includes('收到')),
-        snapMessages
-      )
+      // 服务端无状态：历史以客户端 RunAgentInput.messages 为准，
+      // 所以不应下发 MESSAGES_SNAPSHOT —— 它的语义是"整段替换消息列表"，
+      // 只在服务端真的改写历史（会话存储 / 上下文压缩）时才该发。
+      check('不下发 MESSAGES_SNAPSHOT', !findEvent(res.events, 'MESSAGES_SNAPSHOT'), brief(res.events))
 
       const stateSnapshot = findEvent(res.events, 'STATE_SNAPSHOT')
       check('STATE_SNAPSHOT.phase = running', stateSnapshot?.snapshot?.phase === 'running', stateSnapshot?.snapshot)
@@ -721,6 +718,55 @@ const cases = [
           sourceOps[0]
         )
       }
+    }
+  },
+
+  {
+    name: 'long_context',
+    title: '长上下文：历史超过 token 上限，裁剪后仍正常完成（替代原 test-long-chat.js）',
+    async run() {
+      const threadId = newSessionId('t_long')
+      const runId = `r_${randomUUID()}`
+      // 每轮填充约 1150 字（中文约 1 字 ≈ 1 token），按上限的 1.6 倍构造轮数，确保一定越过阈值。
+      // 为什么要读 .env：如果 MAX_CONTEXT_TOKENS 被调大，写死的 8 轮就不触发裁剪，用例会假绿。
+      const contextLimit = Number(process.env.MAX_CONTEXT_TOKENS || 6000)
+      const filler =
+        '人工智能智能体开发，Vue3 前端，TDesign 聊天组件，Function Calling，ReAct 循环，RAG 知识库，向量检索，文档分块，Embedding，流式输出，思考过程折叠面板，工具调用可视化，token 裁剪，上下文管理。'
+      const rounds = Math.max(6, Math.ceil((contextLimit * 1.6) / 1150))
+
+      const messages = []
+      for (let i = 1; i <= rounds; i++) {
+        messages.push({ id: `u${i}`, role: 'user', content: `【第${i}轮】请简单回答。${filler.repeat(8)}` })
+        messages.push({
+          id: `a${i}`,
+          role: 'assistant',
+          content: `收到，第${i}轮回复：智能体开发核心就是 ReAct 循环，大模型思考、调用工具、拿到结果再继续回答。${filler.repeat(3)}`
+        })
+      }
+      messages.push({ id: 'mLast', role: 'user', content: '用一句话说明我们刚才聊的是什么主题' })
+
+      const res = await requestAgui({ threadId, runId, messages, state: { sources: [] } })
+      if (res.networkError) {
+        check('长历史请求完成', false, res.networkError)
+        return
+      }
+      if (!assertRunBasics(res, { threadId, runId })) return
+
+      // trim_notice 是“裁剪真的发生了”唯一的外部证据：服务端只在 isTrimmed 时发这个 CUSTOM 事件
+      const trimNotice = res.events.find(event => event.type === 'CUSTOM' && event.name === 'trim_notice')
+      check(`${rounds} 轮历史触发上下文裁剪`, Boolean(trimNotice), brief(res.events))
+      check(
+        'trim_notice 报告了被丢弃的消息条数',
+        Number(trimNotice?.value?.droppedMessages) > 0,
+        trimNotice?.value
+      )
+
+      const chunks = res.events.filter(event => event.type === 'TEXT_MESSAGE_CHUNK')
+      const text = chunks.map(chunk => chunk.delta || '').join('')
+      check('裁剪后仍有正文输出', text.trim().length > 0, text.slice(0, 80))
+
+      const phases = phaseUpdates(res.events)
+      check('结束前 phase 变为 done', phases.at(-1)?.value === 'done', phases)
     }
   },
 
