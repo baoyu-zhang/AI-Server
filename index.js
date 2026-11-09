@@ -8,9 +8,9 @@ const { EventEncoder } = require('@ag-ui/encoder') // AG-UI 官方 SSE 事件编
 const fs = require('fs') // 用于清理解析后的临时文件
 const path = require('path') // 用于解析上传文件的后缀名
 const { UPLOAD_DIR, ALLOWED_EXTS, IMAGE_EXTS, extractFileText, splitTextIntoChunks } = require('./rag-utils')
-const { initVectorStore, batchInsertEmbedding, searchVector, getAllItems, getDocuments, deleteDocument, clearVectorIndex } = require('./rag-vector')
+const { initVectorStore, batchInsertEmbedding, searchVector, getDocuments, deleteDocument } = require('./rag-vector')
 const { addSessionFile, addSessionImage, deleteSessionFile, getSessionFiles, searchSessionFiles } = require('./session-files')
-const { prepareChatStream, MAX_CONTEXT_TOKENS } = require('./chat-core') // 两个端点共用的聊天主链路（裁剪/附件/选模型/streamText）
+const { prepareChatStream, MAX_CONTEXT_TOKENS } = require('./chat-core') // 聊天主链路（裁剪/附件/选模型/streamText）
 const app = express() // 创建 Express 应用实例
 const PORT = process.env.PORT || 3000 // 服务端口：优先取环境变量，默认 3000
 app.use(express.json()) // 注册 JSON 请求体解析中间件
@@ -272,80 +272,9 @@ function executeApprovalTool(toolName, input, sessionId) {
     : `删除失败：${fileName}`
 }
 
-const encodeLine = (text) => String(text).replace(/\r\n|\r|\n/g, '\\n') // 把真实换行转成字面量 \n，保证每条消息只占一行
-
-// 流式聊天接口，开启工具调用
-app.post('/api/chat', async (req, res) => { // 定义 POST /api/chat 路由
-  try { // 统一捕获异常，避免服务崩溃
-    const { messages, sessionId } = req.body // 取出前端传来的历史消息列表与会话标识
-    console.log('sessionId', sessionId)
-    if (!messages) return res.status(400).send('缺少messages') // 参数校验：缺少消息时返回 400
-    const tools = createTools(sessionId) // 按会话构建工具，检索时带上本次会话的临时附件
-    // 裁剪上下文 + 注入附件清单 + 挂载图片 + 选模型，全部由 chat-core 统一处理
-    const { result, meta } = prepareChatStream({
-      messages,
-      sessionId,
-      tools,
-      logTag: 'chat', // 单步日志前缀，和 /agui 的日志区分开
-      onFinish() {
-        res.write(`data: ${JSON.stringify({ type: 'end' })}\n\n`)
-      }
-    })
-    console.log('原始消息数量：', meta.inputCount, '模型：', meta.modelId)
-    console.log('裁剪后消息数量：', meta.inputCount - meta.droppedCount, '是否裁剪：', meta.isTrimmed, '图片数量：', meta.imageCount, 'token 估算：', meta.tokenCount)
-    const { isTrimmed } = meta // 供下面的裁剪提示使用
-
-    res.setHeader('Content-Type', 'text/plain; charset=utf-8') // 声明响应为 UTF-8 纯文本流
-    res.setHeader('Cache-Control', 'no-cache') // 禁止缓存，保证实时性
-    res.setHeader('Connection', 'keep-alive') // 保持长连接，便于持续推送
-    res.flushHeaders?.() // 立即发送响应头，让浏览器尽早进入流式接收
-    // 如果裁剪了消息，向前端推送自定义事件，前端展示提示
-    if (isTrimmed) {
-      res.write(`data: ${JSON.stringify({ type: 'trim_notice', content: '对话过长，已精简早期上下文' })}\n\n`)
-    }
-    // 前端约定：think:思考过程，answer:正式回答，tool-call/tool-result/tool-error:工具事件（每行一个 JSON）
-    for await (const part of result.fullStream) { // 逐块消费模型输出的完整事件流
-      if (part.type === 'reasoning-delta') { // 命中推理过程增量
-        res.write(`think:${encodeLine(part.text)}\n`) // 以 think: 前缀输出思考内容
-      } else if (part.type === 'text-delta') { // 命中正式回答增量
-        res.write(`answer:${encodeLine(part.text)}\n`) // 以 answer: 前缀输出回答内容
-      } else if (part.type === 'tool-call') { // 模型决定调用工具
-        res.write(`tool-call:${JSON.stringify({ // JSON.stringify 会转义换行，保证一行一条消息
-          id: part.toolCallId, // 工具调用 id，用于和结果配对
-          name: part.toolName, // 工具名称
-          input: part.input // 模型给出的入参
-        })}\n`)
-      } else if (part.type === 'tool-result') { // 工具执行完成
-        res.write(`tool-result:${JSON.stringify({
-          id: part.toolCallId, // 对应 tool-call 的 id
-          name: part.toolName, // 工具名称
-          output: part.output // 工具返回值
-        })}\n`)
-      } else if (part.type === 'tool-error') { // 工具执行抛出异常
-        res.write(`tool-error:${JSON.stringify({
-          id: part.toolCallId, // 对应 tool-call 的 id
-          name: part.toolName, // 工具名称
-          error: part.error instanceof Error ? part.error.message : String(part.error) // 统一成可读文本
-        })}\n`)
-      } else if (part.type === 'error') { // 命中流式错误事件
-        console.error('流式错误', part.error) // 打印错误，便于排查
-      }
-    }
-
-    res.end() // 正常结束响应流
-  } catch (err) { // 捕获请求处理过程中的异常
-    console.error(err) // 打印错误堆栈
-    if (!res.headersSent) { // 响应头尚未发送时
-      res.status(500).json({ error: '服务异常' }) // 返回标准 500 错误
-    } else { // 已经进入流式响应时
-      res.end() // 只能直接结束流，避免挂起
-    }
-  }
-})
-
-
-// ========== AG-UI 协议适配层（P0） ==========
-// 保留 /api/chat 不动，新增 /agui；两者共用同一套模型、工具、附件与裁剪逻辑。
+// ========== AG-UI 协议适配层 ==========
+// 唯一的聊天入口。原 /api/chat 已删除：同时维护自研 SSE 与 AG-UI 两套协议，
+// 每次改裁剪/附件逻辑都要做两遍回归，收益远小于成本。
 const eventEncoder = new EventEncoder()
 
 /** 把 AG-UI 消息内容（string 或 content parts）拍平成纯文本 */
@@ -570,7 +499,7 @@ app.post('/agui', async (req, res) => {
     if (frontendToolNames.length) console.log('[agui] 前端工具：%s', frontendToolNames.join(', '))
     // AG-UI 结构化历史还原成 AI SDK 消息，再交给 chat-core 统一处理
     const chatMessages = aguiToChatMessages(aguiMessages)
-    // 裁剪上下文 + 注入附件清单 + 挂载图片 + 选模型（与 /api/chat 完全同一套逻辑）
+    // 裁剪上下文 + 注入附件清单 + 挂载图片 + 选模型
     const { result, meta } = prepareChatStream({
       messages: chatMessages,
       sessionId,
@@ -817,6 +746,9 @@ const uploadSessionFile = (req, res, next) => {
 }
 
 // ========== 上传接口 ==========
+// 解析 → 切块 → 覆盖同名旧片段 → 入库，全部在服务端一次完成。
+// 为什么不再有 /api/embedding-add：那个端点接收前端传来的 chunks 直接入库，等于绕过了文件解析，
+// 任何人都能往知识库写任意文本（语料投毒，且能覆盖同名文档）；切块结果还要在网络上白跑两趟。
 app.post('/api/upload-doc', upload.single('file'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: '请上传文件' })
@@ -825,59 +757,23 @@ app.post('/api/upload-doc', upload.single('file'), async (req, res) => {
     const ext = path.extname(fileName).toLowerCase()
     const rawText = await extractFileText(filePath, ext)
     const chunks = splitTextIntoChunks(rawText, 800, 150)
+    if (!chunks.length) return res.status(400).json({ error: '未能从文件中解析出文本' })
 
-    // 只返回分块，不入库，入库交给 /api/embedding-add
+    // 同名文档重新上传时先删掉旧片段，避免向量库里出现重复内容
+    const removed = await deleteDocument(fileName)
+    await batchInsertEmbedding(chunks, fileName)
+
     res.json({
       ok: true,
       filename: fileName,
       chunkCount: chunks.length,
-      chunks
+      removed,
+      msg: `成功入库${chunks.length}个文本块${removed ? `，已覆盖旧片段${removed}个` : ''}`
     })
   } catch (err) {
     console.error('文档上传解析失败：', err)
     res.status(500).json({ error: err.message })
   }
-})
-//接收前端传过来的 `chunks` 和 `filename`，批量生成向量存入 Vectra 向量数据库
-app.post('/api/embedding-add', async (req, res) => {
-  try {
-    const { chunks, filename } = req.body
-    if (!chunks || !Array.isArray(chunks) || chunks.length === 0) {
-      return res.status(400).json({ error: 'chunks不能为空数组' })
-    }
-    if (!filename) {
-      return res.status(400).json({ error: '缺少filename文档名' })
-    }
-    // 同名文档重新上传时先删掉旧片段，避免向量库里出现重复内容
-    const removed = await deleteDocument(filename)
-    await batchInsertEmbedding(chunks, filename)
-    res.json({
-      ok: true,
-      msg: `成功入库${chunks.length}个文本块${removed ? `，已覆盖旧片段${removed}个` : ''}`,
-      filename,
-      chunkCount: chunks.length
-    })
-  } catch (err) {
-    console.error('Embedding入库失败：', err)
-    res.status(500).json({ error: err.message })
-  }
-})
-// 接收前端传过来的 `query`，返回搜索结果
-app.post('/api/search-knowledge', async (req, res) => {
-  try {
-    const { query, topK = 3 } = req.body
-    if (!query) return res.status(400).json({ error: '缺少query查询文本' })
-    const result = await searchVector(query, topK)
-    res.json({ ok: true, data: result })
-  } catch (err) {
-    console.error('知识库检索异常', err)
-    res.status(500).json({ error: err.message })
-  }
-})
-// 获取全部向量条目
-app.get('/api/vector-list', async (req, res) => {
-  const list = await getAllItems()
-  res.json({ ok: true, data: list })
 })
 // 文档列表：按文件名聚合，前端左侧文档栏使用
 app.get('/api/documents', async (req, res) => {
@@ -951,12 +847,8 @@ app.post('/api/session-files/delete', (req, res) => {
   }
 })
 
-// 清空向量库
-app.post('/api/vector-clear', async (req, res) => {
-  await clearVectorIndex()
-  res.json({ ok: true, msg: "向量库已清空" })
-})
-
+// 清空知识库不走 HTTP：原 /api/vector-clear 没有鉴权，部署到公网后一次 POST 就能清库。
+// 需要重建时用 npm run eval:ingest（会先删同名文档再入库），彻底清空直接删 vector-index/ 目录。
 
 app.listen(PORT, () => { // 启动 HTTP 服务并监听端口
   console.log(`✅ 服务启动 http://localhost:${PORT}`) // 启动成功后打印访问地址
