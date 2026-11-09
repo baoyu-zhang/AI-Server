@@ -202,26 +202,38 @@ function bm25Search(bm25Index, query, topK) {
 }
 
 /**
- * 混合检索内部实现：保留两路排名明细，供调试与评测使用
+ * 双路召回原始候选：向量 + BM25，不做融合
+ * 单独拆出来是因为 rerank 需要的正是"未融合的候选集"——融合只是候选的下游消费者之一。
+ * 将来接 rerank 时，从 denseHits + keywordHits 取并集送去重排即可，不必再动检索层。
  * @param {string} query
- * @param {number} topK
- * @returns {Promise<Array<{id: string, score: number, content: string, fileName: string, denseRank: number, bm25Rank: number}>>}
+ * @param {number} pool 每路各召回多少条
+ * @returns {Promise<{denseHits: Array, keywordHits: Array}>}
  */
-async function hybridSearch(query, topK = 3) {
-  const pool = Math.max(topK * 4, 20); // 召回池要放大，否则没东西可融
+async function retrieveCandidates(query, pool) {
   // embedding 推理与倒排索引构建互不依赖，必须并行；串行会让两段耗时直接相加
   const [queryVector, bm25Index] = await Promise.all([getEmbedding(query), getBm25Index()]);
   // Vectra 0.15 的签名是 queryItems(vector, query, topK, filter, isBm25)，这里只用语义那一路
   const denseItems = await index.queryItems(queryVector, query, pool);
-  const denseHits = denseItems.map(item => ({
-    id: item.item.id,
-    score: item.score,
-    content: item.item.metadata.content,
-    fileName: item.item.metadata.fileName
-  }));
-  const keywordHits = bm25Search(bm25Index, query, pool);
+  return {
+    denseHits: denseItems.map(item => ({
+      id: item.item.id,
+      score: item.score,
+      content: item.item.metadata.content,
+      fileName: item.item.metadata.fileName
+    })),
+    keywordHits: bm25Search(bm25Index, query, pool)
+  };
+}
 
-  // 用片段 id 聚合同一片段在两路的排名，累加 RRF 分：score = Σ 1/(60 + rank)
+/**
+ * RRF 融合：用片段 id 聚合同一片段在两路的排名，累加 score = Σ 1/(60 + rank)
+ * 保留 denseRank / bm25Rank 两个字段：排查"这条是被哪一路救回来的"全靠它。
+ * @param {Array} denseHits 向量候选（需带 id/score/content/fileName）
+ * @param {Array} keywordHits BM25 候选（结构同上）
+ * @param {number} topK
+ * @returns {Array<{id: string, score: number, content: string, fileName: string, denseRank: number, bm25Rank: number}>}
+ */
+function fuseRRF(denseHits, keywordHits, topK) {
   const fused = new Map();
   const merge = (hits, field) => {
     hits.forEach((hit, index) => {
@@ -235,7 +247,7 @@ async function hybridSearch(query, topK = 3) {
         bm25Rank: 0
       };
       current.score += 1 / (RRF_K + rank);
-      current[field] = rank; // 保留单路排名，便于排查"这条是被哪一路救回来的"
+      current[field] = rank; // 记下单路名次，0 表示这一路没召回它
       fused.set(hit.id, current);
     });
   };
@@ -250,6 +262,18 @@ async function hybridSearch(query, topK = 3) {
     .sort((a, b) => b.score - a.score)
     .slice(0, topK)
     .map(item => ({ ...item, score: Number((item.score / maxRrf).toFixed(4)) }));
+}
+
+/**
+ * 混合检索主链路：双路召回 → RRF 融合
+ * @param {string} query
+ * @param {number} topK
+ * @returns {Promise<Array>} 融合后的 topK，含排名明细
+ */
+async function hybridSearch(query, topK = 3) {
+  const pool = Math.max(topK * 4, 20); // 召回池要放大，否则没东西可融
+  const { denseHits, keywordHits } = await retrieveCandidates(query, pool);
+  return fuseRRF(denseHits, keywordHits, topK);
 }
 
 /**
@@ -275,6 +299,37 @@ async function searchVector(query, topK = 3) {
  */
 async function searchVectorDebug(query, topK = 3) {
   return await hybridSearch(query, topK);
+}
+
+/**
+ * 带候选集的检索：同时返回两路原始候选和融合结果
+ * 判断"BM25 到底有没有起作用"就看这里——keywordHits 为空说明倒排没命中任何片段，
+ * fused 里某条的 bm25Rank 为 0 说明它是纯向量召回的。
+ * @param {string} query
+ * @param {number} topK
+ * @returns {Promise<{denseHits: Array, keywordHits: Array, fused: Array}>}
+ */
+async function searchWithCandidates(query, topK = 3) {
+  const pool = Math.max(topK * 4, 20);
+  const candidates = await retrieveCandidates(query, pool);
+  return {
+    ...candidates,
+    fused: fuseRRF(candidates.denseHits, candidates.keywordHits, topK)
+  };
+}
+
+/**
+ * BM25 索引体检：文档数、词表大小、平均长度
+ * 词表为 0 说明所有 content 都没通过分词（例如全是标点），此时 BM25 静默失效
+ * @returns {Promise<{docs: number, vocab: number, avgdl: number}>}
+ */
+async function getBm25Stats() {
+  const bm25Index = await getBm25Index();
+  return {
+    docs: bm25Index.docs.length,
+    vocab: bm25Index.df.size,
+    avgdl: Math.round(bm25Index.avgdl)
+  };
 }
 
 
@@ -338,6 +393,8 @@ module.exports = {
   batchInsertEmbedding,
   searchVector,
   searchVectorDebug, // 带两路排名明细，供本地调试与评测
+  searchWithCandidates, // 连两路原始候选一起返回，用于验证 BM25 是否生效、以及后续接 rerank
+  getBm25Stats, // 倒排体检：文档数 / 词表大小 / 平均长度
   tokenize, // 导出给单元测试验证分词行为
   getAllItems,
   getDocuments,

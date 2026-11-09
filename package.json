@@ -7,7 +7,8 @@
     "test": "echo \"Error: no test specified\" && exit 1",
     "test:agui": "node test-agui-protocol.mjs",
     "eval": "node eval/run-eval.js",
-    "eval:ingest": "node eval/ingest-corpus.js"
+    "eval:ingest": "node eval/ingest-corpus.js",
+    "inspect": "node eval/inspect.js"
   },
   "keywords": [],
   "author": "",
