@@ -1,0 +1,546 @@
+{
+  "tag": "baseline",
+  "timestamp": "2026-11-09T07:02:53.112Z",
+  "topK": 10,
+  "corpus": {
+    "docs": 8,
+    "chunks": 80
+  },
+  "summary": {
+    "total": 20,
+    "hit1": 15,
+    "hit3": 16,
+    "hit5": 16,
+    "hit3Rate": 0.8,
+    "fileHit3": 16,
+    "mrr": 0.798
+  },
+  "byType": {
+    "精确术语": {
+      "total": 5,
+      "hit3": 4,
+      "hitRate": 0.8,
+      "mrr": 0.833
+    },
+    "语义改述": {
+      "total": 5,
+      "hit3": 4,
+      "hitRate": 0.8,
+      "mrr": 0.8
+    },
+    "数字代号": {
+      "total": 5,
+      "hit3": 5,
+      "hitRate": 1,
+      "mrr": 0.9
+    },
+    "跨文档": {
+      "total": 5,
+      "hit3": 3,
+      "hitRate": 0.6,
+      "mrr": 0.658
+    }
+  },
+  "items": [
+    {
+      "id": 1,
+      "type": "精确术语",
+      "question": "docker logs 这个命令是做什么的？",
+      "expectFile": "Docker命令汇总.pdf",
+      "expectKeywords": [
+        "日志"
+      ],
+      "strictRank": 1,
+      "fileRank": 1,
+      "top3": [
+        {
+          "fileName": "Docker命令汇总.pdf",
+          "score": 0.6365
+        },
+        {
+          "fileName": "Docker命令汇总.pdf",
+          "score": 0.6163
+        },
+        {
+          "fileName": "Docker命令汇总.pdf",
+          "score": 0.6115
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "精确术语",
+      "question": "演示部署 Rerank 时用的是智源的哪个开源模型？",
+      "expectFile": "Rerank模型的部署及使用.pdf",
+      "expectKeywords": [
+        "bge-reranker-large"
+      ],
+      "strictRank": 1,
+      "fileRank": 1,
+      "top3": [
+        {
+          "fileName": "Rerank模型的部署及使用.pdf",
+          "score": 0.7096
+        },
+        {
+          "fileName": "API调用大模型.pdf",
+          "score": 0.5996
+        },
+        {
+          "fileName": "8种主流Agent框架.pdf",
+          "score": 0.5942
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "精确术语",
+      "question": "OpenAI Agents SDK 是从哪个内部实验项目演变来的？",
+      "expectFile": "8种主流Agent框架.pdf",
+      "expectKeywords": [
+        "Swarm"
+      ],
+      "strictRank": 6,
+      "fileRank": 6,
+      "top3": [
+        {
+          "fileName": "API调用大模型.pdf",
+          "score": 0.534
+        },
+        {
+          "fileName": "RAG聊天机器人VS AI Agent.pdf",
+          "score": 0.5276
+        },
+        {
+          "fileName": "张宝玉简历-优化版.md",
+          "score": 0.5222
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "精确术语",
+      "question": "提示词里用哪个参数来指定输出格式？",
+      "expectFile": "AI大模型提示词技巧.pdf",
+      "expectKeywords": [
+        "output_format"
+      ],
+      "strictRank": 1,
+      "fileRank": 1,
+      "top3": [
+        {
+          "fileName": "AI大模型提示词技巧.pdf",
+          "score": 0.6597
+        },
+        {
+          "fileName": "AI大模型提示词技巧.pdf",
+          "score": 0.5655
+        },
+        {
+          "fileName": "Rerank模型的部署及使用.pdf",
+          "score": 0.5635
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "精确术语",
+      "question": "HuggingFace 推出的、用来部署 Rerank 模型的工具叫什么？",
+      "expectFile": "Rerank模型的部署及使用.pdf",
+      "expectKeywords": [
+        "TEI"
+      ],
+      "strictRank": 1,
+      "fileRank": 1,
+      "top3": [
+        {
+          "fileName": "Rerank模型的部署及使用.pdf",
+          "score": 0.6983
+        },
+        {
+          "fileName": "Rerank模型的部署及使用.pdf",
+          "score": 0.6295
+        },
+        {
+          "fileName": "8种主流Agent框架.pdf",
+          "score": 0.6128
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "type": "语义改述",
+      "question": "他有没有把老系统整体换成现代前端框架的经历？",
+      "expectFile": "张宝玉简历-优化版.md",
+      "expectKeywords": [
+        "JSP"
+      ],
+      "strictRank": 1,
+      "fileRank": 1,
+      "top3": [
+        {
+          "fileName": "张宝玉简历-优化版.md",
+          "score": 0.5829
+        },
+        {
+          "fileName": "张宝玉简历-优化版.md",
+          "score": 0.547
+        },
+        {
+          "fileName": "张宝玉简历-优化版.md",
+          "score": 0.5398
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "type": "语义改述",
+      "question": "他做过的项目里，有没有需要跟硬件设备打交道的？",
+      "expectFile": "张宝玉简历-优化版.md",
+      "expectKeywords": [
+        "蓝牙"
+      ],
+      "strictRank": 1,
+      "fileRank": 1,
+      "top3": [
+        {
+          "fileName": "张宝玉简历-优化版.md",
+          "score": 0.6095
+        },
+        {
+          "fileName": "张宝玉简历-优化版.md",
+          "score": 0.5469
+        },
+        {
+          "fileName": "张宝玉简历-优化版.md",
+          "score": 0.5403
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "type": "语义改述",
+      "question": "哪个应用是他自己打包并发布到苹果应用商店的？",
+      "expectFile": "张宝玉简历-优化版.md",
+      "expectKeywords": [
+        "App Store"
+      ],
+      "strictRank": 0,
+      "fileRank": 0,
+      "top3": [
+        {
+          "fileName": "API调用大模型.pdf",
+          "score": 0.5626
+        },
+        {
+          "fileName": "API调用大模型.pdf",
+          "score": 0.556
+        },
+        {
+          "fileName": "API调用大模型.pdf",
+          "score": 0.5538
+        }
+      ]
+    },
+    {
+      "id": 9,
+      "type": "语义改述",
+      "question": "检索出一堆文档之后，怎么把最相关的几篇挑到最前面？",
+      "expectFile": "Rerank模型的部署及使用.pdf",
+      "expectKeywords": [
+        "排序"
+      ],
+      "strictRank": 1,
+      "fileRank": 1,
+      "top3": [
+        {
+          "fileName": "Rerank模型的部署及使用.pdf",
+          "score": 0.6415
+        },
+        {
+          "fileName": "AI大模型提示词技巧.pdf",
+          "score": 0.5734
+        },
+        {
+          "fileName": "Rerank模型的部署及使用.pdf",
+          "score": 0.5717
+        }
+      ]
+    },
+    {
+      "id": 10,
+      "type": "语义改述",
+      "question": "不靠人工介入就能自动处理重复性任务的系统属于哪一类？",
+      "expectFile": "RAG聊天机器人VS AI Agent.pdf",
+      "expectKeywords": [
+        "任务自动化"
+      ],
+      "strictRank": 1,
+      "fileRank": 1,
+      "top3": [
+        {
+          "fileName": "RAG聊天机器人VS AI Agent.pdf",
+          "score": 0.5416
+        },
+        {
+          "fileName": "RAG聊天机器人VS AI Agent.pdf",
+          "score": 0.5347
+        },
+        {
+          "fileName": "张宝玉简历-优化版.md",
+          "score": 0.5167
+        }
+      ]
+    },
+    {
+      "id": 11,
+      "type": "数字代号",
+      "question": "这张发票的价税合计金额是多少？",
+      "expectFile": "电脑300元发票.pdf",
+      "expectKeywords": [
+        "300"
+      ],
+      "strictRank": 1,
+      "fileRank": 1,
+      "top3": [
+        {
+          "fileName": "电脑300元发票.pdf",
+          "score": 0.5348
+        },
+        {
+          "fileName": "8种主流Agent框架.pdf",
+          "score": 0.3762
+        },
+        {
+          "fileName": "AI大模型提示词技巧.pdf",
+          "score": 0.3591
+        }
+      ]
+    },
+    {
+      "id": 12,
+      "type": "数字代号",
+      "question": "这张发票是哪天开的？",
+      "expectFile": "电脑300元发票.pdf",
+      "expectKeywords": [
+        "2026年10月13日"
+      ],
+      "strictRank": 1,
+      "fileRank": 1,
+      "top3": [
+        {
+          "fileName": "电脑300元发票.pdf",
+          "score": 0.4976
+        },
+        {
+          "fileName": "8种主流Agent框架.pdf",
+          "score": 0.3643
+        },
+        {
+          "fileName": "8种主流Agent框架.pdf",
+          "score": 0.3561
+        }
+      ]
+    },
+    {
+      "id": 13,
+      "type": "数字代号",
+      "question": "这张发票的开票人是谁？",
+      "expectFile": "电脑300元发票.pdf",
+      "expectKeywords": [
+        "朱伊唯"
+      ],
+      "strictRank": 1,
+      "fileRank": 1,
+      "top3": [
+        {
+          "fileName": "电脑300元发票.pdf",
+          "score": 0.5173
+        },
+        {
+          "fileName": "张宝玉简历-优化版.md",
+          "score": 0.374
+        },
+        {
+          "fileName": "张宝玉简历-优化版.md",
+          "score": 0.3649
+        }
+      ]
+    },
+    {
+      "id": 14,
+      "type": "数字代号",
+      "question": "协作办公平台重构时，迁移了多少个流程发起表单页面？",
+      "expectFile": "张宝玉简历-优化版.md",
+      "expectKeywords": [
+        "260"
+      ],
+      "strictRank": 1,
+      "fileRank": 1,
+      "top3": [
+        {
+          "fileName": "张宝玉简历-优化版.md",
+          "score": 0.5933
+        },
+        {
+          "fileName": "张宝玉简历-优化版.md",
+          "score": 0.5675
+        },
+        {
+          "fileName": "张宝玉简历-优化版.md",
+          "score": 0.5566
+        }
+      ]
+    },
+    {
+      "id": 15,
+      "type": "数字代号",
+      "question": "玉佛禅寺 APP 里封装了多少个公共组件？",
+      "expectFile": "张宝玉简历-优化版.md",
+      "expectKeywords": [
+        "65"
+      ],
+      "strictRank": 2,
+      "fileRank": 1,
+      "top3": [
+        {
+          "fileName": "张宝玉简历-优化版.md",
+          "score": 0.4682
+        },
+        {
+          "fileName": "张宝玉简历-优化版.md",
+          "score": 0.4654
+        },
+        {
+          "fileName": "8种主流Agent框架.pdf",
+          "score": 0.4626
+        }
+      ]
+    },
+    {
+      "id": 16,
+      "type": "跨文档",
+      "question": "想确认一家公司的纳税人识别号，应该查哪份文档？",
+      "expectFile": "电脑300元发票.pdf",
+      "expectKeywords": [
+        "统一社会信用代码"
+      ],
+      "strictRank": 6,
+      "fileRank": 6,
+      "top3": [
+        {
+          "fileName": "Rerank模型的部署及使用.pdf",
+          "score": 0.5382
+        },
+        {
+          "fileName": "API调用大模型.pdf",
+          "score": 0.5231
+        },
+        {
+          "fileName": "API调用大模型.pdf",
+          "score": 0.5127
+        }
+      ]
+    },
+    {
+      "id": 17,
+      "type": "跨文档",
+      "question": "要给容器做数据卷管理，用哪个命令？",
+      "expectFile": "Docker命令汇总.pdf",
+      "expectKeywords": [
+        "volume"
+      ],
+      "strictRank": 1,
+      "fileRank": 1,
+      "top3": [
+        {
+          "fileName": "Docker命令汇总.pdf",
+          "score": 0.5954
+        },
+        {
+          "fileName": "API调用大模型.pdf",
+          "score": 0.5913
+        },
+        {
+          "fileName": "8种主流Agent框架.pdf",
+          "score": 0.5683
+        }
+      ]
+    },
+    {
+      "id": 18,
+      "type": "跨文档",
+      "question": "哪份文档给出了把 MCP Server 接进 Agent 框架的代码示例？",
+      "expectFile": "8种主流Agent框架.pdf",
+      "expectKeywords": [
+        "MCP"
+      ],
+      "strictRank": 1,
+      "fileRank": 1,
+      "top3": [
+        {
+          "fileName": "8种主流Agent框架.pdf",
+          "score": 0.6668
+        },
+        {
+          "fileName": "8种主流Agent框架.pdf",
+          "score": 0.664
+        },
+        {
+          "fileName": "Rerank模型的部署及使用.pdf",
+          "score": 0.6559
+        }
+      ]
+    },
+    {
+      "id": 19,
+      "type": "跨文档",
+      "question": "RAG 的英文全称是什么？",
+      "expectFile": "RAG聊天机器人VS AI Agent.pdf",
+      "expectKeywords": [
+        "Retrieval-Augmented Generation"
+      ],
+      "strictRank": 8,
+      "fileRank": 8,
+      "top3": [
+        {
+          "fileName": "API调用大模型.pdf",
+          "score": 0.4571
+        },
+        {
+          "fileName": "Rerank模型的部署及使用.pdf",
+          "score": 0.4348
+        },
+        {
+          "fileName": "Rerank模型的部署及使用.pdf",
+          "score": 0.433
+        }
+      ]
+    },
+    {
+      "id": 20,
+      "type": "跨文档",
+      "question": "除了开源模型，Rerank 还可以调用哪家公司的线上模型 API？",
+      "expectFile": "Rerank模型的部署及使用.pdf",
+      "expectKeywords": [
+        "Cohere"
+      ],
+      "strictRank": 1,
+      "fileRank": 1,
+      "top3": [
+        {
+          "fileName": "Rerank模型的部署及使用.pdf",
+          "score": 0.6647
+        },
+        {
+          "fileName": "API调用大模型.pdf",
+          "score": 0.6254
+        },
+        {
+          "fileName": "8种主流Agent框架.pdf",
+          "score": 0.6243
+        }
+      ]
+    }
+  ]
+}

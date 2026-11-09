@@ -1,0 +1,165 @@
+[
+  {
+    "id": 1,
+    "type": "精确术语",
+    "question": "docker logs 这个命令是做什么的？",
+    "expectFile": "Docker命令汇总.pdf",
+    "expectKeywords": ["日志"],
+    "note": "考命令名这类强关键词匹配，纯向量检索容易和 docker ps / docker inspect 混淆"
+  },
+  {
+    "id": 2,
+    "type": "精确术语",
+    "question": "演示部署 Rerank 时用的是智源的哪个开源模型？",
+    "expectFile": "Rerank模型的部署及使用.pdf",
+    "expectKeywords": ["bge-reranker-large"],
+    "note": "模型名属于低频专有名词，这类题是 BM25 的主场"
+  },
+  {
+    "id": 3,
+    "type": "精确术语",
+    "question": "OpenAI Agents SDK 是从哪个内部实验项目演变来的？",
+    "expectFile": "8种主流Agent框架.pdf",
+    "expectKeywords": ["Swarm"],
+    "note": "英文专有名词，且答案只出现过一次"
+  },
+  {
+    "id": 4,
+    "type": "精确术语",
+    "question": "提示词里用哪个参数来指定输出格式？",
+    "expectFile": "AI大模型提示词技巧.pdf",
+    "expectKeywords": ["output_format"],
+    "note": "参数名，语义检索很难把“输出格式”和 output_format 直接对上"
+  },
+  {
+    "id": 5,
+    "type": "精确术语",
+    "question": "HuggingFace 推出的、用来部署 Rerank 模型的工具叫什么？",
+    "expectFile": "Rerank模型的部署及使用.pdf",
+    "expectKeywords": ["TEI"],
+    "note": "缩写与全称混用，考向量模型对缩写的泛化"
+  },
+
+  {
+    "id": 6,
+    "type": "语义改述",
+    "question": "他有没有把老系统整体换成现代前端框架的经历？",
+    "expectFile": "张宝玉简历-优化版.md",
+    "expectKeywords": ["JSP"],
+    "note": "问句里没有 JSP / 迁移 这些原词，考纯语义匹配"
+  },
+  {
+    "id": 7,
+    "type": "语义改述",
+    "question": "他做过的项目里，有没有需要跟硬件设备打交道的？",
+    "expectFile": "张宝玉简历-优化版.md",
+    "expectKeywords": ["蓝牙"],
+    "note": "把“蓝牙 BLE 通信”改述成“跟硬件设备打交道”"
+  },
+  {
+    "id": 8,
+    "type": "语义改述",
+    "question": "哪个应用是他自己打包并发布到苹果应用商店的？",
+    "expectFile": "张宝玉简历-优化版.md",
+    "expectKeywords": ["App Store"],
+    "note": "中文改述对应英文短语，跨语言语义对齐"
+  },
+  {
+    "id": 9,
+    "type": "语义改述",
+    "question": "检索出一堆文档之后，怎么把最相关的几篇挑到最前面？",
+    "expectFile": "Rerank模型的部署及使用.pdf",
+    "expectKeywords": ["排序"],
+    "note": "问句是“挑到前面”，原文是“重新排序”，考概念级匹配"
+  },
+  {
+    "id": 10,
+    "type": "语义改述",
+    "question": "不靠人工介入就能自动处理重复性任务的系统属于哪一类？",
+    "expectFile": "RAG聊天机器人VS AI Agent.pdf",
+    "expectKeywords": ["任务自动化"],
+    "note": "与 RAG 文档意思相近，考能否区分 Agent 的定位"
+  },
+
+  {
+    "id": 11,
+    "type": "数字代号",
+    "question": "这张发票的价税合计金额是多少？",
+    "expectFile": "电脑300元发票.pdf",
+    "expectKeywords": ["300"],
+    "note": "数字型字段，向量检索对数字极不敏感"
+  },
+  {
+    "id": 12,
+    "type": "数字代号",
+    "question": "这张发票是哪天开的？",
+    "expectFile": "电脑300元发票.pdf",
+    "expectKeywords": ["2026年10月13日"],
+    "note": "日期字段，考精确字符串召回"
+  },
+  {
+    "id": 13,
+    "type": "数字代号",
+    "question": "这张发票的开票人是谁？",
+    "expectFile": "电脑300元发票.pdf",
+    "expectKeywords": ["朱伊唯"],
+    "note": "人名，低频实体"
+  },
+  {
+    "id": 14,
+    "type": "数字代号",
+    "question": "协作办公平台重构时，迁移了多少个流程发起表单页面？",
+    "expectFile": "张宝玉简历-优化版.md",
+    "expectKeywords": ["260"],
+    "note": "简历里有 260+ / 250+ / 271+ 多个数字，考能否选对那一个"
+  },
+  {
+    "id": 15,
+    "type": "数字代号",
+    "question": "玉佛禅寺 APP 里封装了多少个公共组件？",
+    "expectFile": "张宝玉简历-优化版.md",
+    "expectKeywords": ["65"],
+    "note": "同一段里还有 100+ 页面、30+ 状态模块，考数字定位精度"
+  },
+
+  {
+    "id": 16,
+    "type": "跨文档",
+    "question": "想确认一家公司的纳税人识别号，应该查哪份文档？",
+    "expectFile": "电脑300元发票.pdf",
+    "expectKeywords": ["统一社会信用代码"],
+    "note": "税务机关用语改述，需在发票和简历之间做选择"
+  },
+  {
+    "id": 17,
+    "type": "跨文档",
+    "question": "要给容器做数据卷管理，用哪个命令？",
+    "expectFile": "Docker命令汇总.pdf",
+    "expectKeywords": ["volume"],
+    "note": "volume 在语料里出现多次，但只有 Docker 文档给的是命令用法"
+  },
+  {
+    "id": 18,
+    "type": "跨文档",
+    "question": "哪份文档给出了把 MCP Server 接进 Agent 框架的代码示例？",
+    "expectFile": "8种主流Agent框架.pdf",
+    "expectKeywords": ["MCP"],
+    "note": "MCP 是高频词，多地出现，考能否定位到真正讲集成的那篇"
+  },
+  {
+    "id": 19,
+    "type": "跨文档",
+    "question": "RAG 的英文全称是什么？",
+    "expectFile": "RAG聊天机器人VS AI Agent.pdf",
+    "expectKeywords": ["Retrieval-Augmented Generation"],
+    "note": "Rerank 文档也大量提到 RAG，考两篇相似文档的区分能力"
+  },
+  {
+    "id": 20,
+    "type": "跨文档",
+    "question": "除了开源模型，Rerank 还可以调用哪家公司的线上模型 API？",
+    "expectFile": "Rerank模型的部署及使用.pdf",
+    "expectKeywords": ["Cohere"],
+    "note": "答案藏在“目前可用的 Rerank 模型并不多”那段，考长句中的实体召回"
+  }
+]
