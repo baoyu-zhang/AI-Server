@@ -34,6 +34,35 @@ function isAttachmentQuery(query, files) {
   return q.length <= 6
 }
 
+// 按名次融合多个检索源的结果（RRF）
+// 为什么不能直接按 score 排序：知识库走的是"向量 + BM25 融合分"，会话附件走的是纯 cosine，
+// 两者的分数量纲不同，直接比较会让一方系统性地碾压另一方（比如附件 cosine 0.6 永远压过融合分 0.4）。
+// 排名是唯一可比的信号，所以按 1/(60 + rank) 累加，与 rag-vector.js 内部的融合口径保持一致。
+const MERGE_RRF_K = 60
+function mergeByRank(lists, topK) {
+  const merged = new Map()
+  for (const list of lists) {
+    list.forEach((item, index) => {
+      // 同一片段在不同源里不会重名，用来源 + 文件名 + 正文前缀做 key 即可
+      const key = `${item.sourceType}|${item.fileName}|${item.content.slice(0, 40)}`
+      const rankScore = 1 / (MERGE_RRF_K + index + 1)
+      const current = merged.get(key)
+      if (current) {
+        current.raw += rankScore // 两源都命中，说明更可信
+      } else {
+        merged.set(key, { ...item, raw: rankScore })
+      }
+    })
+  }
+  // 统一归一化到 0~1：双源都排第 1 得 1.0，单源排第 1 得 0.5
+  // 必须是"先累加原始分、最后一次性归一化"；初始值归一化后再累加原始分，两种量纲会混在一起
+  const maxRaw = 2 / (MERGE_RRF_K + 1)
+  return [...merged.values()]
+    .map(({ raw, ...item }) => ({ ...item, score: Number((raw / maxRaw).toFixed(4)) }))
+    .sort((a, b) => b.score - a.score)
+    .slice(0, topK)
+}
+
 // ========== 工具集合：按会话构建 ==========
 // 工具分三类，差别不在"功能"，而在"谁执行、什么时候执行"：
 //   ① 服务端工具（本函数）：有 execute，流内立即执行，结果自动回填给模型继续生成
@@ -115,11 +144,12 @@ function createTools(sessionId) {
         // 合并策略分两种，这是本工具最容易被忽略的设计：
         //   附件意图：附件优先占位，不足的再用知识库补。
         //     否则长期知识库的片段永远压过"用户刚上传的那份文件"，用户会觉得"它根本没看我的文件"。
-        //   普通意图：一律按相似度排序，谁更相关谁在前。
+        //   普通意图：按名次融合排序，谁更相关谁在前。
+        //     这里不能直接比较两个源的 score——知识库是融合分、附件是 cosine，量纲不同。
         if (attachments.length && isAttachmentQuery(query, getSessionFiles(sessionId))) {
           searchResult = [...attachments.slice(0, topK), ...knowledge].slice(0, topK)
         } else {
-          searchResult = [...knowledge, ...attachments].sort((a, b) => b.score - a.score).slice(0, topK)
+          searchResult = mergeByRank([knowledge, attachments], topK)
         }
         // 空结果也必须是合法返回：让模型明确知道"查了但没有"，而不是让它自由发挥编一个答案
         if (!searchResult.length) return { text: '知识库和本次会话附件中都没有检索到相关内容', sources: [] }
@@ -129,10 +159,11 @@ function createTools(sessionId) {
         return {
           // ① 给模型读的文本。三个细节都是刻意的：
           //   【片段N】让模型能说"根据片段2"，人也能对上号；
-          //   写出相似度，低分时模型自己会更谨慎（这是最便宜的"置信度提示"）；
+          //   写出相关度，低分时模型自己会更谨慎（这是最便宜的"置信度提示"）；
           //   标出来源文件名，避免模型把附件内容说成知识库内容。
+          //   score 是"融合相关度"（两路/两源都命中才接近 1），不是余弦相似度，所以不能写成"相似度"。
           text: searchResult
-            .map((item, i) => `【片段${i + 1}】相似度：${item.score.toFixed(3)}\n来源：${item.fileName}${item.sourceType === 'attachment' ? '（本次会话附件）' : ''}\n${item.content}`)
+            .map((item, i) => `【片段${i + 1}】相关度：${item.score.toFixed(3)}\n来源：${item.fileName}${item.sourceType === 'attachment' ? '（本次会话附件）' : ''}\n${item.content}`)
             .join('\n\n'),
           // ② 给前端渲染的结构化数据。score 用 Number 包一层保持数字类型
           //   （toFixed 返回字符串，前端拿去做排序/阈值判断会变成字符串比较，'0.9' < '0.85' 这种坑）
