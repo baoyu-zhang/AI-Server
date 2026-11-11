@@ -19,3 +19,9 @@ uploads/
 .DS_Store
 
 dist/
+
+# 候选人状态表（本地运行时数据）
+data/
+
+# 每次跑评测都会覆盖的产物，基线文件（baseline*.json）才是要留的
+server/eval/results/latest.json

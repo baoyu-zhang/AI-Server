@@ -18,10 +18,15 @@
 | 元数据三字段 | 已完成 | `rag-vector.js` `batchInsertEmbedding(chunks, fileName, meta)`，白名单只收 `docType/jobId/candidateId` |
 | 双路过滤 | 已完成 | `matchesFilter` + 向量路透传 `filter` + BM25 打分前过滤 |
 | 上传接业务参数 | 已完成 | `/api/upload-doc` 收 `docType/jobId/candidateId`，简历缺 `candidateId`、JD 缺 `jobId` 直接 400 |
+| 同名文件不互相覆盖 | 已完成 | `resolveDocName`：同业务对象沿用原名覆盖，不同候选人另存 `-2/-3`（否则后传的会删掉前一个人的简历） |
+| `scoreResumeAgainstJD` | 已完成 | `score-resume.js`：四维加权（30/20/20/15）+ 三道硬门槛否决，模型只判档位、代码加总 |
+| `listCandidates` / `listJobs` | 已完成 | 服务端工具，给模型"拿到真实 id"的入口；另有 `GET /api/candidates`、`GET /api/jobs` 供前端 |
+| `updateCandidateStatus` | 已完成 | 审批工具 + `candidates-store.js`（JSON 持久化、写串行化、原子替换、幂等） |
 | 简历脱敏 | 未开始 | `rag-utils.js` 切块前插一步 |
-| `scoreResumeAgainstJD` | 未开始 | 新增文件，rubric 五项、模型只判定、代码加总 |
-| `updateCandidateStatus` | 未开始 | 复制 `deleteSessionFile` 的审批工具范式 |
-| 文档列表按类型分组 | 未开始 | `/api/documents` + `DocPanel.vue` |
+| 文档列表按类型分组 | 接口已完成 / 前端未做 | `/api/documents` 已带 `docType/jobId/candidateId`，`DocPanel.vue` 未改 |
+
+验收脚本：`npm run verify:hr`（39 项断言，覆盖 store 单测、同名上传、评分接线、审批 interrupt→resume→重放幂等；
+`--skip-model` 可只跑不需要模型的前两段）。
 
 ---
 

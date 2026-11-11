@@ -377,24 +377,77 @@ async function getAllItems() {
 
 /**
  * 获取文档列表：按 fileName 聚合向量片段
- * 只返回文件名、片段数、入库时间，不把向量本体传给前端
- * @returns {Promise<Array<{fileName: string, chunkCount: number, createdAt: number}>>}
+ * 只返回文件名、片段数、入库时间与业务标签，不把向量本体传给前端
+ *
+ * 业务标签（docType / jobId / candidateId）之所以要带出来：`/api/upload-doc` 判断
+ * "这次上传是不是同一份业务对象"全靠它。没有它，两个候选人都传「简历.md」时，
+ * 后传的那份会把前一个人的片段删掉——覆盖变成互相覆盖。
+ * @returns {Promise<Array<{fileName: string, chunkCount: number, createdAt: number, docType?: string, jobId?: string, candidateId?: string}>>}
  */
 async function getDocuments() {
   const items = await index.listItems()
   const map = new Map()
   for (const item of items) {
-    const fileName = item.metadata?.fileName
+    const meta = item.metadata || {}
+    const fileName = meta.fileName
     if (!fileName) continue // 没有文件名的历史数据不纳入文档列表
     if (!map.has(fileName)) {
-      map.set(fileName, { fileName, chunkCount: 0, createdAt: item.metadata.createdAt || 0 })
+      map.set(fileName, {
+        fileName,
+        chunkCount: 0,
+        createdAt: meta.createdAt || 0,
+        // 同一文件的所有片段共享同一组标签，取第一条即可（旧语料没有这些字段，值为 undefined）
+        docType: meta.docType,
+        jobId: meta.jobId,
+        candidateId: meta.candidateId
+      })
     }
     const doc = map.get(fileName)
     doc.chunkCount += 1
     // 取最新一次入库时间，便于同名文档重新上传后排序
-    doc.createdAt = Math.max(doc.createdAt, item.metadata.createdAt || 0)
+    doc.createdAt = Math.max(doc.createdAt, meta.createdAt || 0)
   }
   return Array.from(map.values()).sort((a, b) => b.createdAt - a.createdAt)
+}
+
+/**
+ * 按业务字段聚合成清单（候选人 / 岗位）
+ * 抽成一个函数是因为两者逻辑完全一样，只是聚合键不同；复制两遍将来改字段要改两处。
+ * @param {'candidateId'|'jobId'} field 聚合键
+ * @param {(meta: object) => boolean} [predicate] 额外筛选，用于"统计岗位时排除简历片段"
+ * @returns {Promise<Array<{key: string, fileName: string, chunkCount: number, createdAt: number, jobId?: string, candidateId?: string}>>}
+ */
+async function groupByBizField(field, predicate) {
+  const items = await index.listItems()
+  const map = new Map()
+  for (const item of items) {
+    const meta = item.metadata || {}
+    const key = meta[field]
+    // 没有该字段的片段不参与聚合：旧语料没有 candidateId，不能让它变成一条"空候选人"
+    if (!key) continue
+    if (predicate && !predicate(meta)) continue
+    if (!map.has(key)) {
+      map.set(key, { key, fileName: meta.fileName, chunkCount: 0, createdAt: 0, jobId: meta.jobId, candidateId: meta.candidateId })
+    }
+    const entry = map.get(key)
+    entry.chunkCount += 1
+    entry.createdAt = Math.max(entry.createdAt, meta.createdAt || 0)
+  }
+  return Array.from(map.values()).sort((a, b) => b.createdAt - a.createdAt)
+}
+
+/** 候选人清单：只统计带 candidateId 的片段（简历入库强制带 candidateId，所以这里天然只有简历） */
+async function getCandidates() {
+  return await groupByBizField('candidateId')
+}
+
+/**
+ * 岗位清单：按 jobId 聚合，排除简历类片段
+ * 为什么要排除：简历也可以标 jobId（表示"投的是这个岗"），如果一并计入，
+ * 一个岗位的"片段数"里会混进几十段简历正文，看的人会误以为 JD 很长。
+ */
+async function getJobs() {
+  return await groupByBizField('jobId', meta => meta.docType !== 'resume')
 }
 
 /**
@@ -433,6 +486,8 @@ module.exports = {
   tokenize, // 导出给单元测试验证分词行为
   getAllItems,
   getDocuments,
+  getCandidates, // 候选人清单：按 metadata.candidateId 聚合
+  getJobs, // 岗位清单：按 metadata.jobId 聚合
   deleteDocument,
   clearVectorIndex
 }

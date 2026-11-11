@@ -8,9 +8,17 @@ const { EventEncoder } = require('@ag-ui/encoder') // AG-UI 官方 SSE 事件编
 const fs = require('fs') // 用于清理解析后的临时文件
 const path = require('path') // 用于解析上传文件的后缀名
 const { UPLOAD_DIR, ALLOWED_EXTS, IMAGE_EXTS, extractFileText, splitTextIntoChunks } = require('./rag-utils')
-const { initVectorStore, batchInsertEmbedding, searchVector, getDocuments, deleteDocument } = require('./rag-vector')
+const { initVectorStore, batchInsertEmbedding, searchVector, getDocuments, getCandidates, getJobs, deleteDocument } = require('./rag-vector')
 const { addSessionFile, addSessionImage, deleteSessionFile, getSessionFiles, searchSessionFiles } = require('./session-files')
 const { prepareChatStream, MAX_CONTEXT_TOKENS } = require('./chat-core') // 聊天主链路（裁剪/附件/选模型/streamText）
+const { scoreResumeAgainstJD } = require('./score-resume') // 招聘场景的领域能力：简历 × JD 匹配度评估
+const {
+  CANDIDATE_STATUS, // 状态白名单，工具入参的 enum 与写库校验共用一份
+  listCandidates: listCandidateRecords,
+  upsertCandidate,
+  updateCandidateStatus,
+  recordScore
+} = require('./candidates-store')
 const app = express() // 创建 Express 应用实例
 const PORT = process.env.PORT || 3000 // 服务端口：优先取环境变量，默认 3000
 app.use(express.json()) // 注册 JSON 请求体解析中间件
@@ -175,6 +183,87 @@ function createTools(sessionId) {
           }))
         }
       }
+    }),
+
+    // ---- 招聘场景①：候选人 / 岗位清单（"模型拿不到 id" 的解药）----
+    // 为什么必须先有这个工具再注册评分工具：
+    // 模型看不到向量库里的 metadata，它只知道用户口中的"张三"。如果没有查询入口，
+    // 它只能猜一个 candidateId 去调评分——猜错了返回"材料缺失"，用户看到的就是"它不会用"。
+    listCandidates: tool({
+      description: `列出知识库里已经有简历的候选人，含 candidateId、应聘岗位、当前状态和最近一次评分。
+            用户问"有哪些候选人""这个岗位有几个人""谁还没面试"时必须调用；
+            需要给某人评分但不知道 candidateId 时，也要先调用它拿 id，不要猜。`,
+      inputSchema: z.object({
+        // 状态白名单来自 candidates-store，和写库校验共用一份，避免两处枚举漂移
+        status: z.enum(CANDIDATE_STATUS).optional().describe('只看某个状态的候选人，不传则返回全部')
+      }),
+      async execute({ status }) {
+        // 两路数据合并：向量库决定"谁有简历"，JSON 表决定"状态和分数"
+        const [resumes, records] = await Promise.all([getCandidates(), listCandidateRecords()])
+        const byId = new Map(records.map(item => [item.candidateId, item]))
+        let list = resumes.map(resume => {
+          const record = byId.get(resume.key)
+          return {
+            candidateId: resume.key,
+            // 展示名优先用登记名，没登记过就退回文件名（去掉后缀）
+            name: record?.name || String(resume.fileName || resume.key).replace(/\.[^.]+$/, ''),
+            jobId: record?.jobId || resume.jobId || '',
+            // "待登记"不是合法业务状态，只是提示"这条记录还没走过上传接口"
+            status: record?.status || '待登记',
+            lastScore: record?.lastScore ?? null,
+            lastVerdict: record?.lastVerdict || '',
+            fileName: resume.fileName,
+            chunkCount: resume.chunkCount
+          }
+        })
+        if (status) list = list.filter(item => item.status === status)
+        if (!list.length) {
+          return { text: status ? `没有状态为「${status}」的候选人` : '知识库里还没有候选人简历，请先上传简历并标记 candidateId' }
+        }
+        const lines = list.map((item, i) => {
+          const scorePart = item.lastScore == null ? '未评分' : `最近评分 ${item.lastScore}（${item.lastVerdict}）`
+          return `${i + 1}. candidateId=${item.candidateId}｜${item.name}｜岗位=${item.jobId || '未指定'}｜状态=${item.status}｜${scorePart}｜简历：${item.fileName}（${item.chunkCount} 段）`
+        })
+        return { text: `候选人共 ${list.length} 人：\n${lines.join('\n')}` }
+      }
+    }),
+
+    listJobs: tool({
+      description: '列出知识库里的岗位 JD 及其 jobId。需要按岗位评估候选人但不知道 jobId 时先调用它',
+      inputSchema: z.object({}),
+      async execute() {
+        const jobs = await getJobs()
+        if (!jobs.length) return { text: '知识库里还没有岗位 JD，请先上传 JD 并标记 jobId' }
+        const lines = jobs.map((job, i) => `${i + 1}. jobId=${job.key}｜${job.fileName}（${job.chunkCount} 段）`)
+        return { text: `岗位 JD 共 ${jobs.length} 个：\n${lines.join('\n')}` }
+      }
+    }),
+
+    // ---- 招聘场景②：匹配度评估，本项目的业务身份所在 ----
+    // 注意这里只负责"接线"：检索、判定、加总、证据核查全在 score-resume.js。
+    // 拆开的好处是那个文件能脱离 HTTP 与 AG-UI 单独跑评测。
+    scoreResumeAgainstJD: tool({
+      description: `评估某位候选人对某个岗位的匹配度，返回四个维度的分项得分、硬性门槛结论和简历原文依据。
+            用户问"某人和这个岗位匹配吗""能不能约面试""简历符合要求吗"时必须调用。
+            入参必须用真实 id：不知道就先调 listCandidates 取 candidateId、listJobs 取 jobId，绝对不要编造。`,
+      inputSchema: z.object({
+        candidateId: z.string().describe('候选人标识，必须是 listCandidates 返回的 candidateId'),
+        jobId: z.string().describe('岗位标识，必须是 listJobs 返回的 jobId')
+      }),
+      async execute({ candidateId, jobId }) {
+        const result = await scoreResumeAgainstJD({ candidateId, jobId })
+        // 材料缺失是正常分支而不是异常：告诉模型缺什么，它才能引导用户补材料
+        if (!result.ok) return { text: result.text, sources: [] }
+        // 结论写回候选人表——刷新页面后列表里还能看到"这个人上次评了多少分"
+        await recordScore(candidateId, { score: result.score, verdict: result.verdict, jobId })
+        return {
+          text: result.text,
+          sources: result.sources,
+          // 下面两个字段不进模型上下文（模型只读 text），留给前端做卡片和表格
+          score: result.score,
+          verdict: result.verdict
+        }
+      }
     })
   }
 }
@@ -217,11 +306,18 @@ function createFrontendTools(definitions, serverTools) {
 // interrupt/resume 把"等待"变成协议状态：本轮正常结束并返回 interrupt，
 // 用户决定后用新请求 resume，服务端因此完全无状态。
 const INTERRUPT_PREFIX = 'int_' // interrupt id 由服务端自己生成，用它承载 toolCallId
-const APPROVAL_TOOL_NAME = 'deleteSessionFile'
+
+/**
+ * 需要人工确认的工具名单。
+ * 从单个字符串改成 Set，是因为审批工具从 1 个变成 2 个之后，三处判断（挂载工具、拦 tool-call、resume 白名单）
+ * 都靠这个名字；继续用字符串就得写成 `a || b`，漏掉一处就变成"某个工具绕过了审批直接执行"。
+ * 用 Set 之后，加新工具只需要往这里加一行。
+ */
+const APPROVAL_TOOL_NAMES = new Set(['deleteSessionFile', 'updateCandidateStatus'])
 
 function createApprovalTools() {
   return {
-    [APPROVAL_TOOL_NAME]: tool({
+    deleteSessionFile: tool({
       // 描述里"只有在用户明确要求删除附件时才调用"是第二道闸：
       // 第一道是 interrupt（执行前必暂停），这一道降低误触发概率——删除不可恢复，值得写死。
       description: '删除本次会话中已上传的某个附件。删除不可恢复，调用后会暂停并等待用户确认；只有在用户明确要求删除附件时才调用',
@@ -229,6 +325,18 @@ function createApprovalTools() {
         // 强调"必须是清单里的完整文件名"：模型容易把文件名截断或改写成"简历.pdf"，
         // 到 resume 阶段按名字精确匹配时会找不到文件。
         fileName: z.string().describe('要删除的附件文件名，必须是附件清单里出现的完整文件名')
+      })
+    }),
+
+    updateCandidateStatus: tool({
+      // 改状态有副作用且要通知别人（约面、淘汰），所以和一键删除一样走审批。
+      // 描述里写清"只在用户明确要求改状态时调用"，避免模型在评分之后自作主张把状态推成"待面试"。
+      description: `修改候选人的招聘状态。可选状态：${CANDIDATE_STATUS.join(' / ')}。
+            调用后会暂停并等待用户确认；只有在用户明确要求变更某人状态时才调用，评分本身不要顺手改状态。`,
+      inputSchema: z.object({
+        candidateId: z.string().describe('候选人标识，必须是 listCandidates 返回的 candidateId'),
+        status: z.enum(CANDIDATE_STATUS).describe('目标状态，只能从给定枚举里选'),
+        reason: z.string().optional().describe('变更原因，一句话说明，会展示在确认框里')
       })
     })
   }
@@ -257,19 +365,45 @@ function findToolCall(messages, toolCallId) {
 }
 
 /**
+ * 中断时展示给用户确认的文案。
+ * 按工具分支而不是统一写"是否允许执行该操作"：用户要能一眼看出自己将改变什么，
+ * 否则确认框就是一个无脑点"同意"的按钮，审批也就失去了意义。
+ */
+function approvalMessage({ toolName, input }) {
+  if (toolName === 'deleteSessionFile') {
+    return `即将删除附件「${input?.fileName || ''}」，删除后不可恢复，是否允许？`
+  }
+  if (toolName === 'updateCandidateStatus') {
+    const reason = input?.reason ? `\n原因：${input.reason}` : ''
+    return `即将把候选人「${input?.candidateId || ''}」的状态改为「${input?.status || ''}」。${reason}\n是否允许？`
+  }
+  return `即将执行 ${toolName}，是否允许？`
+}
+
+/**
  * 执行用户已确认的审批工具。
  * 三道校验都不是多余的：resume 的 interruptId 来自客户端，属于不可信输入。
  */
-function executeApprovalTool(toolName, input, sessionId) {
-  if (toolName !== APPROVAL_TOOL_NAME) return `操作失败：未知的审批工具 ${toolName}` // 白名单：防止伪造中断去调别的工具
-  const fileName = String(input?.fileName || '').trim()
-  if (!fileName) return '删除失败：缺少文件名'
-  // 只在本会话附件里找：防止构造一个别的会话的文件名来越权删除
-  const file = getSessionFiles(sessionId).find(item => item.fileName === fileName)
-  if (!file) return `删除失败：本次会话中没有名为「${fileName}」的附件`
-  return deleteSessionFile(sessionId, file.fileId)
-    ? `已删除附件：${fileName}`
-    : `删除失败：${fileName}`
+async function executeApprovalTool(toolName, input, sessionId) {
+  if (!APPROVAL_TOOL_NAMES.has(toolName)) return `操作失败：未知的审批工具 ${toolName}` // 白名单：防止伪造中断去调别的工具
+
+  if (toolName === 'deleteSessionFile') {
+    const fileName = String(input?.fileName || '').trim()
+    if (!fileName) return '删除失败：缺少文件名'
+    // 只在本会话附件里找：防止构造一个别的会话的文件名来越权删除
+    const file = getSessionFiles(sessionId).find(item => item.fileName === fileName)
+    if (!file) return `删除失败：本次会话中没有名为「${fileName}」的附件`
+    return deleteSessionFile(sessionId, file.fileId)
+      ? `已删除附件：${fileName}`
+      : `删除失败：${fileName}`
+  }
+
+  // updateCandidateStatus：真正的写库动作在 candidates-store.js，这里只负责把结果翻译成一句人话
+  const candidateId = String(input?.candidateId || '').trim()
+  const result = await updateCandidateStatus(candidateId, input?.status)
+  if (!result.ok) return `状态修改失败：${result.error}`
+  if (result.unchanged) return `候选人「${candidateId}」的状态已经是「${result.record.status}」，未做修改`
+  return `已将候选人「${candidateId}」的状态从「${result.from}」改为「${result.record.status}」`
 }
 
 // ========== AG-UI 协议适配层 ==========
@@ -481,8 +615,10 @@ app.post('/agui', async (req, res) => {
       const call = findToolCall(aguiMessages, toolCallId)
       if (!call) continue
       const approved = entry.status === 'resolved' && entry.payload?.approved !== false
+      // executeApprovalTool 现在是 async（改状态要写 JSON 文件），必须 await，
+      // 否则下面写回历史的 content 会是一个 Promise，序列化出来是 {}
       const output = approved
-        ? executeApprovalTool(call.name, call.input, sessionId)
+        ? await executeApprovalTool(call.name, call.input, sessionId)
         : '用户拒绝了该操作，未执行'
       // 结果写回历史：快照、模型上下文、前端卡片都靠这条消息对齐
       const messageId = `msg_tool_${++toolMessageSeq}`
@@ -565,8 +701,9 @@ app.post('/agui', async (req, res) => {
         closeText()
         closeReasoning()
         // 审批类工具没有 execute，本轮不会产生 tool-result，先记下来留到收尾转成 interrupt
-        if (part.toolName === APPROVAL_TOOL_NAME) {
-          pendingApprovals.push({ toolCallId: part.toolCallId, input: part.input })
+        // 连 toolName 一起记：收尾时既要用它生成确认文案，也要写进 metadata 供前端区分卡片类型
+        if (APPROVAL_TOOL_NAMES.has(part.toolName)) {
+          pendingApprovals.push({ toolCallId: part.toolCallId, toolName: part.toolName, input: part.input })
         }
         send({
           type: 'TOOL_CALL_START',
@@ -652,14 +789,14 @@ app.post('/agui', async (req, res) => {
             interrupts: pendingApprovals.map(item => ({
               id: `${INTERRUPT_PREFIX}${item.toolCallId}`,
               reason: 'approval',
-              message: `即将删除附件「${item.input?.fileName || ''}」，删除后不可恢复，是否允许？`,
+              message: approvalMessage(item),
               toolCallId: item.toolCallId,
               responseSchema: {
                 type: 'object',
                 properties: { approved: { type: 'boolean', description: '是否允许执行该操作' } },
                 required: ['approved']
               },
-              metadata: { toolName: APPROVAL_TOOL_NAME, input: item.input }
+              metadata: { toolName: item.toolName, input: item.input }
             }))
           }
         })
@@ -752,6 +889,34 @@ const uploadSessionFile = (req, res, next) => {
 // 业务标签白名单：只认这几类，前端传别的值一律丢弃，避免脏值进 metadata 后过滤失效
 const DOC_TYPES = ['resume', 'jd', 'policy', 'other']
 
+/**
+ * 决定本次入库最终使用的文件名。
+ * 同名文档有两种完全不同的含义，必须分开处理：
+ *   ① 同一个业务对象重新上传（docType / jobId / candidateId 完全一致）→ 沿用原名，覆盖旧片段，幂等；
+ *   ② 不同业务对象的同名文件（两个候选人都叫「简历.md」）→ 加序号另存。
+ *      不加序号的话，后面那句 deleteDocument(fileName) 会把前一个人的简历删掉——
+ *      这是"上传即覆盖"最危险的副作用，而且在单候选人测试时永远发现不了。
+ * 判断依据只能是业务标签，不能靠文件名：文件名是给人看的，业务标签才是身份。
+ * @param {string} fileName 原始文件名
+ * @param {{docType?: string, jobId?: string, candidateId?: string}} biz
+ * @returns {Promise<string>}
+ */
+async function resolveDocName(fileName, biz) {
+  const docs = await getDocuments()
+  const sameName = docs.filter(doc => doc.fileName === fileName)
+  const sameOwner = sameName.some(doc =>
+    doc.docType === biz.docType && doc.jobId === biz.jobId && doc.candidateId === biz.candidateId
+  )
+  if (!sameName.length || sameOwner) return fileName
+
+  const ext = path.extname(fileName)
+  const base = fileName.slice(0, fileName.length - ext.length)
+  let seq = 2
+  // 必须循环到没被占用为止：只加一次 -2 的话，第三次上传又撞上 -2，覆盖问题原样复现
+  while (docs.some(doc => doc.fileName === `${base}-${seq}${ext}`)) seq++
+  return `${base}-${seq}${ext}`
+}
+
 app.post('/api/upload-doc', upload.single('file'), async (req, res) => {
   // 提到 try 外面：校验失败时也要能拿到路径去删文件
   const filePath = req.file?.path
@@ -773,26 +938,42 @@ app.post('/api/upload-doc', upload.single('file'), async (req, res) => {
       return res.status(400).json({ error: '岗位 JD 必须带 jobId（岗位标识）' })
     }
 
-    const fileName = fixFileName(req.file.originalname)
-    const ext = path.extname(fileName).toLowerCase()
+    const uploadName = fixFileName(req.file.originalname)
+    const ext = path.extname(uploadName).toLowerCase()
     const rawText = await extractFileText(filePath, ext)
     const chunks = splitTextIntoChunks(rawText, 800, 150)
-    if (!chunks.length) return res.status(400).json({ error: '未能从文件中解析出文本' })
+    if (!chunks.length) {
+      // 解析不出文本也算失败：multer 已经把文件落盘了，不清掉就是孤儿文件
+      fs.unlink(filePath, () => {})
+      return res.status(400).json({ error: '未能从文件中解析出文本' })
+    }
+
+    const biz = { docType, jobId, candidateId }
+    // 同名不同候选人时改名，避免 deleteDocument 把别人的简历删掉
+    const fileName = await resolveDocName(uploadName, biz)
+    const renamed = fileName !== uploadName
 
     // 同名文档重新上传时先删掉旧片段，避免向量库里出现重复内容
     const removed = await deleteDocument(fileName)
     // 第三个参数就是刚加的业务标签；不传时行为与之前完全一致
-    await batchInsertEmbedding(chunks, fileName, { docType, jobId, candidateId })
+    await batchInsertEmbedding(chunks, fileName, biz)
+
+    // 简历入库即登记候选人：后面的 listCandidates / updateCandidateStatus 都以这张表为准
+    if (docType === 'resume') {
+      await upsertCandidate({ candidateId, fileName, jobId })
+    }
 
     res.json({
       ok: true,
       filename: fileName,
+      // 改名要回给前端：用户看到"我传的是 简历.md，怎么变成 简历-2.md 了"得有个解释
+      renamed,
       chunkCount: chunks.length,
       removed,
       docType,
       jobId,
       candidateId,
-      msg: `成功入库${chunks.length}个文本块${removed ? `，已覆盖旧片段${removed}个` : ''}`
+      msg: `成功入库${chunks.length}个文本块${removed ? `，已覆盖旧片段${removed}个` : ''}${renamed ? `，同名文件已另存为「${fileName}」` : ''}`
     })
   } catch (err) {
     console.error('文档上传解析失败：', err)
@@ -819,6 +1000,47 @@ app.post('/api/documents/delete', async (req, res) => {
     res.json({ ok: true, fileName, removed })
   } catch (err) {
     console.error('删除文档失败', err)
+    res.status(500).json({ error: err.message })
+  }
+})
+// 候选人列表：前端候选人表格的数据源
+// 与 listCandidates 工具读的是同一份数据，但两个出口的用途不同——
+//   工具 → 拼成一段文案给模型读；这里 → 结构化字段给表格渲染和筛选
+app.get('/api/candidates', async (req, res) => {
+  try {
+    const [resumes, records] = await Promise.all([getCandidates(), listCandidateRecords()])
+    const byId = new Map(records.map(item => [item.candidateId, item]))
+    let data = resumes.map(resume => {
+      const record = byId.get(resume.key)
+      return {
+        candidateId: resume.key,
+        name: record?.name || String(resume.fileName || resume.key).replace(/\.[^.]+$/, ''),
+        jobId: record?.jobId || resume.jobId || '',
+        status: record?.status || '待登记',
+        lastScore: record?.lastScore ?? null,
+        lastVerdict: record?.lastVerdict || '',
+        fileName: resume.fileName,
+        chunkCount: resume.chunkCount,
+        updatedAt: record?.updatedAt || resume.createdAt
+      }
+    })
+    // 筛选放服务端：前端拿到全量再 filter 也能做，但将来接分页时接口形状就得改
+    const { jobId, status } = req.query
+    if (jobId) data = data.filter(item => item.jobId === jobId)
+    if (status) data = data.filter(item => item.status === status)
+    res.json({ ok: true, data, statuses: CANDIDATE_STATUS })
+  } catch (err) {
+    console.error('获取候选人列表失败', err)
+    res.status(500).json({ error: err.message })
+  }
+})
+// 岗位列表：JD 的 jobId 只有服务端知道，前端做下拉框要它
+app.get('/api/jobs', async (req, res) => {
+  try {
+    const jobs = await getJobs()
+    res.json({ ok: true, data: jobs.map(job => ({ jobId: job.key, fileName: job.fileName, chunkCount: job.chunkCount })) })
+  } catch (err) {
+    console.error('获取岗位列表失败', err)
     res.status(500).json({ error: err.message })
   }
 })
