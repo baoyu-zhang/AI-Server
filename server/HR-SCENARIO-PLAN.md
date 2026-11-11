@@ -22,11 +22,13 @@
 | `scoreResumeAgainstJD` | 已完成 | `score-resume.js`：四维加权（30/20/20/15）+ 三道硬门槛否决，模型只判档位、代码加总 |
 | `listCandidates` / `listJobs` | 已完成 | 服务端工具，给模型"拿到真实 id"的入口；另有 `GET /api/candidates`、`GET /api/jobs` 供前端 |
 | `updateCandidateStatus` | 已完成 | 审批工具 + `candidates-store.js`（JSON 持久化、写串行化、原子替换、幂等） |
-| 简历脱敏 | 未开始 | `rag-utils.js` 切块前插一步 |
-| 文档列表按类型分组 | 接口已完成 / 前端未做 | `/api/documents` 已带 `docType/jobId/candidateId`，`DocPanel.vue` 未改 |
+| 简历脱敏 | 已完成 | `rag-utils.js` `redactPII`：手机号 / 身份证 / 邮箱 / 银行卡 / 门牌号五条规则，在 `extractFileText` 末尾统一执行 |
+| 前端上传表单带业务标签 | 已完成 | `DocPanel.vue`：类型选择 + 候选人 / 岗位可搜索可新建，必填项前置校验 |
+| 候选人面板 | 已完成 | `CandidatePanel.vue` + `SidePanel.vue`：左侧栏两个页签，卡片式列表，操作走对话（改状态仍经审批） |
+| 文档列表按类型分组 | 已完成 | `/api/documents` 带 `docType/jobId/candidateId`，`DocPanel` 列表渲染为标签 |
 
-验收脚本：`npm run verify:hr`（39 项断言，覆盖 store 单测、同名上传、评分接线、审批 interrupt→resume→重放幂等；
-`--skip-model` 可只跑不需要模型的前两段）。
+验收脚本：`npm run verify:hr`（48 项断言，覆盖 store 单测、同名上传、评分接线、审批 interrupt→resume→重放幂等、
+PII 脱敏五条规则与"入库后磁盘索引里查不到手机号"；`--skip-model` 可只跑不需要模型的前三段）。
 
 ---
 

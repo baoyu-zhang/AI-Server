@@ -1,13 +1,13 @@
 <template>
   <!-- 整体两栏布局：左侧知识库文档栏 + 右侧聊天区 -->
   <div class="app-shell">
-    <!-- 桌面端：文档栏常驻左侧 -->
-    <DocPanel v-if="!isNarrow" class="app-shell__aside" />
+    <!-- 桌面端：文档 / 候选人侧栏常驻左侧 -->
+    <SidePanel v-if="!isNarrow" class="app-shell__aside" @ask="onSend" />
 
-    <!-- 窄屏：文档栏收进左侧抽屉 -->
+    <!-- 窄屏：侧栏收进左侧抽屉 -->
     <t-drawer v-else v-model:visible="docDrawerVisible" placement="left" size="280px" :header="false"
       :footer="false" class="doc-drawer">
-      <DocPanel class="app-shell__drawer-panel" />
+      <SidePanel class="app-shell__drawer-panel" @ask="onSend" />
     </t-drawer>
 
     <!-- 整个聊天面板容器 -->
@@ -172,8 +172,8 @@ import { useMediaQuery } from '@vueuse/core'
 import { useChatStore, USER_META, ASSISTANT_META } from './store/chat'
 // AG-UI 事件里的消息 / 中断类型（真正的请求由 chatEngine 发出）
 import type { Message, Interrupt, ResumeEntry } from '@ag-ui/core'
-// 左侧知识库文档面板
-import DocPanel from './components/DocPanel.vue'
+// 左侧栏（文档 / 候选人两个页签）
+import SidePanel from './components/SidePanel.vue'
 // 引入文件上传组件类型定义
 import type { TdAttachmentItem } from '@tdesign-vue-next/chat/es/index'
 import { useChat } from '@tdesign-vue-next/chat/es/chat-engine'

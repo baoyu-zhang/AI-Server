@@ -322,9 +322,54 @@ async function testApproval() {
   check('重放不重复执行', !duplicated, duplicated?.content)
 }
 
+// ========== E. PII 脱敏 ==========
+async function testRedact() {
+  section('E. PII 脱敏：该抹的抹掉，不该动的别碰')
+  const { redactPII } = require('../rag-utils.js')
+  const cases = [
+    ['手机号', '联系电话 138 1234 5678，随时可到岗', '138'],
+    ['身份证', '身份证号 310115199003074512', '310115199003074512'],
+    ['邮箱', '邮箱 zhang.san+vip@example.com.cn', 'example.com']
+  ]
+  for (const [label, input, secret] of cases) {
+    const { text } = redactPII(input)
+    check(`${label}被抹掉`, !text.includes(secret) && /已脱敏/.test(text), text)
+  }
+
+  // 邮箱里含手机号：手机号规则先跑会挖掉中间，剩下 z[手机号已脱敏]@163.com，等于没盖住
+  const combo = redactPII('邮箱：z15000000000@163.com').text
+  check('手机号形式的邮箱整体被抹', combo.includes('[邮箱已脱敏]'), combo)
+
+  // 这两条是实测踩出来的误伤，必须回归住：误伤不报错，只会让检索质量悄悄下降
+  const taxId = redactPII('统一社会信用代码/纳税人识别号:91310000631494692T').text
+  check('纳税人识别号不被当成银行卡', taxId.includes('91310000631494692T'), taxId)
+  const float = redactPII('source node score: 0.8659382811170047').text
+  check('16 位小数不被当成银行卡', float.includes('0.8659382811170047'), float)
+
+  const address = redactPII('现居：杭州市西湖区文三路 100 号').text
+  check('门牌被抹但城市保留', address.includes('杭州市西湖区') && !address.includes('100 号'), address)
+
+  // 端到端：带手机号的简历入库后，磁盘上的向量库文件里不能再出现那串数字
+  const phone = '13900001111'
+  const uploaded = await uploadDoc(
+    '脱敏验证简历.md',
+    `# 王五\n\n电话：${phone}\n邮箱：wangwu${phone}@qq.com\n\n6 年前端经验，熟悉 Vue3。`,
+    { docType: 'resume', candidateId: 'v-redact' }
+  )
+  check('简历入库成功', uploaded.status === 200 && uploaded.body.ok === true, uploaded.body)
+  const indexFile = path.join(import.meta.dirname, '..', 'vector-index', 'index.json')
+  const raw = fs.existsSync(indexFile) ? fs.readFileSync(indexFile, 'utf8') : ''
+  check('向量库文件里查不到手机号', Boolean(raw) && !raw.includes(phone), raw ? '索引里仍有该号码' : '索引文件不存在')
+  await fetch(`${BASE_URL}/api/documents/delete`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ fileName: '脱敏验证简历.md' })
+  })
+}
+
 async function cleanup() {
   section('清理')
-  for (const name of ['同名简历.md', '同名简历-2.md', '岗位JD.md']) {
+  for (const name of ['同名简历.md', '同名简历-2.md', '岗位JD.md', '脱敏验证简历.md']) {
     const res = await fetch(`${BASE_URL}/api/documents/delete`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -342,6 +387,7 @@ console.log(`${bold('招聘场景切片验收')} ${dim(BASE_URL)}`)
 try {
   await testStore()
   await testUpload()
+  await testRedact()
   if (SKIP_MODEL) {
     console.log(`\n${dim('--skip-model：跳过 C、D 两段需要调模型的用例')}`)
   } else {

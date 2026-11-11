@@ -69,6 +69,66 @@ function cleanText(text) {
 const SENTENCE_SPLIT_RE = /(?<=[。！？；!?;\n])/ // 零宽后行断言：在句号/问号/感叹号/分号/换行之后切分，且不消耗标点本身
 
 /**
+ * PII 脱敏规则表。
+ *
+ * 为什么必须在切块前做：简历一旦入库，同一份手机号会同时出现在
+ * 向量库文件、检索回填给模型的上下文、服务端日志、以及用户点开的【引用来源】里。
+ * 事后清理要同时改四个地方，而入口只有这一处——脱敏放在入口，成本最低、漏得最少。
+ *
+ * 每条规则都带边界断言（(?<!\d) / (?!\d)），这不是洁癖：
+ * 缺了它，"纳税人识别号 91310000MA1FL1XX2Y" 里的片段、
+ * 或 20 位发票号码里的 11 位，都会被误判成手机号/身份证，把业务数据打坏。
+ *
+ * 顺序有意义：先长后短。18 位身份证必须先于 16~19 位银行卡匹配，
+ * 否则身份证会被当成银行卡，占位符写错（信息没丢，但会误导排查）。
+ */
+const PII_RULES = [
+  // 邮箱必须排在第一位：z15021890501@163.com 这种「手机号 + 域名」的邮箱，
+  // 先跑手机号规则会把中间挖掉，剩下 z[手机号已脱敏]@163.com —— 邮箱地址没盖住，反而更难读。
+  { label: '邮箱', pattern: /[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+/g, mask: '[邮箱已脱敏]' },
+  // 身份证：17 位数字 + 1 位数字或 X
+  { label: '身份证', pattern: /(?<![\dA-Za-z.])\d{17}[\dXx](?![\dA-Za-z])/g, mask: '[身份证已脱敏]' },
+  // 银行卡：边界必须把字母和小数点也算进去。
+  //   只写 (?<!\d) 时："91310115336433060T" 这类「数字 + 校验位字母」的纳税人识别号会被打掉半截；
+  //   而 "0.9999999999999999" 这种浮点数，小数部分正好 16 位，会被当成银行卡——
+  //   技术文档里全是这种数，误伤之后检索质量会悄悄下降，却不报任何错。
+  { label: '银行卡', pattern: /(?<![\dA-Za-z.])\d{16,19}(?![\dA-Za-z])/g, mask: '[银行卡已脱敏]' },
+  // 手机号：允许 138 1234 5678 / 138-1234-5678 这类分隔写法
+  { label: '手机号', pattern: /(?<![\dA-Za-z.])1[3-9]\d(?:[\s-]?\d){8}(?![\dA-Za-z])/g, mask: '[手机号已脱敏]' },
+  // 门牌级地址：只抹掉"门牌号"，路名与城市/区县都保留。
+  // 为什么不整段抹：JD 里的工作地点要用来判断"候选人现居地是否匹配"，
+  // 把城市抹了，location 这道硬门槛就没法判；而"某路 969 号"这种精确门牌才是关键隐私。
+  // 为什么用后行断言锚在路名之后、而不是整段匹配：整段匹配必然带一个贪婪的字符类，
+  // 它会把"西湖区文三路"从"区"开始吃进去（实测就是这样），城市信息跟着一起没了。
+  // 只匹配后面的门牌号，就没有"吃多长"的自由度。
+  {
+    label: '门牌地址',
+    // 路名用变长后行断言：V8 支持变长 lookbehind，这是唯一能"只替换后缀"的写法
+    pattern: /(?<=[\u4e00-\u9fa5]{2,6}(?:路|街|大道|巷|弄|胡同))\s*\d{1,5}\s*号/g,
+    mask: '[门牌已脱敏]'
+  }
+]
+
+/**
+ * 对文本做 PII 脱敏
+ * @param {string} text
+ * @returns {{ text: string, hits: Array<{label: string, count: number}> }}
+ *   hits 只用于日志与验收（"这次传的简历里有 2 个手机号"），不返回原文片段，
+ *   否则日志本身又成了泄露渠道。
+ */
+function redactPII(text) {
+  let output = String(text || '')
+  const hits = []
+  for (const rule of PII_RULES) {
+    const matched = output.match(rule.pattern)
+    if (!matched || !matched.length) continue
+    hits.push({ label: rule.label, count: matched.length })
+    output = output.replace(rule.pattern, rule.mask)
+  }
+  return { text: output, hits }
+}
+
+/**
  * 超长单句的兜底切分：按字符窗口硬切，保留 overlap 重叠
  * @param {string} text 超长句子
  * @param {number} chunkSize 单块最大字符
@@ -184,7 +244,13 @@ async function extractFileText(filePath, ext) { // 按后缀分发到不同的�
   if (!cleaned) { // 清洗后没有任何有效字符
     throw new Error('未提取到文本内容，若为扫描版 PDF 需要先做 OCR') // 抛出明确原因，便于前端提示
   }
-  return cleaned // 返回可直接用于切块的纯文本
+  // 脱敏放在解析的最后一步：清洗之后再抹，避免占位符被 cleanText 的空格压缩改形
+  const { text: redacted, hits } = redactPII(cleaned)
+  if (hits.length) {
+    // 只记类型和数量，不记原文——日志本身就是常见的泄露渠道
+    console.log(`🔒 PII 脱敏：${hits.map(item => `${item.label}×${item.count}`).join('，')}`)
+  }
+  return redacted // 返回可直接用于切块的纯文本
 }
 
 module.exports = { // 导出模块对外能力
@@ -192,6 +258,7 @@ module.exports = { // 导出模块对外能力
   ALLOWED_EXTS, // 后缀白名单，供路由层 fileFilter 复用
   IMAGE_EXTS, // 图片附件后缀，会话附件上传时走多模态分支
   cleanText, // 文本清洗函数
+  redactPII, // PII 脱敏，导出给单元测试与入库脚本单独调用
   splitTextIntoChunks, // 文本切块函数
   extractFileText // 文档解析入口
 }
