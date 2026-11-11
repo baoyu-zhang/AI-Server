@@ -36,6 +36,23 @@ const MODEL_JUDGE = process.env.MODEL_JUDGE || 'deepseek-chat'
 const CHUNKS_PER_SIDE = 4
 
 /**
+ * 门槛三项（学历 / 地点 / 到岗）单独再检索一路。
+ *
+ * 为什么不能只靠上面那一路：这三类信息在简历里的"信息密度"极低——
+ * 常常就是「学历：大专」「随时到岗」「期望城市：上海」这么几个词，
+ * 用"核心技能 经验年限 项目经历"去查，它们永远排不进前 4 段（前 4 段全是项目描述）。
+ * 于是模型手里没有依据，却必须给 gate 一个 satisfied —— 它只能推断，而推断会出错：
+ * 实测出现过"简历明写随时到岗，模型却判到岗时间不满足"，直接把 78 分砍到 59 分。
+ * 这不是模型笨，是喂给它的材料里根本没有那句话。
+ */
+const GATE_QUERY = {
+  resume: '学历 专业 到岗时间 现居城市 期望城市 求职意向',
+  jd: '学历要求 工作地点 是否远程 到岗时间'
+}
+// 门槛只补事实，取 2 段就够；取多了会把无关项目描述重新塞回来，反而稀释信号
+const GATE_CHUNKS_PER_SIDE = 2
+
+/**
  * rubric：全模块唯一的事实来源。
  * 权重合计必须 100（满分才是 100）。硬性门槛单独走否决，不计权重 ——
  * 如果把门槛也加权，会出现"学历不符但技术很强 → 75 分建议面试"这种荒谬结论。
@@ -149,7 +166,12 @@ function describeRubric() {
 
 /** 拼接判定 prompt。两份材料都带来源标注，便于模型区分"简历说的"和"JD 要的" */
 function buildPrompt({ candidateId, jobId, resumeText, jdText }) {
+  // 今天是判断"到岗时间是否满足"的唯一参照点，必须显式给模型。
+  // 不给的后果是实测过的：简历写「2026 年 11 月 13 日后可到岗」，JD 要求「一个月内到岗」，
+  // 差一天就该通过，模型却因为没有"现在几点"的概念判了不满足——分数被门槛从 78 砍到 59。
+  const today = new Date().toLocaleDateString('zh-CN', { year: 'numeric', month: '2-digit', day: '2-digit' })
   return `你是招聘评估助手。请根据【岗位 JD】逐项评估【候选人简历】的匹配度。
+今天是 ${today}，需要比较日期时以这一天为基准。
 
 评估维度与档位判据：
 ${describeRubric()}
@@ -157,7 +179,11 @@ ${describeRubric()}
 硬性门槛（不参与打分，只判断是否满足，固定这三项）：
 - education（学历）：JD 写了学历要求的，对照简历判断；JD 没写视为满足。
 - location（工作地点）：JD 写了城市/远程要求的，对照简历现居地或期望地；JD 没写视为满足。
-- availability（到岗时间）：JD 写了到岗时间要求的，对照简历可到岗时间；简历没写视为满足。
+- availability（到岗时间）：JD 写了到岗时间要求的，对照简历可到岗时间与今天的关系；简历没写视为满足。
+  算法：把简历里的具体日期与今天 ${today} 相减得到天数，再和 JD 的要求比较。
+  例：JD 要求「一个月内到岗」，简历写「2026-11-13 后可到岗」，今天 2026-11-12 → 相差 1 天，满足。
+门槛的判定原则是**宁可不误杀**：只有在简历明确写出与 JD 冲突的事实时才判 satisfied=false；
+信息不足、写法含糊、日期换算不确定，一律判 true 并在 note 里说明"信息不足，按满足处理"。
 注意：经验年限、技术栈、项目规模都属于评分维度，不要在门槛里判断，也不要写进 note。
 
 【岗位 JD】（jobId=${jobId}）
@@ -308,6 +334,24 @@ function renderText(result) {
 }
 
 /**
+ * 合并两路检索结果：按正文去重，主路在前。
+ * 为什么是"主路在前"而不是按分数重排：主路是按维度相关性查出来的，
+ * 门槛路只是补事实（学历/地点/到岗那几行），把它插到前面反而会让模型先读琐碎信息。
+ * @param {Array<{content: string}>} primary
+ * @param {Array<{content: string}>} extra
+ */
+function mergeChunks(primary, extra) {
+  const seen = new Set(primary.map(item => item.content))
+  const merged = [...primary]
+  for (const item of extra) {
+    if (seen.has(item.content)) continue // 两路撞上同一段是常态，不能重复喂给模型
+    seen.add(item.content)
+    merged.push(item)
+  }
+  return merged
+}
+
+/**
  * 评估一位候选人对某个岗位的匹配度
  * @param {object} params
  * @param {string} params.candidateId 候选人标识（简历 metadata 里的 candidateId）
@@ -317,9 +361,12 @@ function renderText(result) {
  */
 async function scoreResumeAgainstJD({ candidateId, jobId, query = '岗位要求 核心技能 经验年限 项目经历' }) {
   // 两路检索必须带 filter：不带的话会召回别的候选人简历，评分对象就错了
-  const [resumeChunks, jdChunks] = await Promise.all([
+  // 每边查两次（维度相关 + 门槛事实），四个请求并发发出去，延迟由最慢的一个决定
+  const [resumeChunks, jdChunks, gateResumeChunks, gateJdChunks] = await Promise.all([
     searchVector(query, CHUNKS_PER_SIDE, { candidateId }),
-    searchVector(query, CHUNKS_PER_SIDE, { jobId })
+    searchVector(query, CHUNKS_PER_SIDE, { jobId }),
+    searchVector(GATE_QUERY.resume, GATE_CHUNKS_PER_SIDE, { candidateId }),
+    searchVector(GATE_QUERY.jd, GATE_CHUNKS_PER_SIDE, { jobId })
   ])
 
   // 材料缺失是"有效信息"而不是异常：让调用方（模型）如实告诉用户缺什么，
@@ -331,8 +378,12 @@ async function scoreResumeAgainstJD({ candidateId, jobId, query = '岗位要求 
     return { ok: false, text: `知识库中没有找到岗位「${jobId}」的 JD，请先上传 JD 并标记 jobId=${jobId}` }
   }
 
-  const resumeText = resumeChunks.map((item, i) => `[简历片段${i + 1}] ${item.content}`).join('\n\n')
-  const jdText = jdChunks.map((item, i) => `[JD片段${i + 1}] ${item.content}`).join('\n\n')
+  // 门槛路可能查到主路没有的片段（例如「到岗时间：随时到岗」单独一段），合并后一起喂给模型
+  const resumeAll = mergeChunks(resumeChunks, gateResumeChunks)
+  const jdAll = mergeChunks(jdChunks, gateJdChunks)
+
+  const resumeText = resumeAll.map((item, i) => `[简历片段${i + 1}] ${item.content}`).join('\n\n')
+  const jdText = jdAll.map((item, i) => `[JD片段${i + 1}] ${item.content}`).join('\n\n')
 
   const { output } = await generateText({
     model: createDeepSeek({ apiKey: process.env.DEEPSEEK_API_KEY })(MODEL_JUDGE),
@@ -351,7 +402,7 @@ async function scoreResumeAgainstJD({ candidateId, jobId, query = '岗位要求 
   const result = { ok: true, candidateId, jobId, score, rawScore, verdict, gate, dimensions, missingEvidence }
   result.text = renderText(result)
   // 引用来源：前端复用现有的 sources 渲染，能点开看到评分依据出自哪几段原文
-  result.sources = [...resumeChunks, ...jdChunks].map(item => ({
+  result.sources = [...resumeAll, ...jdAll].map(item => ({
     fileName: item.fileName,
     score: item.score,
     content: item.content,

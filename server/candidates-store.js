@@ -63,8 +63,20 @@ function persist() {
       // 目录要按 STORE_FILE 反推，而不是固定用 DATA_DIR——测试时文件在 /tmp 下
       await fs.promises.mkdir(path.dirname(STORE_FILE), { recursive: true })
       const tmp = `${STORE_FILE}.tmp`
-      await fs.promises.writeFile(tmp, JSON.stringify({ candidates: cache }, null, 2), 'utf8')
-      await fs.promises.rename(tmp, STORE_FILE)
+      const payload = JSON.stringify({ candidates: cache }, null, 2)
+      await fs.promises.writeFile(tmp, payload, 'utf8')
+      try {
+        await fs.promises.rename(tmp, STORE_FILE)
+      } catch (err) {
+        // rename 覆盖已存在文件，在部分环境里会被拦：容器只读挂载、Windows 上文件被占用、
+        // 以及某些安全软件/沙箱的删除保护（EPERM/EXDEV/EACCES）。
+        // 这里必须退化成直接覆盖写：丢掉"原子替换"只影响极端掉电场景，
+        // 而不退化的后果是"内存里改了、磁盘上没改"——重启后状态与分数全部消失，
+        // 用户看到的现象是"改完状态刷新就没了"，且日志里只有一行 rename 失败。
+        console.warn(`[candidates] rename 失败（${err.code || err.message}），改为直接覆盖写`)
+        await fs.promises.writeFile(STORE_FILE, payload, 'utf8')
+        await fs.promises.rm(tmp, { force: true }).catch(() => {})
+      }
     })
     .catch(err => {
       // 落盘失败不能把异常抛给调用方：状态已经改在内存里了，

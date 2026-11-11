@@ -70,6 +70,29 @@
     </div>
 
     <div class="cand-panel__foot">共 {{ candidates.length }} 人 · 评分与状态由对话中的工具写入</div>
+
+    <!--
+      候选人没关联岗位时，让用户当场选一个再评估。
+      为什么不在卡片里直接发请求：评分本身要调模型，走对话才能看到工具调用过程与原文依据；
+      这里只负责把「候选人 × 岗位」这两个 id 拼成一句话，执行仍然交给对话。
+    -->
+    <t-dialog
+      v-model:visible="jobPickerVisible"
+      header="选择评估岗位"
+      width="420px"
+      :confirm-btn="{ content: '开始评估', theme: 'primary' }"
+      @confirm="confirmJob"
+    >
+      <p class="job-picker__tip">
+        候选人 <code>{{ pendingCandidate?.candidateId }}</code> 还没有关联岗位，选一个岗位来评估：
+      </p>
+      <t-radio-group v-model="pickedJobId" class="job-picker__list">
+        <t-radio v-for="job in jobOptions" :key="job.jobId" :value="job.jobId" class="job-picker__item">
+          <span class="job-picker__id">{{ job.jobId }}</span>
+          <span class="job-picker__file">{{ job.fileName }}</span>
+        </t-radio>
+      </t-radio-group>
+    </t-dialog>
   </div>
 </template>
 
@@ -96,6 +119,13 @@ interface DropdownOption {
   content?: string
 }
 
+// 岗位清单：来自 GET /api/jobs（向量库里带 jobId 的片段按岗位聚合）
+interface JobItem {
+  jobId: string
+  fileName: string
+  chunkCount: number
+}
+
 // 操作交给对话去执行：面板只负责"发起意图"，真正改状态要经过审批中断
 const emit = defineEmits<{ ask: [text: string] }>()
 
@@ -105,6 +135,12 @@ const busy = ref(false)
 const expandedId = ref('')
 const statusFilter = ref('')
 const statusFilterOptions = ref<{ label: string; value: string }[]>([{ label: '全部状态', value: '' }])
+
+// 岗位选择弹窗：只在"候选人没有关联岗位"时出现
+const jobPickerVisible = ref(false)
+const jobOptions = ref<JobItem[]>([])
+const pickedJobId = ref('')
+const pendingCandidate = ref<CandidateItem | null>(null)
 
 const STATUS_ACTIONS = ['待筛选', '初筛通过', '待面试', '已面试', '已发offer', '已淘汰']
 const statusActions: DropdownOption[] = STATUS_ACTIONS.map(item => ({ value: item, content: item }))
@@ -165,11 +201,39 @@ function ask(text: string) {
 }
 
 function askScore(item: CandidateItem) {
-  if (!item.jobId) {
-    MessagePlugin.warning('这位候选人还没有关联岗位，请先上传对应岗位的 JD')
+  if (item.jobId) {
+    ask(`请评估候选人 ${item.candidateId} 对岗位 ${item.jobId} 的匹配度`)
     return
   }
-  ask(`请评估候选人 ${item.candidateId} 对岗位 ${item.jobId} 的匹配度`)
+  // 没关联岗位不代表不能评：JD 的 jobId 是检索时的过滤键，只要用户能选出岗位就够了。
+  // 之前这里直接提示"请先上传 JD"然后返回，等于把"上传了 JD 但简历没写岗位"的人堵死。
+  void openJobPicker(item)
+}
+
+/** 拉岗位清单并弹出选择框。岗位为空时给一句能照着做的提示，而不是空白弹窗 */
+async function openJobPicker(item: CandidateItem) {
+  try {
+    const res = await fetch('/api/jobs')
+    const data = await res.json().catch(() => ({}))
+    const jobs: JobItem[] = Array.isArray(data.data) ? data.data : []
+    if (!jobs.length) {
+      MessagePlugin.warning('知识库里还没有岗位 JD：到「文档」页上传 JD，类型选「岗位 JD」并填写岗位 id')
+      return
+    }
+    jobOptions.value = jobs
+    pickedJobId.value = jobs[0].jobId
+    pendingCandidate.value = item
+    jobPickerVisible.value = true
+  } catch (err) {
+    MessagePlugin.error((err as Error).message)
+  }
+}
+
+function confirmJob() {
+  const target = pendingCandidate.value
+  if (!target || !pickedJobId.value) return
+  jobPickerVisible.value = false
+  ask(`请评估候选人 ${target.candidateId} 对岗位 ${pickedJobId.value} 的匹配度`)
 }
 
 // 下拉项被点击：TDesign 的 event 类型没有导出成稳定名字，这里按结构取 value 即可
@@ -353,5 +417,53 @@ defineExpose({ load })
   font-size: var(--td-font-size-body-small);
   color: var(--td-text-color-placeholder);
   text-align: center;
+}
+
+.job-picker__tip {
+  margin: 0 0 var(--td-comp-margin-m);
+  font-size: var(--td-font-size-body-small);
+  color: var(--td-text-color-secondary);
+  line-height: 1.6;
+}
+
+.job-picker__list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--td-comp-margin-xs);
+  width: 100%;
+}
+
+/* 单项一行：jobId 用等宽字体（要照着念给 AI），文件名可省略 */
+.job-picker__item {
+  display: flex;
+  align-items: center;
+  width: 100%;
+  padding: 6px 8px;
+  border-radius: var(--td-radius-default);
+
+  :deep(.t-radio__label) {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    align-items: baseline;
+    gap: var(--td-comp-margin-s);
+    overflow: hidden;
+  }
+}
+
+.job-picker__id {
+  font-family: var(--td-font-family-mono, monospace);
+  font-size: var(--td-font-size-body-small);
+  color: var(--td-text-color-primary);
+}
+
+.job-picker__file {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--td-font-size-body-small);
+  color: var(--td-text-color-placeholder);
 }
 </style>
