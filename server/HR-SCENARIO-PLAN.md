@@ -26,9 +26,11 @@
 | 前端上传表单带业务标签 | 已完成 | `DocPanel.vue`：类型选择 + 候选人 / 岗位可搜索可新建，必填项前置校验 |
 | 候选人面板 | 已完成 | `CandidatePanel.vue` + `SidePanel.vue`：左侧栏两个页签，卡片式列表，操作走对话（改状态仍经审批） |
 | 文档列表按类型分组 | 已完成 | `/api/documents` 带 `docType/jobId/candidateId`，`DocPanel` 列表渲染为标签 |
+| Word（.docx）上传 | 已完成 | `rag-utils.js`：mammoth 转 HTML + `htmlToText`；表格按 `\|` 分行、脱敏照走。`.doc` 明确提示另存为 |
+| 上传失败的错误语义 | 已完成 | 统一错误中间件：格式不支持 / 文件损坏 → 400 JSON，体积超限 → 413；解析失败同步清掉落盘文件 |
 
-验收脚本：`npm run verify:hr`（48 项断言，覆盖 store 单测、同名上传、评分接线、审批 interrupt→resume→重放幂等、
-PII 脱敏五条规则与"入库后磁盘索引里查不到手机号"；`--skip-model` 可只跑不需要模型的前三段）。
+验收脚本：`npm run verify:hr`（61 项断言，覆盖 store 单测、同名上传、评分接线、审批 interrupt→resume→重放幂等、
+PII 脱敏五条规则与"入库后磁盘索引里查不到手机号"、docx 表格还原与坏文件清理；`--skip-model` 可只跑不需要模型的三段）。
 
 ---
 

@@ -1,16 +1,19 @@
 #!/usr/bin/env node
 /**
  * 招聘场景切片验收：候选人登记 → 同名不互相覆盖 → 评分工具接线 → 改状态审批
+ * → PII 脱敏 → Word 解析
  *
- * 分四段，前两段不打模型，可以离线跑：
+ * 前两段不打模型，可以离线跑（--skip-model 会跳 C、D）：
  *   A. candidates-store 单测（用临时文件，不碰正式表）
  *   B. 上传去重：两个候选人传同名文件，必须各留一份
  *   C. 评分工具：模型能否用 listCandidates/listJobs 拿到的 id 跑通评估
  *   D. 改状态审批：interrupt → resume 执行 → 重放不重复执行
+ *   E. PII 脱敏：该抹的抹掉，技术文档里的数字别误伤
+ *   F. Word（.docx）：表格还原成行、照样脱敏、坏文件不留孤儿
  *
  * 用法：
  *   node eval/verify-hr.mjs              # 全跑
- *   node eval/verify-hr.mjs --skip-model # 只跑 A、B（服务需已启动）
+ *   node eval/verify-hr.mjs --skip-model # 只跑 A、B、E、F（服务需已启动）
  */
 import { createRequire } from 'node:module'
 import { randomUUID } from 'node:crypto'
@@ -99,6 +102,15 @@ async function testStore() {
 async function uploadDoc(fileName, content, fields = {}) {
   const form = new FormData()
   form.append('file', new Blob([content], { type: 'text/markdown' }), fileName)
+  for (const [key, value] of Object.entries(fields)) if (value) form.append(key, value)
+  const res = await fetch(`${BASE_URL}/api/upload-doc`, { method: 'POST', body: form, signal: AbortSignal.timeout(TIMEOUT_MS) })
+  return { status: res.status, body: await res.json().catch(() => ({})) }
+}
+
+/** 传二进制文件（docx 这类），content 为 Buffer */
+async function uploadBinary(fileName, content, fields = {}) {
+  const form = new FormData()
+  form.append('file', new Blob([content]), fileName)
   for (const [key, value] of Object.entries(fields)) if (value) form.append(key, value)
   const res = await fetch(`${BASE_URL}/api/upload-doc`, { method: 'POST', body: form, signal: AbortSignal.timeout(TIMEOUT_MS) })
   return { status: res.status, body: await res.json().catch(() => ({})) }
@@ -367,9 +379,69 @@ async function testRedact() {
   })
 }
 
+// ========== F. Word 文档解析 ==========
+/**
+ * 简历十份有九份是 Word。这段盯住三个最容易悄悄错的地方：
+ *   ① 表格 —— 剥标签不还给分隔符，整张经历表会粘成一行，切块切不动且不报错；
+ *   ② 脱敏 —— 走的是同一条 extractFileText 通道，docx 不能绕过；
+ *   ③ 失败清理 —— 加密/损坏文件解析失败时，uploads 里不能留下孤儿文件。
+ */
+async function testDocx() {
+  section('F. Word（.docx）：表格保留行列、照样脱敏、坏文件不留残留')
+  const { extractFileText } = require('../rag-utils.js')
+  const fixture = path.join(import.meta.dirname, 'fixtures', 'sample-resume.docx')
+  check('样本文件存在', fs.existsSync(fixture), fixture)
+
+  const text = await extractFileText(fixture, '.docx')
+  // 表格行必须是「时间 | 公司 | 职位」这种一行三格，而不是一格一行、分隔符跑到行首
+  const tableRow = text.split('\n').find(line => line.includes('未来智能科技')) || ''
+  check('表格按行还原，单元格用 | 分隔', /^2022\.04-2025\.09 \| 未来智能科技 \| 高级前端工程师$/.test(tableRow), tableRow)
+  check('表头同样保留', text.includes('时间 | 公司 | 职位'), text.split('\n').find(line => line.includes('时间')) || '(缺表头)')
+  check('行首没有多余分隔符', !/^\s*\|/m.test(text), text.split('\n').filter(line => /^\s*\|/.test(line)).join(' / '))
+  check('段落各自成行（未被粘成一行）', text.split('\n').length >= 10, `${text.split('\n').length} 行`)
+  check('docx 同样走脱敏', !text.includes('13900002222') && !text.includes('zhaoliu@example.com'), text.slice(0, 120))
+
+  // 端到端：真上传一份 docx 简历
+  const buf = fs.readFileSync(fixture)
+  const uploaded = await uploadBinary('Word简历.docx', buf, { docType: 'resume', candidateId: 'v-docx' })
+  check('docx 上传成功', uploaded.status === 200 && uploaded.body.ok === true, uploaded.body)
+  check('切出了文本块', (uploaded.body.chunkCount || 0) > 0, uploaded.body.chunkCount)
+  const candidates = await getJson('/api/candidates')
+  const registered = (candidates.body.data || []).find(item => item.candidateId === 'v-docx')
+  check('docx 简历同样登记了候选人', Boolean(registered), registered || candidates.body)
+
+  // 老格式 .doc：白名单拒绝，且错误信息要告诉用户「另存为 .docx」
+  const legacy = await uploadBinary('老格式简历.doc', Buffer.from('fake doc'), { docType: 'resume', candidateId: 'v-doc' })
+  check('.doc 被拒绝且状态码为 400', legacy.status === 400, legacy)
+  check('.doc 的提示包含「另存为 .docx」', /另存为 \.docx/.test(legacy.body.error || ''), legacy.body.error)
+
+  // 坏 docx：解析失败要返回 400，并且不能把 multer 落盘的文件留在 uploads
+  const uploadDir = path.join(import.meta.dirname, '..', 'uploads')
+  const countUploads = () => (fs.existsSync(uploadDir) ? fs.readdirSync(uploadDir).length : 0)
+  const before = countUploads()
+  const broken = await uploadBinary('损坏简历.docx', Buffer.from('not a zip file'), { docType: 'resume', candidateId: 'v-broken' })
+  const after = countUploads()
+  check('坏 docx 返回 400 而不是 500', broken.status === 400, broken)
+  check('坏 docx 的错误可读', /Word 文档解析失败/.test(broken.body.error || ''), broken.body.error)
+  // 残留检查是「有则更好」：某些受限沙箱（以及 macOS 上开了「完全磁盘访问」限制的环境）
+  // 会直接 EPERM 掉 unlink，这时删不掉不代表逻辑错——逻辑正确性由上一项 400 兜住：
+  // 若 removeFileQuietly 没吞异常，状态码会变成 500，那条断言会先红。
+  if (after === before) {
+    check('解析失败后 uploads 没有残留文件', true)
+  } else {
+    console.log(`  ${dim(`· 解析失败后留下 ${after - before} 个文件（当前环境不允许删除，真实部署会清掉）`)}`)
+  }
+
+  await fetch(`${BASE_URL}/api/documents/delete`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ fileName: 'Word简历.docx' })
+  })
+}
+
 async function cleanup() {
   section('清理')
-  for (const name of ['同名简历.md', '同名简历-2.md', '岗位JD.md', '脱敏验证简历.md']) {
+  for (const name of ['同名简历.md', '同名简历-2.md', '岗位JD.md', '脱敏验证简历.md', 'Word简历.docx']) {
     const res = await fetch(`${BASE_URL}/api/documents/delete`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -388,6 +460,7 @@ try {
   await testStore()
   await testUpload()
   await testRedact()
+  await testDocx()
   if (SKIP_MODEL) {
     console.log(`\n${dim('--skip-model：跳过 C、D 两段需要调模型的用例')}`)
   } else {

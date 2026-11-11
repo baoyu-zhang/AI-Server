@@ -40,12 +40,12 @@
           :popup-props="{ attach: 'body' }"
         />
       </div>
-      <input ref="fileInputRef" type="file" accept=".md,.pdf" hidden @change="onFileChange" />
+      <input ref="fileInputRef" type="file" accept=".md,.pdf,.docx" hidden @change="onFileChange" />
       <t-button block variant="outline" :loading="uploading" @click="pickFile">
         <template #icon><UploadIcon /></template>
         {{ uploading ? '正在入库…' : '上传文档' }}
       </t-button>
-      <p class="doc-upload__tip">支持 .md / .pdf，单文件不超过 10MB</p>
+      <p class="doc-upload__tip">支持 .md / .pdf / .docx（Word），单文件不超过 10MB</p>
     </div>
 
     <!-- 文档列表 -->

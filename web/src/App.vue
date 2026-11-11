@@ -139,7 +139,7 @@
         <template #suffix="{ renderPresets }">
           <component :is="renderPresets([
             { name: 'uploadImage', uploadProps: { accept: '.png,.jpg,.jpeg,.webp,.gif' } },
-            { name: 'uploadAttachment', uploadProps: { accept: '.md,.pdf' } },
+            { name: 'uploadAttachment', uploadProps: { accept: '.md,.pdf,.docx' } },
           ])" />
         </template>
         <template #footer-prefix>
@@ -1272,7 +1272,7 @@ function onStop() {
 // ========== 附件上传 ==========
 const MAX_ATTACHMENTS = 5 // 单次对话最多 5 个附件
 const MAX_ATTACHMENT_SIZE = 20 * 1024 * 1024 // 单个附件上限 10MB
-const ACCEPT_EXTS = ['.md', '.pdf', '.png', '.jpg', '.jpeg', '.webp', '.gif'] // 与后端会话附件白名单保持一致
+const ACCEPT_EXTS = ['.md', '.pdf', '.docx', '.png', '.jpg', '.jpeg', '.webp', '.gif'] // 与后端会话附件白名单保持一致
 const IMAGE_EXTS = ['.png', '.jpg', '.jpeg', '.webp', '.gif'] // 图片在发送区用本地预览图展示
 
 // 组件把图片渲染成缩略图卡片，没有 url 时会一直显示 loading，所以本地先造一个预览地址

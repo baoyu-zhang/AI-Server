@@ -3,11 +3,17 @@ const path = require('path') // 引入 Node 内置路径模块，用于拼接路
 const markdownIt = require('markdown-it') // 引入 markdown-it，用于把 Markdown 渲染成 HTML
 const pdfParse = require('pdf-parse') // 引入 pdf-parse，用于解析 PDF 文本
 const { PDFParse } = pdfParse // pdf-parse v2 不再导出函数，需要从导出对象中取出 PDFParse 类
+const mammoth = require('mammoth') // 引入 mammoth，用于解析 Word（.docx）文本
 
 const md = new markdownIt() // 创建 Markdown 渲染器实例，模块级复用避免重复初始化
 
 // 允许上传的文件后缀，路由层的白名单校验也复用这份定义
-const ALLOWED_EXTS = ['.md', '.pdf'] // 当前仅支持 Markdown 与 PDF 两种格式
+// 注意 .docx ≠ .doc：mammoth 只认 OOXML（2007 之后的 docx，本质是 zip+XML），
+// 老版 .doc 是二进制 OLE 格式，解析它需要 LibreOffice 之类的重型依赖，所以不收。
+const ALLOWED_EXTS = ['.md', '.pdf', '.docx'] // Markdown / PDF / Word
+
+// 解析时提示用户「请另存为」的格式：doc 能上传但不解析，是最容易踩的坑
+const LEGACY_EXTS = ['.doc']
 
 // 图片附件后缀：不做文本解析与向量化，直接作为多模态内容交给视觉模型
 const IMAGE_EXTS = ['.png', '.jpg', '.jpeg', '.webp', '.gif']
@@ -48,6 +54,46 @@ function mergeVerticalCharLines(text) {
   }
   if (buffer) merged.push(buffer)
   return merged.join('\n')
+}
+
+/**
+ * HTML → 纯文本。
+ *
+ * 为什么不能只做 `html.replace(/<[^>]+>/g, '')`：
+ * 剥标签不产生任何分隔符，`<p>甲</p><p>乙</p>` 会变成「甲乙」，
+ * `<td>2020-2023</td><td>某某公司</td>` 会变成「2020-2023某某公司」。
+ * 简历几乎全是表格排版，一旦粘连，切块按句号/换行切不动，
+ * 一整份简历就变成几个巨块，检索时命中率断崖式下降，而且不报任何错。
+ *
+ * 所以先把块级标签换成换行、表格单元格换成 ` | `，再剥标签、解实体。
+ * @param {string} html
+ * @returns {string}
+ */
+function htmlToText(html) {
+  // 表格必须单独处理，且要在全局规则之前：
+  // mammoth 输出的每个单元格里还包着 <p>，若先按「</p> → 换行」处理，
+  // 表格会变成一格一行、` | ` 全被挤到行首（实测就是「时间\n | 公司\n | 职位」）。
+  // 所以表格范围内先把段落压成空格，再让 </td> 当列分隔、</tr> 当换行。
+  const flattened = html.replace(/<table[\s\S]*?<\/table>/gi, table =>
+    table
+      .replace(/<br\s*\/?>/gi, ' ') // 单元格内换行 → 空格，保住这一行的完整性
+      .replace(/<\/(p|div|li|h[1-6])>/gi, ' ') // 单元格内段落 → 空格
+      .replace(/<\/(td|th)>\s*(?=<\/(tr|tbody|thead)>)/gi, '') // 行尾最后一个单元格不要分隔符
+      .replace(/<\/(td|th)>/gi, ' | ') // 列分隔，保住表格的行列语义
+      .replace(/<\/tr>/gi, '\n')
+      .replace(/<[^>]+>/g, '')
+      .replace(/[ \t]+$/gm, '') // 清掉行尾空格（最后一格的段落被压成空格后残留）
+  )
+  return flattened
+    .replace(/<br\s*\/?>/gi, '\n') // 换行标签
+    .replace(/<\/(p|div|h[1-6]|li|tr|blockquote|pre)>/gi, '\n') // 块级结束 → 换行
+    .replace(/<[^>]+>/g, '') // 剩余标签直接剥掉
+    .replace(/&nbsp;/g, ' ') // 常见实体：不换行空格
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&amp;/g, '&') // 必须最后解：否则 "&amp;lt;" 会被还原成 "<"，把原文改坏
 }
 
 /**
@@ -222,14 +268,25 @@ function splitTextIntoChunks(text, chunkSize = 800, overlap = 150) {
  */
 async function extractFileText(filePath, ext) { // 按后缀分发到不同的解析逻辑
   if (!ALLOWED_EXTS.includes(ext)) { // 后缀不在白名单内直接拒绝
-    throw new Error(`不支持的文件类型：${ext || '未知'}，仅支持 ${ALLOWED_EXTS.join(' / ')}`) // 抛出可读的类型错误
+    // .doc 单独给一句「请另存为」：用户手上十有八九就是这种老格式，
+    // 只说"不支持"会让人以为整个 Word 都不支持。
+    const hint = LEGACY_EXTS.includes(ext) ? '；.doc 是 2003 之前的老格式，请用 Word 另存为 .docx 后重试' : ''
+    throw new Error(`不支持的文件类型：${ext || '未知'}，仅支持 ${ALLOWED_EXTS.join(' / ')}${hint}`) // 抛出可读的类型错误
   }
   const rawBuffer = fs.readFileSync(filePath) // 同步读取文件内容为 Buffer，上传文件通常很小
   let text // 存放解析出来的原始文本
   if (ext === '.md') { // Markdown 分支：先渲染成 HTML 再剥标签
     const rawMarkdown = rawBuffer.toString('utf8') // 按 UTF-8 解码成 Markdown 字符串
-    const html = md.render(rawMarkdown) // 调用 markdown-it 把 Markdown 渲染成 HTML
-    text = html.replace(/<[^>]+>/g, '') // 用正则去掉所有 HTML 标签，只保留纯文本
+    text = htmlToText(md.render(rawMarkdown)) // 渲染成 HTML 后转纯文本，保住段落与表格结构
+  } else if (ext === '.docx') { // Word 分支：mammoth 把 OOXML 转成语义化 HTML
+    try {
+      const result = await mammoth.convertToHtml({ buffer: rawBuffer }) // 只取正文，图片等非文本内容自动忽略
+      text = htmlToText(result.value) // 同样走 HTML → 纯文本，与 md 分支共用一套分隔规则
+    } catch (err) {
+      // 损坏文件 / 加密文档 / 把 .doc 改后缀成 .docx 都会走到这里，
+      // 原始报错是 "Can't find end of central directory" 之类，用户看不懂
+      throw new Error(`Word 文档解析失败：${err.message}。若文件已加密或实为 .doc 格式，请解密或用 Word 另存为 .docx`)
+    }
   } else { // 剩余情况只可能是 .pdf（已被白名单保证）
     const parser = new PDFParse({ data: rawBuffer }) // pdf-parse v2 用 Buffer 实例化解析器
     try { // try/finally 保证解析器一定被释放
@@ -256,8 +313,10 @@ async function extractFileText(filePath, ext) { // 按后缀分发到不同的�
 module.exports = { // 导出模块对外能力
   UPLOAD_DIR, // 上传目录，供 multer 指定落盘位置
   ALLOWED_EXTS, // 后缀白名单，供路由层 fileFilter 复用
+  LEGACY_EXTS, // 需要提示「另存为新格式」的老格式（.doc），供 fileFilter 拼错误信息
   IMAGE_EXTS, // 图片附件后缀，会话附件上传时走多模态分支
   cleanText, // 文本清洗函数
+  htmlToText, // HTML → 纯文本，导出给单元测试单独验证表格与段落分隔
   redactPII, // PII 脱敏，导出给单元测试与入库脚本单独调用
   splitTextIntoChunks, // 文本切块函数
   extractFileText // 文档解析入口

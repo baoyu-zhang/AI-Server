@@ -7,7 +7,7 @@ const { randomUUID } = require('node:crypto') // 生成 AG-UI 的 threadId / run
 const { EventEncoder } = require('@ag-ui/encoder') // AG-UI 官方 SSE 事件编码器
 const fs = require('fs') // 用于清理解析后的临时文件
 const path = require('path') // 用于解析上传文件的后缀名
-const { UPLOAD_DIR, ALLOWED_EXTS, IMAGE_EXTS, extractFileText, splitTextIntoChunks } = require('./rag-utils')
+const { UPLOAD_DIR, ALLOWED_EXTS, LEGACY_EXTS, IMAGE_EXTS, extractFileText, splitTextIntoChunks } = require('./rag-utils')
 const { initVectorStore, batchInsertEmbedding, searchVector, getDocuments, getCandidates, getJobs, deleteDocument } = require('./rag-vector')
 const { addSessionFile, addSessionImage, deleteSessionFile, getSessionFiles, searchSessionFiles } = require('./session-files')
 const { prepareChatStream, MAX_CONTEXT_TOKENS } = require('./chat-core') // 聊天主链路（裁剪/附件/选模型/streamText）
@@ -842,7 +842,9 @@ const upload = multer({
   fileFilter: (req, file, cb) => {
     const ext = path.extname(file.originalname).toLowerCase()
     if (!ALLOWED_EXTS.includes(ext)) {
-      return cb(new Error(`不支持的文件类型：${ext || '未知'}，仅支持 ${ALLOWED_EXTS.join(' / ')}`))
+      // .doc 单独提示「另存为」：用户以为「Word 不能传」，实际只是老格式不认
+      const hint = LEGACY_EXTS.includes(ext) ? '；.doc 是 2003 之前的老格式，请用 Word 另存为 .docx 后重试' : ''
+      return cb(new Error(`不支持的文件类型：${ext || '未知'}，仅支持 ${ALLOWED_EXTS.join(' / ')}${hint}`))
     }
     cb(null, true)
   }
@@ -890,6 +892,23 @@ const uploadSessionFile = (req, res, next) => {
 const DOC_TYPES = ['resume', 'jd', 'policy', 'other']
 
 /**
+ * 安静地删掉落盘文件。
+ *
+ * 两个细节都是踩出来的：
+ *   ① 必须同步：异步 unlink 会把「文件还在」的窗口留给紧接着的逻辑；
+ *   ② 必须吞掉异常：清理本来就是失败路径上的补偿动作，删不掉只该记日志，
+ *      不能因为"删不掉"把原本准确的 400（文件格式不对）变成 500（服务端故障）。
+ */
+function removeFileQuietly(filePath) {
+  if (!filePath) return
+  try {
+    fs.rmSync(filePath, { force: true })
+  } catch (err) {
+    console.warn(`清理上传文件失败（不影响本次响应）：${filePath}`, err.message)
+  }
+}
+
+/**
  * 决定本次入库最终使用的文件名。
  * 同名文档有两种完全不同的含义，必须分开处理：
  *   ① 同一个业务对象重新上传（docType / jobId / candidateId 完全一致）→ 沿用原名，覆盖旧片段，幂等；
@@ -930,11 +949,11 @@ app.post('/api/upload-doc', upload.single('file'), async (req, res) => {
 
     // 业务约束：简历必须能对应到某个候选人，否则入库后无法按候选人隔离检索
     if (docType === 'resume' && !candidateId) {
-      fs.unlink(filePath, () => {}) // multer 已把文件落盘，校验失败必须清掉，否则 uploads 会攒垃圾文件
+      removeFileQuietly(filePath) // multer 已把文件落盘，校验失败必须清掉，否则 uploads 会攒垃圾文件
       return res.status(400).json({ error: '简历必须带 candidateId（候选人标识）' })
     }
     if (docType === 'jd' && !jobId) {
-      fs.unlink(filePath, () => {})
+      removeFileQuietly(filePath)
       return res.status(400).json({ error: '岗位 JD 必须带 jobId（岗位标识）' })
     }
 
@@ -944,7 +963,7 @@ app.post('/api/upload-doc', upload.single('file'), async (req, res) => {
     const chunks = splitTextIntoChunks(rawText, 800, 150)
     if (!chunks.length) {
       // 解析不出文本也算失败：multer 已经把文件落盘了，不清掉就是孤儿文件
-      fs.unlink(filePath, () => {})
+      removeFileQuietly(filePath)
       return res.status(400).json({ error: '未能从文件中解析出文本' })
     }
 
@@ -977,7 +996,11 @@ app.post('/api/upload-doc', upload.single('file'), async (req, res) => {
     })
   } catch (err) {
     console.error('文档上传解析失败：', err)
-    res.status(500).json({ error: err.message })
+    // 解析阶段抛错（加密文档 / 损坏 docx / 扫描版 PDF）也要清掉已落盘的文件，
+    // 否则用户每重试一次，uploads 里就多一份谁都认不出来的孤儿文件。
+    removeFileQuietly(filePath)
+    // 这类失败都是「文件本身不合适」，属于客户端问题：400 而不是 500
+    res.status(400).json({ error: err.message })
   }
 })
 
@@ -1096,6 +1119,23 @@ app.post('/api/session-files/delete', (req, res) => {
 
 // 清空知识库不走 HTTP：原 /api/vector-clear 没有鉴权，部署到公网后一次 POST 就能清库。
 // 需要重建时用 npm run eval:ingest（会先删同名文档再入库），彻底清空直接删 vector-index/ 目录。
+
+// 统一错误出口：multer 的 fileFilter / limits 错误是在中间件层 next(err) 抛的，
+// 不经过路由里的 try/catch。没有这个中间件时，传一个 .doc 会拿到 Express 默认的
+// HTML 500 页，前端只能显示「Internal Server Error」——用户根本不知道是格式问题。
+app.use((err, req, res, next) => {
+  if (res.headersSent) return next(err) // 流式响应已经开始，不能再改状态码
+  if (err instanceof multer.MulterError) {
+    // 体积超限单独给 413，前端能据此提示「压缩或拆分后再传」
+    const status = err.code === 'LIMIT_FILE_SIZE' ? 413 : 400
+    const message = err.code === 'LIMIT_FILE_SIZE' ? `文件超过大小限制（${MAX_FILE_SIZE / 1024 / 1024}MB）` : err.message
+    return res.status(status).json({ error: message })
+  }
+  // 文件类型不合法同样属于「用户的请求有问题」，返回 400 而不是 500
+  const status = /不支持的文件类型/.test(err.message || '') ? 400 : 500
+  if (status === 500) console.error('未捕获的服务端错误：', err)
+  res.status(status).json({ error: err.message || '服务端错误' })
+})
 
 app.listen(PORT, () => { // 启动 HTTP 服务并监听端口
   console.log(`✅ 服务启动 http://localhost:${PORT}`) // 启动成功后打印访问地址
