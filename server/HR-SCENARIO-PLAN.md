@@ -296,3 +296,26 @@ curl -s http://127.0.0.1:3000/api/candidates | head -c 300
 node eval/run-eval-hr.js
 npm run eval -- after-hr && node eval/compare.js baseline-v2 after-hr
 ```
+
+## 附录 C：JD 怎么造（演示前必做准备）
+
+JD 就是一份普通文档（`.md` / `.pdf` / `.docx` 都行），关键在于**上传时打上 `docType=jd` 与 `jobId`**——
+这两个标签才是检索时的过滤键，没有它们，`listJobs` 查不到、`scoreResumeAgainstJD` 也取不到材料。
+
+**方式一：界面上传（推荐）**
+左侧「文档」页签 → 类型选「岗位 JD」→ 岗位 id 填 `fe-001` → 选文件 → 上传。
+界面会拦住"选了 JD 却没填岗位 id"的情况，不用等 400 回来。
+
+**方式二：命令行**
+
+```bash
+curl -F "file=@samples/jd-高级前端工程师-fe-001.md" \
+     -F "docType=jd" -F "jobId=fe-001" \
+     http://localhost:3000/api/upload-doc
+curl -s http://localhost:3000/api/jobs     # 确认 jobId 已登记
+```
+
+**JD 内容该写什么**：照着 `samples/jd-高级前端工程师-fe-001.md` 的四段结构写——
+「岗位信息（地点 / 到岗时间）」+「岗位职责」+「任职要求（学历 / 年限 / 技术栈）」+「加分项」。
+评分工具的三道门槛（学历 / 地点 / 到岗）和四个维度（技术栈 / 经验 / 复杂度 / 行业）都从这里取判据，
+缺哪一段，对应那一项就只能靠模型猜。
