@@ -70,21 +70,30 @@ async function getEmbeddings(texts) {
  * 批量将chunk数组向量化，插入向量库
  * @param {string[]} chunks 文本片段数组
  * @param {string} fileName 文档名称（元数据）
+ * @param {{docType?: string, jobId?: string, candidateId?: string}} meta 业务标签，可选
  */
-async function batchInsertEmbedding(chunks, fileName) {
+async function batchInsertEmbedding(chunks, fileName, meta = {}) {
   const vectors = await getEmbeddings(chunks)
+  // 白名单：只接收业务字段，防止调用方传 content 把正文覆盖掉
+  const biz = {
+    docType: meta.docType,
+    jobId: meta.jobId,
+    candidateId: meta.candidateId
+  }
   for (let i = 0; i < chunks.length; i++) {
     await index.insertItem({
       vector: vectors[i],
       metadata: {
         fileName,
         content: chunks[i],
-        createdAt: Date.now() // 记录入库时间，前端文档列表可按时间排序
+        createdAt: Date.now(), // 记录入库时间，前端文档列表可按时间排序
+        ...biz // 展开在后：业务字段追加进 metadata
       }
     });
   }
   invalidateBm25(); // 语料变了，倒排缓存必须失效，否则新文档检索不到
 }
+
 
 // ==================== BM25 关键词召回 ====================
 // 为什么不用 Vectra 自带的 queryItems(..., isBm25=true)：
@@ -159,7 +168,9 @@ function getBm25Index() {
           content,
           fileName: item.metadata?.fileName,
           tf,
-          len: tokens.length
+          len: tokens.length,
+          meta: item.metadata || {}, // 过滤要在 BM25 侧也能用，所以整份 metadata 都留下
+
         });
         totalLen += tokens.length;
         for (const t of tf.keys()) df.set(t, (df.get(t) || 0) + 1);
@@ -170,6 +181,28 @@ function getBm25Index() {
   }
   return bm25Pending;
 }
+/**
+ * 复刻 Vectra 的过滤语义（对象精确匹配 + $and/$or）
+ * 为什么必须自己写一份：向量那路把 filter 交给 Vectra 了，BM25 这路得手写；
+ * 两边语义不一致时，融合会把"本该过滤掉的片段"又带回来，而且不报错。
+ * @param {object} meta 片段 metadata
+ * @param {object} filter 形如 { candidateId: 'c1' } 或 { $or: [{docType:'jd'},{docType:'resume'}] }
+ * @returns {boolean}
+ */
+function matchesFilter(meta, filter) {
+  if (!filter) return true;
+  const m = meta || {};
+  for (const [key, expect] of Object.entries(filter)) {
+    if (key === '$and') {
+      if (!Array.isArray(expect) || !expect.every(f => matchesFilter(m, f))) return false;
+    } else if (key === '$or') {
+      if (!Array.isArray(expect) || !expect.some(f => matchesFilter(m, f))) return false;
+    } else if (m[key] !== expect) {
+      return false;
+    }
+  }
+  return true;
+}
 
 /**
  * BM25 Okapi 打分：idf 压低高频词，tf 饱和 + 文档长度归一化，避免长片段天然占优
@@ -178,13 +211,15 @@ function getBm25Index() {
  * @param {number} topK
  * @returns {Array<{id: string, score: number, content: string, fileName: string}>}
  */
-function bm25Search(bm25Index, query, topK) {
+function bm25Search(bm25Index, query, topK,filter) {
   const queryTokens = tokenize(query);
   if (!queryTokens.length || !bm25Index.docs.length) return [];
   const { docs, df, avgdl } = bm25Index;
   const total = docs.length;
   const scored = [];
   for (const doc of docs) {
+    if (!matchesFilter(doc.meta, filter)) continue; // 必须在打分前过滤，不能取完 topK 再筛
+
     let score = 0;
     for (const token of queryTokens) {
       const tf = doc.tf.get(token);
@@ -209,11 +244,11 @@ function bm25Search(bm25Index, query, topK) {
  * @param {number} pool 每路各召回多少条
  * @returns {Promise<{denseHits: Array, keywordHits: Array}>}
  */
-async function retrieveCandidates(query, pool) {
+async function retrieveCandidates(query, pool,filter) {
   // embedding 推理与倒排索引构建互不依赖，必须并行；串行会让两段耗时直接相加
   const [queryVector, bm25Index] = await Promise.all([getEmbedding(query), getBm25Index()]);
   // Vectra 0.15 的签名是 queryItems(vector, query, topK, filter, isBm25)，这里只用语义那一路
-  const denseItems = await index.queryItems(queryVector, query, pool);
+  const denseItems = await index.queryItems(queryVector, query, pool,filter);
   return {
     denseHits: denseItems.map(item => ({
       id: item.item.id,
@@ -221,7 +256,7 @@ async function retrieveCandidates(query, pool) {
       content: item.item.metadata.content,
       fileName: item.item.metadata.fileName
     })),
-    keywordHits: bm25Search(bm25Index, query, pool)
+    keywordHits: bm25Search(bm25Index, query, pool,filter)
   };
 }
 
@@ -270,9 +305,9 @@ function fuseRRF(denseHits, keywordHits, topK) {
  * @param {number} topK
  * @returns {Promise<Array>} 融合后的 topK，含排名明细
  */
-async function hybridSearch(query, topK = 3) {
+async function hybridSearch(query, topK = 3,filter) {
   const pool = Math.max(topK * 4, 20); // 召回池要放大，否则没东西可融
-  const { denseHits, keywordHits } = await retrieveCandidates(query, pool);
+  const { denseHits, keywordHits } = await retrieveCandidates(query, pool,filter);
   return fuseRRF(denseHits, keywordHits, topK);
 }
 
@@ -284,8 +319,8 @@ async function hybridSearch(query, topK = 3) {
  * @param {number} topK
  * @returns {Promise<Array<{score: number, content: string, fileName: string}>>}
  */
-async function searchVector(query, topK = 3) {
-  const results = await hybridSearch(query, topK);
+async function searchVector(query, topK = 3,filter) {
+  const results = await hybridSearch(query, topK,filter);
   return results.map(item => ({
     score: item.score,
     content: item.content,
@@ -297,8 +332,8 @@ async function searchVector(query, topK = 3) {
  * 调试版检索：额外返回 denseRank / bm25Rank
  * 只在本地排查和评测脚本里用，不接入线上链路
  */
-async function searchVectorDebug(query, topK = 3) {
-  return await hybridSearch(query, topK);
+async function searchVectorDebug(query, topK = 3,filter) {
+  return await hybridSearch(query, topK,filter);
 }
 
 /**
@@ -309,9 +344,9 @@ async function searchVectorDebug(query, topK = 3) {
  * @param {number} topK
  * @returns {Promise<{denseHits: Array, keywordHits: Array, fused: Array}>}
  */
-async function searchWithCandidates(query, topK = 3) {
+async function searchWithCandidates(query, topK = 3,filter) {
   const pool = Math.max(topK * 4, 20);
-  const candidates = await retrieveCandidates(query, pool);
+  const candidates = await retrieveCandidates(query, pool,filter);
   return {
     ...candidates,
     fused: fuseRRF(candidates.denseHits, candidates.keywordHits, topK)

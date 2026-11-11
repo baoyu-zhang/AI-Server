@@ -749,10 +749,30 @@ const uploadSessionFile = (req, res, next) => {
 // 解析 → 切块 → 覆盖同名旧片段 → 入库，全部在服务端一次完成。
 // 为什么不再有 /api/embedding-add：那个端点接收前端传来的 chunks 直接入库，等于绕过了文件解析，
 // 任何人都能往知识库写任意文本（语料投毒，且能覆盖同名文档）；切块结果还要在网络上白跑两趟。
+// 业务标签白名单：只认这几类，前端传别的值一律丢弃，避免脏值进 metadata 后过滤失效
+const DOC_TYPES = ['resume', 'jd', 'policy', 'other']
+
 app.post('/api/upload-doc', upload.single('file'), async (req, res) => {
+  // 提到 try 外面：校验失败时也要能拿到路径去删文件
+  const filePath = req.file?.path
   try {
     if (!req.file) return res.status(400).json({ error: '请上传文件' })
-    const filePath = req.file.path
+
+    // multer 会把 FormData 里除文件外的普通字段放进 req.body
+    const docType = DOC_TYPES.includes(req.body?.docType) ? req.body.docType : undefined
+    const jobId = String(req.body?.jobId || '').trim() || undefined
+    const candidateId = String(req.body?.candidateId || '').trim() || undefined
+
+    // 业务约束：简历必须能对应到某个候选人，否则入库后无法按候选人隔离检索
+    if (docType === 'resume' && !candidateId) {
+      fs.unlink(filePath, () => {}) // multer 已把文件落盘，校验失败必须清掉，否则 uploads 会攒垃圾文件
+      return res.status(400).json({ error: '简历必须带 candidateId（候选人标识）' })
+    }
+    if (docType === 'jd' && !jobId) {
+      fs.unlink(filePath, () => {})
+      return res.status(400).json({ error: '岗位 JD 必须带 jobId（岗位标识）' })
+    }
+
     const fileName = fixFileName(req.file.originalname)
     const ext = path.extname(fileName).toLowerCase()
     const rawText = await extractFileText(filePath, ext)
@@ -761,13 +781,17 @@ app.post('/api/upload-doc', upload.single('file'), async (req, res) => {
 
     // 同名文档重新上传时先删掉旧片段，避免向量库里出现重复内容
     const removed = await deleteDocument(fileName)
-    await batchInsertEmbedding(chunks, fileName)
+    // 第三个参数就是刚加的业务标签；不传时行为与之前完全一致
+    await batchInsertEmbedding(chunks, fileName, { docType, jobId, candidateId })
 
     res.json({
       ok: true,
       filename: fileName,
       chunkCount: chunks.length,
       removed,
+      docType,
+      jobId,
+      candidateId,
       msg: `成功入库${chunks.length}个文本块${removed ? `，已覆盖旧片段${removed}个` : ''}`
     })
   } catch (err) {
@@ -775,6 +799,7 @@ app.post('/api/upload-doc', upload.single('file'), async (req, res) => {
     res.status(500).json({ error: err.message })
   }
 })
+
 // 文档列表：按文件名聚合，前端左侧文档栏使用
 app.get('/api/documents', async (req, res) => {
   try {
