@@ -63,6 +63,14 @@
 1. **Settings → Source → Connect Repo**：确认已关联 `baoyu-zhang/AI-Server` 的 `main` 分支。
    如果这里还显示 `Connect Repo` / `Connect Image` 两个按钮，说明仓库没连上，先连；
    显示的是仓库名 + 分支名才是已连好。没连仓库就 Deploy 会得到一个空服务。
+
+   > 点 Connect Repo 会跳到 GitHub 的「Install & Authorize Railway App」页，**这一步是必需的、不收费**。
+   > 建议把默认的 `All repositories` 改成 **`Only select repositories`**，只勾 `AI-Server`：
+   > 该授权包含「代码读写 + administration + checks/deployments/workflows」且不能逐项取消，
+   > 缩小仓库范围就能降低暴露面，不影响 `git push` 自动部署。
+   > 以后在 GitHub → Settings → Applications → Installed GitHub Apps → Railway → Configure 可随时增删仓库或卸载。
+   > 若授权后 Railway 的仓库下拉是空的：点下拉旁的刷新图标；还不行就回 Configure 把
+   > All ↔ Only 切换保存一次，强制 GitHub 重新下发安装事件。
 2. **Root Directory 保持 `/`**（截图里已正确）。这是 CLI 部署时的子目录，**不要**改成 `/server`，
    否则根 `Dockerfile` / `railway.json` / `web/` 都读不到。
 3. **Variables 页签**：先把第四节那 5 个必填变量填完。缺 `DEEPSEEK_API_KEY` 会让容器
