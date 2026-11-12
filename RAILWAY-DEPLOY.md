@@ -257,9 +257,42 @@ curl -s -X POST https://xxxx.up.railway.app/api/auth/login \
 | HTTPS | 无 | 平台自动 |
 | 进程守护 | pm2（fork 单实例） | 平台管理，单副本（SQLite 与内存限流要求单实例） |
 | 日志 | `server/data/logs/` 文件 | stdout，Railway Deploy Logs |
+| 已有历史数据 | 本机 `app.db` + 上传/向量/图片 | **全新空库，不会自动带过去** |
 
 单实例是**当前架构的硬约束**：限流、配额、登录尝试、会话归属、MCP 工具索引都在进程内存里，
 开多副本会互相打架。要横向扩容得先做 P3（迁 Redis / PostgreSQL），那部分本次按你的要求暂缓。
+
+### 7.1 上线后「以前的数据全没了」—— 这是预期，不是故障
+
+**结论：本地数据一份没少，云端是第二个环境的新空库。** 部署只搬代码（git 提交），
+`.gitignore` 排除了 `data/`、`uploads/`、`vector-index/`，Railway 的 Volume 是新建的空卷，
+`app.db` 由服务首次启动自行创建，管理员账号由云上 Variables 里的 `ADMIN_*` 播种。
+**就算两边用户名密码一模一样，也是两个库、两个 user id。**
+浏览器 localStorage 还按域名隔离，本机选中的模型、深度思考开关、当前会话 id 也不会跟过去。
+
+本机数据仍在 `server/data/app.db`（含会话、用量、审计、图片元数据）、`server/uploads/`、
+`server/vector-index/`、`server/data/images/`、`server/data/backups/`；本机 pm2 服务打开
+`http://localhost:3000` 就能看到全部历史。
+
+**先做这一步验证卷真的挂对了**（比迁移更重要）：在云端发一条消息、传一张图 →
+Deployments 里 Redeploy 一次 → 刷新页面，消息与图片都还在。
+只有这一步过了，才说明 `/app/data` 是持久化卷，而不是容器内的临时目录。
+
+**要不要把历史搬过去？**
+
+| 目标 | 建议 |
+|---|---|
+| 演示 / 验证功能 | **不迁移**，云端当干净环境重新发几条、传个文档，几分钟搞定 |
+| 确实要共享历史 | 必须**整组迁移**：`app.db`、`uploads/`、`vector-index/`、`images/`、`.image-secret`、模型缓存；且 `IMAGE_SIGN_SECRET` 要与本机一致，否则历史图片的 HMAC 签名全部失效返回 403 |
+
+迁移路径：本机 `npm run backup` 出一份 `app-*.db` → 想办法把它和上述目录放进 Railway 卷
+（卷没有控制台直传入口，需要 Railway CLI 或服务内临时受保护的上传接口）→ **先停服务** →
+`npm run restore -- <file> --force`（自带 pre-restore 备份、`integrity_check` 校验与失败回滚）→ 启动。
+只搬 `app.db` 会造成「会话在、图片 403、文档在但检索失效」，比空库更难查；
+把数据目录提交进 git 更是绝对禁止（用户数据与签名密钥进仓库）。
+
+> 判断「数据丢了」之前，先确认现在连的是哪个环境 —— 这条在复盘 3.9「环境类假故障」里出现过一次，
+> 在云上又应验了一次。详见复盘文档 3.27。
 
 ---
 
