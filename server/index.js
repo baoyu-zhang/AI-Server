@@ -15,7 +15,7 @@ const { initVectorStore, batchInsertEmbedding, searchVector, getDocuments, getDo
 const { addSessionFile, addSessionImage, deleteSessionFile, getSessionFiles, searchSessionFiles, getSessionFileContext } = require('./session-files')
 const { prepareChatStream, MAX_CONTEXT_TOKENS } = require('./chat-core') // 聊天主链路（裁剪/附件/选模型/streamText）
 const { scoreResumeAgainstJD } = require('./score-resume') // 招聘场景的领域能力：简历 × JD 匹配度评估
-const { authRouter, requireAuth } = require('./auth') // 注册/登录 + 全局鉴权闸门
+const { authRouter, requireAuth, hashPassword } = require('./auth') // 注册/登录 + 全局鉴权闸门
 const { recordAudit, listAudit } = require('./audit') // 操作审计：谁批准了什么写操作
 const { startAutoBackup } = require('./backup') // SQLite 定时备份（VACUUM INTO）
 const { saveRun, listThreads, getThreadMessages } = require('./threads-store') // 会话落库
@@ -24,15 +24,42 @@ const { createApiKey, listApiKeys, revokeApiKey } = require('./api-keys') // API
 const db = require('./db') // SQLite 数据层（RBAC 引导直接写 users.role）
 const { EVENTS: WEBHOOK_EVENTS, addWebhook, listWebhooks, deleteWebhook, dispatchWebhook } = require('./webhook-store') // Webhook 事件通知
 
-// ===== RBAC 引导：启动时把 ADMIN_USERNAME 指定的用户提升为 admin =====
+// ===== RBAC 引导：启动时按环境变量准备管理员账号 =====
 // 为什么启动时做而不是注册时：注册时判断"是不是第一个用户"很脆弱（重装库、
 // 测试造数据都会改变结果）；环境变量是显式声明，改管理员 = 改 env 重启，可预期。
 // 库里 role 只存结果：env 没设时没有任何人是 admin，管理接口对所有人都 403（安全默认值）。
+//
+// 两种用法：
+//   ① 只设 ADMIN_USERNAME   —— 把"已注册"的用户提升为 admin（不动密码）
+//   ② ADMIN_USERNAME + ADMIN_PASSWORD —— 保证这个账号存在、密码与 env 一致、
+//      且是 admin。适合第一次部署：不用先走注册流程再手动提升。
+//      注意：账号已存在时密码也会被重置为 env 值——env 是唯一事实源，
+//      否则会出现"env 写了新密码但库里还是旧的"这种难以排查的漂移。
 {
   const adminName = process.env.ADMIN_USERNAME
-  if (adminName) {
+  const adminPassword = process.env.ADMIN_PASSWORD
+
+  if (adminName && adminPassword) {
+    // 用法②：先查再插/改，幂等——重启多少次结果都一样
+    const existing = db.prepare('SELECT id FROM users WHERE username = ?').get(adminName)
+    if (!existing) {
+      const id = crypto.randomUUID()
+      db.prepare('INSERT INTO users (id, username, password_hash, role, created_at) VALUES (?, ?, ?, ?, ?)')
+        .run(id, adminName, hashPassword(adminPassword), 'admin', Date.now())
+      console.log('[rbac] 已创建管理员账号:', adminName)
+    } else {
+      // 密码重置为 env 值 + 确保是 admin：即使之前被降权/改密，重启即回归声明状态
+      db.prepare("UPDATE users SET password_hash = ?, role = 'admin' WHERE username = ?")
+        .run(hashPassword(adminPassword), adminName)
+      if (existing) console.log('[rbac] 管理员已存在，密码已与 ADMIN_PASSWORD 对齐:', adminName)
+    }
+  } else if (adminName) {
+    // 用法①：只提权不改密码（密码归用户自己管理）
     const updated = db.prepare("UPDATE users SET role = 'admin' WHERE username = ? AND role != 'admin'").run(adminName)
     if (updated.changes) console.log('[rbac] 已提升管理员:', adminName)
+  } else if (adminPassword) {
+    // 配了密码却没配用户名：多半是手误，明确报出来而不是静默忽略
+    console.warn('[rbac] ⚠️ 检测到 ADMIN_PASSWORD 但没有 ADMIN_USERNAME，已忽略——请同时设置两个变量')
   }
 }
 
