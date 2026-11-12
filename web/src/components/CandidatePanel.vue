@@ -100,6 +100,7 @@
 import { computed, onMounted, ref } from 'vue'
 import { MessagePlugin } from 'tdesign-vue-next'
 import { RefreshIcon, UserIcon } from 'tdesign-icons-vue-next'
+import { authHeaders } from '../api/auth'
 
 // 候选人记录：来自 GET /api/candidates（向量库"谁有简历" + JSON 表"状态与分数"合并）
 interface CandidateItem {
@@ -176,7 +177,7 @@ function formatTime(timestamp?: number) {
 async function load() {
   loading.value = true
   try {
-    const res = await fetch('/api/candidates')
+    const res = await fetch('/api/candidates', { headers: authHeaders() })
     const data = await res.json().catch(() => ({}))
     if (!res.ok) throw new Error(data.error || `请求失败（${res.status}）`)
     candidates.value = data.data || []
@@ -213,7 +214,7 @@ function askScore(item: CandidateItem) {
 /** 拉岗位清单并弹出选择框。岗位为空时给一句能照着做的提示，而不是空白弹窗 */
 async function openJobPicker(item: CandidateItem) {
   try {
-    const res = await fetch('/api/jobs')
+    const res = await fetch('/api/jobs', { headers: authHeaders() })
     const data = await res.json().catch(() => ({}))
     const jobs: JobItem[] = Array.isArray(data.data) ? data.data : []
     if (!jobs.length) {

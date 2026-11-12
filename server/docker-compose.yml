@@ -1,0 +1,27 @@
+# M1 的最小部署形态：应用 + 持久化卷。本机没有 docker，此文件未经本机验证，
+# 首次使用时先 `docker compose up --build` 观察 embedding 模型下载与冷启动日志。
+services:
+  app:
+    build: .
+    ports:
+      - "3000:3000"
+    env_file:
+      - .env        # DEEPSEEK_API_KEY 等敏感配置不进镜像
+    environment:
+      - NODE_ENV=production
+      - LOG_LEVEL=info
+    volumes:
+      # 知识库向量索引：重建镜像不丢语料
+      - vector-index:/app/vector-index
+      # 上传原件与候选人表
+      - uploads:/app/uploads
+      - app-data:/app/data
+      # embedding 模型缓存（bge-small-zh 数百 MB，挂卷后只在首次下载）
+      - transformers-cache:/home/app/.cache
+    restart: unless-stopped
+
+volumes:
+  vector-index:
+  uploads:
+  app-data:
+  transformers-cache:

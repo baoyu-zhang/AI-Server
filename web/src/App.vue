@@ -1,6 +1,14 @@
 <template>
-  <!-- 整体两栏布局：左侧知识库文档栏 + 右侧聊天区 -->
-  <div class="app-shell">
+  <!-- 未登录：整屏登录门，不挂载任何业务组件（也就不会发出任何未鉴权请求） -->
+  <LoginGate v-if="!authed" @authenticated="onAuthenticated" />
+  <!-- 登录后：整体两栏布局：左侧知识库文档栏 + 右侧聊天区 -->
+  <div v-else class="app-shell">
+    <!-- 右上角账号角标：显示当前用户，登出后回到登录门 -->
+    <div class="account-badge">
+      <span class="account-badge__name">{{ currentUser?.username }}</span>
+      <t-button variant="text" size="small" @click="onLogout">退出</t-button>
+    </div>
+
     <!-- 桌面端：文档 / 候选人侧栏常驻左侧 -->
     <SidePanel v-if="!isNarrow" class="app-shell__aside" @ask="onSend" />
 
@@ -174,6 +182,10 @@ import { useChatStore, USER_META, ASSISTANT_META } from './store/chat'
 import type { Message, Interrupt, ResumeEntry } from '@ag-ui/core'
 // 左侧栏（文档 / 候选人两个页签）
 import SidePanel from './components/SidePanel.vue'
+// 登录门：未登录时替代整个主界面
+import LoginGate from './components/LoginGate.vue'
+// 鉴权：token 存取、请求头、401 统一处理
+import { isLoggedIn, currentUser, authHeaders, logout as apiLogout, setUnauthorizedHandler } from './api/auth'
 // 引入文件上传组件类型定义
 import type { TdAttachmentItem } from '@tdesign-vue-next/chat/es/index'
 import { useChat } from '@tdesign-vue-next/chat/es/chat-engine'
@@ -195,6 +207,25 @@ type SenderFile = TdAttachmentItem & {
 // 窄屏判定：≤900px 时文档栏改为抽屉
 const isNarrow = useMediaQuery('(max-width: 900px)')
 const docDrawerVisible = ref(false)
+
+// ========== 登录门 ==========
+// authed 决定整个主界面是否挂载：登出/401 时置 false，所有业务组件随之卸载，
+// 不会再有任何带旧 token 的请求发出去
+const authed = ref(isLoggedIn())
+setUnauthorizedHandler(() => {
+  authed.value = false
+  MessagePlugin.warning('登录已失效，请重新登录')
+})
+function onAuthenticated() {
+  authed.value = true
+}
+async function onLogout() {
+  await apiLogout()
+  // 清掉本地持久化的消息与共享状态：换账号登录时不能看到上一个人的会话
+  chatStore.clearMessages()
+  chatStore.agentState = {}
+  authed.value = false
+}
 
 // 全局聊天仓库实例
 const chatStore = useChatStore()
@@ -1038,7 +1069,7 @@ const { chatEngine, messages } = useChat({
     // 请求侧：引擎不管 body，这里从 messages 现拼；resume 用于中断确认后的续跑
     onRequest: (params) => ({
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: authHeaders({ 'Content-Type': 'application/json' }),
       body: JSON.stringify(buildAguiBody((params as { resume?: ResumeEntry[] } | undefined)?.resume))
     })
   }
@@ -1369,6 +1400,8 @@ function uploadOne(file: File) {
       description: '网络异常'
     })
   }
+  const auth = authHeaders()
+  if (auth.Authorization) xhr.setRequestHeader('Authorization', auth.Authorization)
   xhr.send(form)
 }
 
@@ -1416,7 +1449,7 @@ const handleRemoveFile = (e: CustomEvent<TdAttachmentItem>) => {
   if (!detail.fileId) return
   fetch('/api/session-files/delete', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: authHeaders({ 'Content-Type': 'application/json' }),
     body: JSON.stringify({ sessionId: sessionId.value, fileId: detail.fileId })
   }).catch(err => console.error('删除会话附件失败', err))
 }
@@ -1458,6 +1491,23 @@ onUnmounted(() => teardownAgentEvents())
   height: 100vh;
   overflow: hidden;
   background: var(--td-bg-color-page);
+}
+
+/* 右上角账号角标：登录用户的唯一可见标识与登出入口 */
+.account-badge {
+  position: fixed;
+  top: 10px;
+  right: 16px;
+  z-index: 100;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  background: var(--td-bg-color-container);
+  border: 1px solid var(--td-component-stroke);
+  border-radius: var(--td-radius-medium, 6px);
+  font-size: var(--td-font-size-body-small, 12px);
+  color: var(--td-text-color-secondary);
 }
 
 .app-shell__aside {

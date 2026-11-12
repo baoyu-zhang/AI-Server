@@ -87,28 +87,34 @@ function persist() {
 }
 
 /**
- * 列表：按岗位 / 状态筛选
+ * 列表：按岗位 / 状态筛选，并按登录用户圈定可见范围
+ * 可见性规则与向量库一致：记录带 userId 时只归本人，没带 userId 的旧记录对所有人可见。
+ * userId 不传（服务端脚本、测试）时不过滤，行为与鉴权上线前完全一致。
  * 筛选放在 store 里而不是让调用方 filter，是因为后面要加排序、分页时只需改一处。
- * @param {{jobId?: string, status?: string}} [filter]
+ * @param {{jobId?: string, status?: string, userId?: string}} [filter]
  * @returns {Promise<Array>}
  */
 async function listCandidates(filter = {}) {
   const all = await loadAll()
-  const { jobId, status } = filter || {}
+  const { jobId, status, userId } = filter || {}
   return all
+    .filter(item => (!userId || !item.userId || item.userId === userId))
     .filter(item => (jobId ? item.jobId === jobId : true))
     .filter(item => (status ? item.status === status : true))
     .sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0))
 }
 
 /**
- * 按 candidateId 查一条
+ * 按 candidateId 查一条（带用户可见性约束）
  * @param {string} candidateId
+ * @param {string} [userId]
  * @returns {Promise<object|null>}
  */
-async function getCandidate(candidateId) {
+async function getCandidate(candidateId, userId) {
   const all = await loadAll()
-  return all.find(item => item.candidateId === candidateId) || null
+  return all.find(item =>
+    item.candidateId === candidateId && (!userId || !item.userId || item.userId === userId)
+  ) || null
 }
 
 /**
@@ -123,13 +129,18 @@ async function getCandidate(candidateId) {
  * @param {string} [params.name] 展示名，缺省用文件名去掉后缀
  * @param {string} [params.fileName] 最近一次上传的简历文件名
  * @param {string} [params.jobId] 应聘岗位
+ * @param {string} [params.userId] 归属用户：candidateId 是用户自己起的，不同用户可以重名，
+ *   所以记录的主键事实上是 (userId, candidateId) 二元组；不带 userId 的旧记录会被"收养"
  * @returns {Promise<object>} 合并后的记录
  */
-async function upsertCandidate({ candidateId, name, fileName, jobId }) {
+async function upsertCandidate({ candidateId, name, fileName, jobId, userId }) {
   const id = String(candidateId || '').trim()
   if (!id) throw new Error('candidateId 不能为空')
   const all = await loadAll()
-  const existing = all.find(item => item.candidateId === id)
+  // 只合并"自己名下的或无主的"：别人名下的同 id 记录对当前用户必须像不存在一样
+  const existing = all.find(item =>
+    item.candidateId === id && (!userId || !item.userId || item.userId === userId)
+  )
   const now = Date.now()
 
   if (existing) {
@@ -137,6 +148,7 @@ async function upsertCandidate({ candidateId, name, fileName, jobId }) {
     if (name) existing.name = name
     if (fileName) existing.fileName = fileName
     if (jobId) existing.jobId = jobId
+    if (userId && !existing.userId) existing.userId = userId // 无主旧记录归当前用户收养
     existing.updatedAt = now
     await persist()
     return existing
@@ -144,6 +156,7 @@ async function upsertCandidate({ candidateId, name, fileName, jobId }) {
 
   const record = {
     candidateId: id,
+    userId: userId || '',
     // 展示名退回文件名（去掉后缀），至少比裸 id 好认
     name: name || String(fileName || id).replace(/\.[^.]+$/, ''),
     fileName: fileName || '',
@@ -167,7 +180,7 @@ async function upsertCandidate({ candidateId, name, fileName, jobId }) {
  *   ok:false 用返回值表达而不是抛异常——审批工具的返回值会直接回填给模型，
  *   抛异常会被包成"工具执行失败"，模型看不到"为什么失败"，也就不会自我纠正。
  */
-async function updateCandidateStatus(candidateId, status) {
+async function updateCandidateStatus(candidateId, status, userId) {
   const id = String(candidateId || '').trim()
   const next = String(status || '').trim()
   if (!id) return { ok: false, error: '缺少 candidateId' }
@@ -175,7 +188,10 @@ async function updateCandidateStatus(candidateId, status) {
     return { ok: false, error: `状态「${next}」不在允许范围内，只能是：${CANDIDATE_STATUS.join(' / ')}` }
   }
   const all = await loadAll()
-  const record = all.find(item => item.candidateId === id)
+  // 只能改自己名下的：模型编一个别人名下的 candidateId，这里必须像"不存在"一样拒绝
+  const record = all.find(item =>
+    item.candidateId === id && (!userId || !item.userId || item.userId === userId)
+  )
   // 只允许改已登记的候选人：否则模型凭空编一个 id 就能往表里塞脏数据
   if (!record) return { ok: false, error: `候选人「${id}」不存在，请先上传该候选人的简历` }
   if (record.status === next) {
@@ -195,15 +211,18 @@ async function updateCandidateStatus(candidateId, status) {
  * @param {string} candidateId
  * @param {{score: number, verdict: string, jobId?: string}} result
  */
-async function recordScore(candidateId, { score, verdict, jobId } = {}) {
+async function recordScore(candidateId, { score, verdict, jobId } = {}, userId) {
   const id = String(candidateId || '').trim()
   if (!id) return null
   const all = await loadAll()
-  let record = all.find(item => item.candidateId === id)
+  let record = all.find(item =>
+    item.candidateId === id && (!userId || !item.userId || item.userId === userId)
+  )
   if (!record) {
     // 没登记过也要留痕：评分能跑通说明简历确实在库里，只是可能是直接调 API 入的库
     record = {
       candidateId: id,
+      userId: userId || '',
       name: id,
       fileName: '',
       jobId: jobId || '',
@@ -212,6 +231,8 @@ async function recordScore(candidateId, { score, verdict, jobId } = {}) {
       updatedAt: Date.now()
     }
     all.push(record)
+  } else if (userId && !record.userId) {
+    record.userId = userId // 无主旧记录顺带收养
   }
   if (typeof score === 'number') record.lastScore = score
   if (verdict) record.lastVerdict = verdict

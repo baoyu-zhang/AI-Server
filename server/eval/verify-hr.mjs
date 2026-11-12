@@ -20,8 +20,8 @@ import { randomUUID } from 'node:crypto'
 import os from 'node:os'
 import path from 'node:path'
 import fs from 'node:fs'
+import { login, authHeaders, BASE_URL } from './http-auth.mjs'
 
-const BASE_URL = (process.env.BASE_URL || 'http://localhost:3000').replace(/\/+$/, '')
 const SKIP_MODEL = process.argv.includes('--skip-model')
 const TIMEOUT_MS = Number(process.env.AGUI_TIMEOUT_MS || 180000)
 
@@ -103,7 +103,7 @@ async function uploadDoc(fileName, content, fields = {}) {
   const form = new FormData()
   form.append('file', new Blob([content], { type: 'text/markdown' }), fileName)
   for (const [key, value] of Object.entries(fields)) if (value) form.append(key, value)
-  const res = await fetch(`${BASE_URL}/api/upload-doc`, { method: 'POST', body: form, signal: AbortSignal.timeout(TIMEOUT_MS) })
+  const res = await fetch(`${BASE_URL}/api/upload-doc`, { method: 'POST', body: form, headers: authHeaders(), signal: AbortSignal.timeout(TIMEOUT_MS) })
   return { status: res.status, body: await res.json().catch(() => ({})) }
 }
 
@@ -112,12 +112,12 @@ async function uploadBinary(fileName, content, fields = {}) {
   const form = new FormData()
   form.append('file', new Blob([content]), fileName)
   for (const [key, value] of Object.entries(fields)) if (value) form.append(key, value)
-  const res = await fetch(`${BASE_URL}/api/upload-doc`, { method: 'POST', body: form, signal: AbortSignal.timeout(TIMEOUT_MS) })
+  const res = await fetch(`${BASE_URL}/api/upload-doc`, { method: 'POST', body: form, headers: authHeaders(), signal: AbortSignal.timeout(TIMEOUT_MS) })
   return { status: res.status, body: await res.json().catch(() => ({})) }
 }
 
 async function getJson(url) {
-  const res = await fetch(`${BASE_URL}${url}`, { signal: AbortSignal.timeout(TIMEOUT_MS) })
+  const res = await fetch(`${BASE_URL}${url}`, { headers: authHeaders(), signal: AbortSignal.timeout(TIMEOUT_MS) })
   return { status: res.status, body: await res.json().catch(() => ({})) }
 }
 
@@ -125,7 +125,7 @@ async function getJson(url) {
 async function runAgui(payload) {
   const res = await fetch(`${BASE_URL}/agui`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', Accept: 'text/event-stream' },
+    headers: authHeaders({ 'Content-Type': 'application/json', Accept: 'text/event-stream' }),
     body: JSON.stringify(payload),
     signal: AbortSignal.timeout(TIMEOUT_MS)
   })
@@ -374,7 +374,7 @@ async function testRedact() {
   check('向量库文件里查不到手机号', Boolean(raw) && !raw.includes(phone), raw ? '索引里仍有该号码' : '索引文件不存在')
   await fetch(`${BASE_URL}/api/documents/delete`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: authHeaders({ 'Content-Type': 'application/json' }),
     body: JSON.stringify({ fileName: '脱敏验证简历.md' })
   })
 }
@@ -434,7 +434,7 @@ async function testDocx() {
 
   await fetch(`${BASE_URL}/api/documents/delete`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: authHeaders({ 'Content-Type': 'application/json' }),
     body: JSON.stringify({ fileName: 'Word简历.docx' })
   })
 }
@@ -444,7 +444,7 @@ async function cleanup() {
   for (const name of ['同名简历.md', '同名简历-2.md', '岗位JD.md', '脱敏验证简历.md', 'Word简历.docx']) {
     const res = await fetch(`${BASE_URL}/api/documents/delete`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: authHeaders({ 'Content-Type': 'application/json' }),
       body: JSON.stringify({ fileName: name })
     })
     const body = await res.json().catch(() => ({}))
@@ -457,6 +457,9 @@ async function cleanup() {
 // ========== 入口 ==========
 console.log(`${bold('招聘场景切片验收')} ${dim(BASE_URL)}`)
 try {
+  // 鉴权上线后所有端点都要 token：脚本注册一个专用账号，HTTP 段全程带它
+  const { username } = await login()
+  console.log(`  ${dim(`测试账号：${username}`)}`)
   await testStore()
   await testUpload()
   await testRedact()

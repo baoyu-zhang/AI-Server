@@ -15,8 +15,9 @@
 
 import 'dotenv/config' // 读 .env 的 MAX_CONTEXT_TOKENS，让“长上下文”用例的填充量跟着服务端配置走
 import { randomUUID } from 'node:crypto'
+import { login, authHeaders, BASE_URL } from './eval/http-auth.mjs'
 
-const BASE_URL = (process.env.BASE_URL || 'http://localhost:3000').replace(/\/+$/, '')
+// BASE_URL 来自 ./eval/http-auth.mjs（可被环境变量覆盖），这里不再重复声明
 const REQUEST_TIMEOUT_MS = Number(process.env.AGUI_TIMEOUT_MS || 180000)
 const UPLOAD_TIMEOUT_MS = Number(process.env.AGUI_UPLOAD_TIMEOUT_MS || 300000)
 
@@ -112,10 +113,10 @@ async function requestAgui(input, timeoutMs = REQUEST_TIMEOUT_MS) {
   try {
     const res = await fetch(`${BASE_URL}/agui`, {
       method: 'POST',
-      headers: {
+      headers: authHeaders({
         'Content-Type': 'application/json',
         Accept: 'text/event-stream'
-      },
+      }),
       body: JSON.stringify(input),
       signal: controller.signal
     })
@@ -197,7 +198,7 @@ const argsOf = (events, toolCallId) =>
 async function requestJSON(path, payload) {
   const res = await fetch(`${BASE_URL}${path}`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: authHeaders({ 'Content-Type': 'application/json' }),
     body: JSON.stringify(payload)
   })
   const text = await res.text()
@@ -221,6 +222,7 @@ async function uploadSessionFile(sessionId, fileName, content) {
     const res = await fetch(`${BASE_URL}/api/session-files/upload`, {
       method: 'POST',
       body: form,
+      headers: authHeaders(),
       signal: controller.signal
     })
     const text = await res.text()
@@ -799,7 +801,7 @@ async function ensureServer() {
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), 5000)
   try {
-    const res = await fetch(`${BASE_URL}/api/documents`, { signal: controller.signal })
+    const res = await fetch(`${BASE_URL}/api/documents`, { headers: authHeaders(), signal: controller.signal })
     if (!res.ok) throw new Error(`HTTP ${res.status}`)
   } catch (err) {
     console.error(red(`无法连接 ${BASE_URL}：${err?.message || err}`))
@@ -838,8 +840,10 @@ async function main() {
     }
   }
 
+  // 鉴权上线后所有端点都要 token，测试先注册专用账号（ensureServer 的探活也要带它）
+  const { username } = await login()
   await ensureServer()
-  console.log(`${bold('AG-UI 协议级测试')} ${dim(`→ ${BASE_URL}`)}`)
+  console.log(`${bold('AG-UI 协议级测试')} ${dim(`→ ${BASE_URL}（账号 ${username}）`)}`)
 
   const startedAt = Date.now()
   for (const item of cases) {

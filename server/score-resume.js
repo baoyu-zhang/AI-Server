@@ -359,14 +359,16 @@ function mergeChunks(primary, extra) {
  * @param {string} [params.query] 检索用查询词，默认用"岗位要求 技能 经验"
  * @returns {Promise<object>} 结构化的评估结果；材料缺失时返回 { ok:false, text } 而不是抛异常
  */
-async function scoreResumeAgainstJD({ candidateId, jobId, query = '岗位要求 核心技能 经验年限 项目经历' }) {
+async function scoreResumeAgainstJD({ candidateId, jobId, query = '岗位要求 核心技能 经验年限 项目经历', userId }) {
   // 两路检索必须带 filter：不带的话会召回别的候选人简历，评分对象就错了
+  // 第四个参数 userId 是数据隔离：登录用户的评分只能看到"自己的 + 公开旧语料"，
+  // 不传（服务端脚本、评测）时不过滤，行为与鉴权上线前一致
   // 每边查两次（维度相关 + 门槛事实），四个请求并发发出去，延迟由最慢的一个决定
   const [resumeChunks, jdChunks, gateResumeChunks, gateJdChunks] = await Promise.all([
-    searchVector(query, CHUNKS_PER_SIDE, { candidateId }),
-    searchVector(query, CHUNKS_PER_SIDE, { jobId }),
-    searchVector(GATE_QUERY.resume, GATE_CHUNKS_PER_SIDE, { candidateId }),
-    searchVector(GATE_QUERY.jd, GATE_CHUNKS_PER_SIDE, { jobId })
+    searchVector(query, CHUNKS_PER_SIDE, { candidateId }, userId),
+    searchVector(query, CHUNKS_PER_SIDE, { jobId }, userId),
+    searchVector(GATE_QUERY.resume, GATE_CHUNKS_PER_SIDE, { candidateId }, userId),
+    searchVector(GATE_QUERY.jd, GATE_CHUNKS_PER_SIDE, { jobId }, userId)
   ])
 
   // 材料缺失是"有效信息"而不是异常：让调用方（模型）如实告诉用户缺什么，

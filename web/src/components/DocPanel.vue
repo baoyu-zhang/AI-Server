@@ -94,6 +94,7 @@
 import { computed, onMounted, ref } from 'vue'
 import { MessagePlugin } from 'tdesign-vue-next'
 import { DeleteIcon, FileIcon, RefreshIcon, UploadIcon } from 'tdesign-icons-vue-next'
+import { authHeaders, clearAuth } from '../api/auth'
 
 // 文档条目：后端按 fileName 聚合后的结果，业务标签可能为空（历史语料没有）
 interface DocItem {
@@ -135,10 +136,14 @@ const docTypeLabel = (type?: string) => (type ? DOC_TYPE_LABELS[type] || type : 
 
 const totalChunks = computed(() => documents.value.reduce((sum, doc) => sum + doc.chunkCount, 0))
 
-// 统一请求封装：非 2xx 时抛出后端返回的错误文案
+// 统一请求封装：带鉴权 header；非 2xx 时抛出后端返回的错误文案
 async function request<T>(url: string, options?: RequestInit): Promise<T> {
-  const res = await fetch(url, options)
+  const res = await fetch(url, { ...options, headers: { ...authHeaders(), ...(options?.headers as Record<string, string> | undefined) } })
   const data = await res.json().catch(() => ({}))
+  if (res.status === 401) {
+    clearAuth()
+    throw new Error('登录已失效，请刷新页面重新登录')
+  }
   if (!res.ok) throw new Error((data as { error?: string }).error || `请求失败（${res.status}）`)
   return data as T
 }

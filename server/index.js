@@ -12,6 +12,9 @@ const { initVectorStore, batchInsertEmbedding, searchVector, getDocuments, getCa
 const { addSessionFile, addSessionImage, deleteSessionFile, getSessionFiles, searchSessionFiles } = require('./session-files')
 const { prepareChatStream, MAX_CONTEXT_TOKENS } = require('./chat-core') // 聊天主链路（裁剪/附件/选模型/streamText）
 const { scoreResumeAgainstJD } = require('./score-resume') // 招聘场景的领域能力：简历 × JD 匹配度评估
+const { authRouter, requireAuth } = require('./auth') // 注册/登录 + 全局鉴权闸门
+const { log, httpLog } = require('./logger') // 结构化日志：JSON 行 + 级别开关
+const { saveRun, listThreads, getThreadMessages } = require('./threads-store') // 会话落库
 const {
   CANDIDATE_STATUS, // 状态白名单，工具入参的 enum 与写库校验共用一份
   listCandidates: listCandidateRecords,
@@ -22,6 +25,34 @@ const {
 const app = express() // 创建 Express 应用实例
 const PORT = process.env.PORT || 3000 // 服务端口：优先取环境变量，默认 3000
 app.use(express.json()) // 注册 JSON 请求体解析中间件
+app.use(httpLog) // 访问日志挂在最外层：401/403 也要留痕
+
+// 挂载顺序是鉴权的骨架，错一行就漏一个口子：
+//   ① /api/auth 必须先挂（登录接口本身不能要求已登录）；
+//   ② requireAuth 紧随其后，成为其后所有端点的总闸门——
+//      以后新加路由只要写在这行之后，就自动受保护，"忘了加鉴权"这类事故在结构上不可能发生。
+app.use('/api/auth', authRouter)
+// 健康检查必须在 requireAuth 之前：容器编排（HEALTHCHECK/探针）不带 token，
+// 它只关心"进程活着没"，不关心你是谁
+app.get('/api/health', (req, res) => {
+  res.json({ ok: true, uptime: Math.round(process.uptime()) })
+})
+app.use(requireAuth)
+
+// ========== 会话附件归属 ==========
+// sessionId 由前端生成，属于不可信输入：不绑定归属的话，B 用户拿 A 的 sessionId
+// 就能把附件传进 A 的会话、读到 A 的附件清单。claim 一次后绑定不变。
+const sessionOwners = new Map() // sessionId -> userId
+
+/** 声明会话归属。返回 false 表示该会话属于别人，调用方必须拒绝请求 */
+function claimSession(sessionId, userId) {
+  const owner = sessionOwners.get(sessionId)
+  if (owner === undefined) {
+    sessionOwners.set(sessionId, userId)
+    return true
+  }
+  return owner === userId
+}
 // 启动服务初始化向量库
 initVectorStore().catch(err => console.error('向量库初始化失败', err))
 
@@ -80,7 +111,8 @@ function mergeByRank(lists, topK) {
 // 为什么用工厂函数而不是模块级常量对象：
 // 附件检索需要 sessionId。若做成常量，这个 id 只能靠全局变量传递，
 // 多请求并发时会串号（A 用户检索到 B 用户的附件）。工厂函数把状态收进闭包，天然隔离。
-function createTools(sessionId) {
+// userId 同理：检索、候选人清单、评分都必须圈定在"当前登录用户"的可见范围内。
+function createTools(sessionId, userId) {
   return {
     // ---- ① 服务端工具：模型调完立刻拿到结果 ----
     getCurrentTime: tool({
@@ -141,8 +173,10 @@ function createTools(sessionId) {
       async execute({ query, topK }) {
         console.log(`🔍 Agent调用知识库检索，query：${query}`)
         // 两个数据源互相独立，必须并行：串行会让检索耗时直接翻倍（知识库是磁盘向量库，附件是内存检索）
+        // 第三个参数不传业务 filter（全库检索），第四个参数 userId 是数据隔离——
+        // 登录用户只能看到自己的文档和鉴权前的公开旧语料
         const [kbResult, sessionResult] = await Promise.all([
-          searchVector(query, topK),
+          searchVector(query, topK, undefined, userId),
           searchSessionFiles(sessionId, query, topK)
         ])
         // 打上来源标记，前端据此把引用渲染成"本次附件 / 知识库"两种标签
@@ -199,7 +233,11 @@ function createTools(sessionId) {
       }),
       async execute({ status }) {
         // 两路数据合并：向量库决定"谁有简历"，JSON 表决定"状态和分数"
-        const [resumes, records] = await Promise.all([getCandidates(), listCandidateRecords()])
+        // 两路都按 userId 圈定：只列"自己的 + 鉴权前的无主旧数据"
+        const [resumes, records] = await Promise.all([
+          getCandidates(userId),
+          listCandidateRecords({ userId })
+        ])
         const byId = new Map(records.map(item => [item.candidateId, item]))
         let list = resumes.map(resume => {
           const record = byId.get(resume.key)
@@ -232,7 +270,7 @@ function createTools(sessionId) {
       description: '列出知识库里的岗位 JD 及其 jobId。需要按岗位评估候选人但不知道 jobId 时先调用它',
       inputSchema: z.object({}),
       async execute() {
-        const jobs = await getJobs()
+        const jobs = await getJobs(userId)
         if (!jobs.length) return { text: '知识库里还没有岗位 JD，请先上传 JD 并标记 jobId' }
         const lines = jobs.map((job, i) => `${i + 1}. jobId=${job.key}｜${job.fileName}（${job.chunkCount} 段）`)
         return { text: `岗位 JD 共 ${jobs.length} 个：\n${lines.join('\n')}` }
@@ -251,11 +289,11 @@ function createTools(sessionId) {
         jobId: z.string().describe('岗位标识，必须是 listJobs 返回的 jobId')
       }),
       async execute({ candidateId, jobId }) {
-        const result = await scoreResumeAgainstJD({ candidateId, jobId })
+        const result = await scoreResumeAgainstJD({ candidateId, jobId, userId })
         // 材料缺失是正常分支而不是异常：告诉模型缺什么，它才能引导用户补材料
         if (!result.ok) return { text: result.text, sources: [] }
         // 结论写回候选人表——刷新页面后列表里还能看到"这个人上次评了多少分"
-        await recordScore(candidateId, { score: result.score, verdict: result.verdict, jobId })
+        await recordScore(candidateId, { score: result.score, verdict: result.verdict, jobId }, userId)
         return {
           text: result.text,
           sources: result.sources,
@@ -384,7 +422,7 @@ function approvalMessage({ toolName, input }) {
  * 执行用户已确认的审批工具。
  * 三道校验都不是多余的：resume 的 interruptId 来自客户端，属于不可信输入。
  */
-async function executeApprovalTool(toolName, input, sessionId) {
+async function executeApprovalTool(toolName, input, sessionId, userId) {
   if (!APPROVAL_TOOL_NAMES.has(toolName)) return `操作失败：未知的审批工具 ${toolName}` // 白名单：防止伪造中断去调别的工具
 
   if (toolName === 'deleteSessionFile') {
@@ -399,8 +437,9 @@ async function executeApprovalTool(toolName, input, sessionId) {
   }
 
   // updateCandidateStatus：真正的写库动作在 candidates-store.js，这里只负责把结果翻译成一句人话
+  // userId 必须透传：审批链路也不能改到别人名下的候选人
   const candidateId = String(input?.candidateId || '').trim()
-  const result = await updateCandidateStatus(candidateId, input?.status)
+  const result = await updateCandidateStatus(candidateId, input?.status, userId)
   if (!result.ok) return `状态修改失败：${result.error}`
   if (result.unchanged) return `候选人「${candidateId}」的状态已经是「${result.record.status}」，未做修改`
   return `已将候选人「${candidateId}」的状态从「${result.from}」改为「${result.record.status}」`
@@ -519,6 +558,12 @@ app.post('/agui', async (req, res) => {
   const runId = input.runId || randomUUID()
   // 前端可以把 sessionId 放在 forwardedProps 里，用于会话附件检索
   const sessionId = input.forwardedProps?.sessionId || input.state?.sessionId || threadId
+  // requireAuth 已在中间件层保证 req.user 存在，这里非空断言是给读代码的人看的
+  const userId = req.user.userId
+  // 会话附件必须归属当前用户：B 用户不能借 A 的 sessionId 读 A 的附件
+  if (!claimSession(sessionId, userId)) {
+    return res.status(403).json({ error: '会话归属其他用户，拒绝访问' })
+  }
   const priorState = input.state && typeof input.state === 'object' ? input.state : {}
   const priorSources = Array.isArray(priorState.sources) ? priorState.sources : []
 
@@ -541,6 +586,9 @@ app.post('/agui', async (req, res) => {
   let hasError = false
   // 本轮出现的审批类工具调用：不在流内执行，收尾时转成 interrupt
   const pendingApprovals = []
+  // 会话落库：正文与工具结果是服务端产出的，客户端历史里没有，必须自己收集
+  let assistantText = '' // 累计正文增量，落库时拼回一条 assistant 消息
+  const runToolResults = [] // 本轮流内执行的工具结果（resume 写回的那部分已进 aguiMessages）
 
   const abortController = new AbortController()
   const send = (event) => {
@@ -618,7 +666,7 @@ app.post('/agui', async (req, res) => {
       // executeApprovalTool 现在是 async（改状态要写 JSON 文件），必须 await，
       // 否则下面写回历史的 content 会是一个 Promise，序列化出来是 {}
       const output = approved
-        ? await executeApprovalTool(call.name, call.input, sessionId)
+        ? await executeApprovalTool(call.name, call.input, sessionId, userId)
         : '用户拒绝了该操作，未执行'
       // 结果写回历史：快照、模型上下文、前端卡片都靠这条消息对齐
       const messageId = `msg_tool_${++toolMessageSeq}`
@@ -627,7 +675,7 @@ app.post('/agui', async (req, res) => {
       console.log('[agui] resume 处理中断 %s，approved=%s', interruptId, approved)
     }
 
-    const serverTools = createTools(sessionId)
+    const serverTools = createTools(sessionId, userId)
     const approvalTools = createApprovalTools()
     const frontendTools = createFrontendTools(input.tools, { ...serverTools, ...approvalTools })
     const tools = { ...serverTools, ...approvalTools, ...frontendTools }
@@ -689,6 +737,7 @@ app.post('/agui', async (req, res) => {
       } else if (part.type === 'text-delta') {
         if (!part.text) continue
         const opened = openText()
+        assistantText += part.text // 同时收集：落库快照要用
         send({
           type: 'TEXT_MESSAGE_CHUNK',
           // 开头的分片带 messageId + role，续写分片省略（省略表示延续当前消息）
@@ -715,12 +764,14 @@ app.post('/agui', async (req, res) => {
         send({ type: 'TOOL_CALL_ARGS', toolCallId: part.toolCallId, delta: JSON.stringify(part.input ?? {}) })
         send({ type: 'TOOL_CALL_END', toolCallId: part.toolCallId })
       } else if (part.type === 'tool-result') {
+        const resultText = toolOutputText(part.output)
+        runToolResults.push({ toolCallId: part.toolCallId, content: resultText }) // 落库收集
         send({
           type: 'TOOL_CALL_RESULT',
           messageId: `msg_tool_${++toolMessageSeq}`,
           toolCallId: part.toolCallId,
           role: 'tool',
-          content: toolOutputText(part.output)
+          content: resultText
         })
         // 检索工具的 sources 走共享状态，前端可直接渲染引用来源
         const sources = Array.isArray(part.output?.sources) ? part.output.sources : []
@@ -814,6 +865,29 @@ app.post('/agui', async (req, res) => {
     }
   } finally {
     finished = true
+    // 会话落库放 finally：正常结束、interrupt、出错、客户端断开都要留痕——
+    // 尤其审批中断时，快照里必须已经包含那条带 toolCalls 的 assistant 消息，resume 才有依据可循
+    try {
+      const snapshot = [...aguiMessages]
+      if (assistantText.trim()) {
+        snapshot.push({
+          id: currentAssistantId || `msg_asst_${randomUUID()}`,
+          role: 'assistant',
+          content: assistantText
+        })
+      }
+      for (const item of runToolResults) {
+        snapshot.push({
+          id: `msg_tool_${++toolMessageSeq}`,
+          role: 'tool',
+          content: item.content,
+          toolCallId: item.toolCallId
+        })
+      }
+      saveRun({ threadId, runId, userId, messages: snapshot })
+    } catch (err) {
+      log.error('[threads] 会话落库失败', { threadId, runId, err: err.message })
+    }
     if (!res.writableEnded) res.end()
   }
 })
@@ -921,10 +995,14 @@ function removeFileQuietly(filePath) {
  * @returns {Promise<string>}
  */
 async function resolveDocName(fileName, biz) {
-  const docs = await getDocuments()
+  // 只在"自己可见"的文档里找同名：别的用户的同名文件对当前用户必须像不存在一样，
+  // 否则 B 传「简历.md」会被 A 的同名文件顶成 -2，自己看着莫名其妙的文件名
+  const docs = await getDocuments(biz.userId)
   const sameName = docs.filter(doc => doc.fileName === fileName)
+  // 同一业务对象 = 业务标签 + 归属都一致；无主旧文档（userId undefined）与带主的新上传不算同主
   const sameOwner = sameName.some(doc =>
     doc.docType === biz.docType && doc.jobId === biz.jobId && doc.candidateId === biz.candidateId
+      && doc.userId === biz.userId
   )
   if (!sameName.length || sameOwner) return fileName
 
@@ -967,19 +1045,20 @@ app.post('/api/upload-doc', upload.single('file'), async (req, res) => {
       return res.status(400).json({ error: '未能从文件中解析出文本' })
     }
 
-    const biz = { docType, jobId, candidateId }
+    const biz = { docType, jobId, candidateId, userId: req.user.userId }
     // 同名不同候选人时改名，避免 deleteDocument 把别人的简历删掉
     const fileName = await resolveDocName(uploadName, biz)
     const renamed = fileName !== uploadName
 
     // 同名文档重新上传时先删掉旧片段，避免向量库里出现重复内容
-    const removed = await deleteDocument(fileName)
-    // 第三个参数就是刚加的业务标签；不传时行为与之前完全一致
+    // 第二个参数圈定"只删自己可见的"：另一个用户碰巧有同名文件时，这里删不动他的
+    const removed = await deleteDocument(fileName, req.user.userId)
+    // 第三个参数就是业务标签 + 归属；userId 进 metadata 后检索/列表/删除都会按它过滤
     await batchInsertEmbedding(chunks, fileName, biz)
 
     // 简历入库即登记候选人：后面的 listCandidates / updateCandidateStatus 都以这张表为准
     if (docType === 'resume') {
-      await upsertCandidate({ candidateId, fileName, jobId })
+      await upsertCandidate({ candidateId, fileName, jobId, userId: req.user.userId })
     }
 
     res.json({
@@ -1004,22 +1083,24 @@ app.post('/api/upload-doc', upload.single('file'), async (req, res) => {
   }
 })
 
-// 文档列表：按文件名聚合，前端左侧文档栏使用
+// 文档列表：按文件名聚合，前端左侧文档栏使用。只列当前用户可见的
 app.get('/api/documents', async (req, res) => {
   try {
-    const data = await getDocuments()
+    const data = await getDocuments(req.user.userId)
     res.json({ ok: true, data })
   } catch (err) {
     console.error('获取文档列表失败', err)
     res.status(500).json({ error: err.message })
   }
 })
-// 删除文档：按文件名删掉向量库中对应的全部片段
+// 删除文档：按文件名删掉向量库中对应的全部片段。只删得动自己可见的，
+// 删到 0 说明文件不存在或不属于你——不能把"别人有这个文件"泄露成删除成功
 app.post('/api/documents/delete', async (req, res) => {
   try {
     const { fileName } = req.body
     if (!fileName) return res.status(400).json({ error: '缺少fileName' })
-    const removed = await deleteDocument(fileName)
+    const removed = await deleteDocument(fileName, req.user.userId)
+    if (!removed) return res.status(404).json({ error: '文档不存在或无权删除' })
     res.json({ ok: true, fileName, removed })
   } catch (err) {
     console.error('删除文档失败', err)
@@ -1031,7 +1112,11 @@ app.post('/api/documents/delete', async (req, res) => {
 //   工具 → 拼成一段文案给模型读；这里 → 结构化字段给表格渲染和筛选
 app.get('/api/candidates', async (req, res) => {
   try {
-    const [resumes, records] = await Promise.all([getCandidates(), listCandidateRecords()])
+    // 两路都圈定在当前用户的可见范围：自己的 + 鉴权前的无主旧数据
+    const [resumes, records] = await Promise.all([
+      getCandidates(req.user.userId),
+      listCandidateRecords({ userId: req.user.userId })
+    ])
     const byId = new Map(records.map(item => [item.candidateId, item]))
     let data = resumes.map(resume => {
       const record = byId.get(resume.key)
@@ -1060,7 +1145,7 @@ app.get('/api/candidates', async (req, res) => {
 // 岗位列表：JD 的 jobId 只有服务端知道，前端做下拉框要它
 app.get('/api/jobs', async (req, res) => {
   try {
-    const jobs = await getJobs()
+    const jobs = await getJobs(req.user.userId)
     res.json({ ok: true, data: jobs.map(job => ({ jobId: job.key, fileName: job.fileName, chunkCount: job.chunkCount })) })
   } catch (err) {
     console.error('获取岗位列表失败', err)
@@ -1074,6 +1159,10 @@ app.post('/api/session-files/upload', uploadSessionFile, async (req, res) => {
     const { sessionId } = req.body
     if (!sessionId) return res.status(400).json({ error: '缺少 sessionId' })
     if (!req.file) return res.status(400).json({ error: '请上传文件' })
+    // 会话归属绑定：第一次上传的人拥有这个会话，其他人（包括改了前端代码的）传不进去
+    if (!claimSession(sessionId, req.user.userId)) {
+      return res.status(403).json({ error: '会话归属其他用户，拒绝访问' })
+    }
 
     const fileName = fixFileName(req.file.originalname)
     const ext = path.extname(fileName).toLowerCase()
@@ -1109,12 +1198,29 @@ app.post('/api/session-files/delete', (req, res) => {
   try {
     const { sessionId, fileId } = req.body || {}
     if (!sessionId || !fileId) return res.status(400).json({ error: '缺少 sessionId 或 fileId' })
+    if (!claimSession(sessionId, req.user.userId)) {
+      return res.status(403).json({ error: '会话归属其他用户，拒绝访问' })
+    }
     const removed = deleteSessionFile(sessionId, fileId)
     res.json({ ok: true, removed })
   } catch (err) {
     console.error('删除会话附件失败', err)
     res.status(500).json({ error: err.message })
   }
+})
+
+// ========== 会话历史（落库的读出口） ==========
+// 写入在 /agui 的 finally 里自动完成，这两个端点只读：
+//   列表 → 会话恢复页/历史侧栏；消息快照 → 选中某个会话后还原整段对话。
+// 历史的运行时口径不变：对话仍以客户端带来的 messages 为准，这里只是兜底副本。
+app.get('/api/threads', (req, res) => {
+  res.json({ ok: true, data: listThreads(req.user.userId) })
+})
+app.get('/api/threads/:threadId/messages', (req, res) => {
+  const result = getThreadMessages(req.params.threadId, req.user.userId)
+  // 404 同时覆盖"不存在"和"存在但不属于你"：不区分才能不泄露会话 id 的存在性
+  if (!result) return res.status(404).json({ error: '会话不存在或无权访问' })
+  res.json({ ok: true, ...result })
 })
 
 // 清空知识库不走 HTTP：原 /api/vector-clear 没有鉴权，部署到公网后一次 POST 就能清库。
@@ -1138,5 +1244,5 @@ app.use((err, req, res, next) => {
 })
 
 app.listen(PORT, () => { // 启动 HTTP 服务并监听端口
-  console.log(`✅ 服务启动 http://localhost:${PORT}`) // 启动成功后打印访问地址
+  log.info(`服务启动 http://localhost:${PORT}`, { port: PORT, node: process.version })
 })

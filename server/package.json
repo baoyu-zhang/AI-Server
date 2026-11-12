@@ -9,7 +9,8 @@
     "eval": "node eval/run-eval.js",
     "eval:ingest": "node eval/ingest-corpus.js",
     "inspect": "node eval/inspect.js",
-    "verify:hr": "node eval/verify-hr.mjs"
+    "verify:hr": "node eval/verify-hr.mjs",
+    "verify:auth": "node eval/verify-auth.mjs"
   },
   "keywords": [],
   "author": "",

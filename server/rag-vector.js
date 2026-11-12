@@ -75,10 +75,12 @@ async function getEmbeddings(texts) {
 async function batchInsertEmbedding(chunks, fileName, meta = {}) {
   const vectors = await getEmbeddings(chunks)
   // 白名单：只接收业务字段，防止调用方传 content 把正文覆盖掉
+  // userId 是数据隔离的锚点：写入后，检索/列表/删除都按它圈定可见范围
   const biz = {
     docType: meta.docType,
     jobId: meta.jobId,
-    candidateId: meta.candidateId
+    candidateId: meta.candidateId,
+    userId: meta.userId
   }
   for (let i = 0; i < chunks.length; i++) {
     await index.insertItem({
@@ -197,11 +199,26 @@ function matchesFilter(meta, filter) {
       if (!Array.isArray(expect) || !expect.every(f => matchesFilter(m, f))) return false;
     } else if (key === '$or') {
       if (!Array.isArray(expect) || !expect.some(f => matchesFilter(m, f))) return false;
+    } else if (expect === null) {
+      // null 的专门语义："这个字段不存在"。用户的可见性过滤靠它：
+      // 旧语料（评测语料、鉴权上线前的数据）没有 userId 字段，要让它对所有人可见，
+      // 表达成 { userId: null }；写 undefined 的话 JSON 序列化会直接丢键。
+      if (m[key] !== undefined) return false;
     } else if (m[key] !== expect) {
       return false;
     }
   }
   return true;
+}
+
+/**
+ * 可见性过滤：有主的片段只归本人，无主片段（旧语料）对所有人可见。
+ * userId 为空（服务端脚本、评测）时返回 null = 不过滤，行为与鉴权上线前完全一致。
+ * 返回值要么直接当 filter 用，要么和业务 filter 一起交给 matchesFilter。
+ */
+function visibilityFilter(userId) {
+  if (!userId) return null;
+  return { $or: [{ userId }, { userId: null }] };
 }
 
 /**
@@ -211,14 +228,16 @@ function matchesFilter(meta, filter) {
  * @param {number} topK
  * @returns {Array<{id: string, score: number, content: string, fileName: string}>}
  */
-function bm25Search(bm25Index, query, topK,filter) {
+function bm25Search(bm25Index, query, topK, filter, userId) {
   const queryTokens = tokenize(query);
   if (!queryTokens.length || !bm25Index.docs.length) return [];
   const { docs, df, avgdl } = bm25Index;
+  const vis = visibilityFilter(userId);
   const total = docs.length;
   const scored = [];
   for (const doc of docs) {
     if (!matchesFilter(doc.meta, filter)) continue; // 必须在打分前过滤，不能取完 topK 再筛
+    if (vis && !matchesFilter(doc.meta, vis)) continue; // 可见性同样在打分前，否则别人的片段会占掉 topK 名额
 
     let score = 0;
     for (const token of queryTokens) {
@@ -244,19 +263,26 @@ function bm25Search(bm25Index, query, topK,filter) {
  * @param {number} pool 每路各召回多少条
  * @returns {Promise<{denseHits: Array, keywordHits: Array}>}
  */
-async function retrieveCandidates(query, pool,filter) {
+async function retrieveCandidates(query, pool, filter, userId) {
   // embedding 推理与倒排索引构建互不依赖，必须并行；串行会让两段耗时直接相加
   const [queryVector, bm25Index] = await Promise.all([getEmbedding(query), getBm25Index()]);
   // Vectra 0.15 的签名是 queryItems(vector, query, topK, filter, isBm25)，这里只用语义那一路
-  const denseItems = await index.queryItems(queryVector, query, pool,filter);
+  const denseItems = await index.queryItems(queryVector, query, pool, filter);
+  // 可见性不交给 Vectra：它的 filter 只认"值精确相等"，表达不了"userId 等于某人或不存在"。
+  // 所以召回时只带业务 filter（扩大召回池），可见性在下面用自己的 matchesFilter 统一收口——
+  // 这样 BM25 路与向量路的"谁能看见"必然是同一套语义，不会出现一边漏一边严。
+  const vis = visibilityFilter(userId);
+  let denseHits = denseItems.map(item => ({
+    id: item.item.id,
+    score: item.score,
+    content: item.item.metadata.content,
+    fileName: item.item.metadata.fileName,
+    meta: item.item.metadata || {} // 带上 metadata 才能做可见性后过滤
+  }));
+  if (vis) denseHits = denseHits.filter(hit => matchesFilter(hit.meta, vis));
   return {
-    denseHits: denseItems.map(item => ({
-      id: item.item.id,
-      score: item.score,
-      content: item.item.metadata.content,
-      fileName: item.item.metadata.fileName
-    })),
-    keywordHits: bm25Search(bm25Index, query, pool,filter)
+    denseHits,
+    keywordHits: bm25Search(bm25Index, query, pool, filter, userId)
   };
 }
 
@@ -305,9 +331,9 @@ function fuseRRF(denseHits, keywordHits, topK) {
  * @param {number} topK
  * @returns {Promise<Array>} 融合后的 topK，含排名明细
  */
-async function hybridSearch(query, topK = 3,filter) {
+async function hybridSearch(query, topK = 3, filter, userId) {
   const pool = Math.max(topK * 4, 20); // 召回池要放大，否则没东西可融
-  const { denseHits, keywordHits } = await retrieveCandidates(query, pool,filter);
+  const { denseHits, keywordHits } = await retrieveCandidates(query, pool, filter, userId);
   return fuseRRF(denseHits, keywordHits, topK);
 }
 
@@ -319,8 +345,8 @@ async function hybridSearch(query, topK = 3,filter) {
  * @param {number} topK
  * @returns {Promise<Array<{score: number, content: string, fileName: string}>>}
  */
-async function searchVector(query, topK = 3,filter) {
-  const results = await hybridSearch(query, topK,filter);
+async function searchVector(query, topK = 3, filter, userId) {
+  const results = await hybridSearch(query, topK, filter, userId);
   return results.map(item => ({
     score: item.score,
     content: item.content,
@@ -332,8 +358,8 @@ async function searchVector(query, topK = 3,filter) {
  * 调试版检索：额外返回 denseRank / bm25Rank
  * 只在本地排查和评测脚本里用，不接入线上链路
  */
-async function searchVectorDebug(query, topK = 3,filter) {
-  return await hybridSearch(query, topK,filter);
+async function searchVectorDebug(query, topK = 3, filter, userId) {
+  return await hybridSearch(query, topK, filter, userId);
 }
 
 /**
@@ -344,9 +370,9 @@ async function searchVectorDebug(query, topK = 3,filter) {
  * @param {number} topK
  * @returns {Promise<{denseHits: Array, keywordHits: Array, fused: Array}>}
  */
-async function searchWithCandidates(query, topK = 3,filter) {
+async function searchWithCandidates(query, topK = 3, filter, userId) {
   const pool = Math.max(topK * 4, 20);
-  const candidates = await retrieveCandidates(query, pool,filter);
+  const candidates = await retrieveCandidates(query, pool, filter, userId);
   return {
     ...candidates,
     fused: fuseRRF(candidates.denseHits, candidates.keywordHits, topK)
@@ -384,11 +410,13 @@ async function getAllItems() {
  * 后传的那份会把前一个人的片段删掉——覆盖变成互相覆盖。
  * @returns {Promise<Array<{fileName: string, chunkCount: number, createdAt: number, docType?: string, jobId?: string, candidateId?: string}>>}
  */
-async function getDocuments() {
+async function getDocuments(userId) {
   const items = await index.listItems()
+  const vis = visibilityFilter(userId);
   const map = new Map()
   for (const item of items) {
     const meta = item.metadata || {}
+    if (vis && !matchesFilter(meta, vis)) continue; // 别人的文档连聚合都不进，chunkCount 也不泄露
     const fileName = meta.fileName
     if (!fileName) continue // 没有文件名的历史数据不纳入文档列表
     if (!map.has(fileName)) {
@@ -399,7 +427,8 @@ async function getDocuments() {
         // 同一文件的所有片段共享同一组标签，取第一条即可（旧语料没有这些字段，值为 undefined）
         docType: meta.docType,
         jobId: meta.jobId,
-        candidateId: meta.candidateId
+        candidateId: meta.candidateId,
+        userId: meta.userId // 传给 resolveDocName 判断"同名是不是同一个对象"
       })
     }
     const doc = map.get(fileName)
@@ -417,11 +446,13 @@ async function getDocuments() {
  * @param {(meta: object) => boolean} [predicate] 额外筛选，用于"统计岗位时排除简历片段"
  * @returns {Promise<Array<{key: string, fileName: string, chunkCount: number, createdAt: number, jobId?: string, candidateId?: string}>>}
  */
-async function groupByBizField(field, predicate) {
+async function groupByBizField(field, predicate, userId) {
   const items = await index.listItems()
+  const vis = visibilityFilter(userId);
   const map = new Map()
   for (const item of items) {
     const meta = item.metadata || {}
+    if (vis && !matchesFilter(meta, vis)) continue;
     const key = meta[field]
     // 没有该字段的片段不参与聚合：旧语料没有 candidateId，不能让它变成一条"空候选人"
     if (!key) continue
@@ -437,8 +468,8 @@ async function groupByBizField(field, predicate) {
 }
 
 /** 候选人清单：只统计带 candidateId 的片段（简历入库强制带 candidateId，所以这里天然只有简历） */
-async function getCandidates() {
-  return await groupByBizField('candidateId')
+async function getCandidates(userId) {
+  return await groupByBizField('candidateId', undefined, userId)
 }
 
 /**
@@ -446,19 +477,23 @@ async function getCandidates() {
  * 为什么要排除：简历也可以标 jobId（表示"投的是这个岗"），如果一并计入，
  * 一个岗位的"片段数"里会混进几十段简历正文，看的人会误以为 JD 很长。
  */
-async function getJobs() {
-  return await groupByBizField('jobId', meta => meta.docType !== 'resume')
+async function getJobs(userId) {
+  return await groupByBizField('jobId', meta => meta.docType !== 'resume', userId)
 }
 
 /**
  * 按文件名删除文档：删除该文件对应的全部向量片段
  * @param {string} fileName
+ * @param {string} [userId] 传入时只删可见范围内的片段——按文件名删是危险操作，
+ *   不能因为另一个用户碰巧传了同名文件就删掉他的。返回 0 意味着"你没有这个文件"。
  * @returns {Promise<number>} 删除的片段数
  */
-async function deleteDocument(fileName) {
+async function deleteDocument(fileName, userId) {
   const items = await index.listItems()
+  const vis = visibilityFilter(userId);
   const ids = items
     .filter(item => item.metadata?.fileName === fileName)
+    .filter(item => !vis || matchesFilter(item.metadata, vis))
     .map(item => item.id)
   if (ids.length) await index.deleteItems(ids)
   invalidateBm25() // 删完必须重建倒排，否则被删的片段还能被关键词召回
