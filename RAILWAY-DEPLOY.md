@@ -88,6 +88,26 @@
 > 右上角 `8 days or $3.91 left` 的含义：试用剩 8 天**或**剩 $3.91 额度，谁先到算谁。
 > 所以先把配置一次填对再部署，别用「反复重试」去试错，失败重启也在计费。
 
+### 2.2 服务创建后显示 `Service is offline`
+
+这是**正常中间态**：staged change 应用完，服务实体存在了，但还没有一次运行中的部署。
+右侧的 `ai-server.railway.internal` 是 Railway 内网 DNS、Region / Replica 是默认配置，
+它们都会自动生成，**不代表服务在跑**。此时别急着 `Generate Domain`，没有后端接着域名只会 502。
+
+点 **Deployments** 页签，按看到的内容对号入座：
+
+| 看到什么 | 原因 | 怎么做 |
+|---|---|---|
+| 一条部署记录都没有 | 只 Apply 了变更，没触发构建 | 点顶部 `Deploy` / `Redeploy` |
+| `❌ .env 缺少 DEEPSEEK_API_KEY` | `index.js:203` 是硬检查，缺了直接 `exit(1)` | Variables 补 `DEEPSEEK_API_KEY` |
+| `[security] 生产配置自检未通过：ADMIN_PASSWORD 是弱口令` | `security.js` 的 `WEAK_PASSWORDS` 会拦本地默认口令 `123456` / `admin` 等 | 换 ≥12 位随机串：`openssl rand -hex 16` |
+| `生产配置自检未通过：数据目录不可写` | Volume 没挂、或挂载路径不是 `/app/data` | 按第三节挂卷后重新部署 |
+| Build Logs 里 `npm ci` / `COPY` 失败 | Dockerfile 构建阶段问题 | 复制完整 Build Logs 再对着改 |
+| 部署列表为空，且 Source 仍显示 `Connect Repo` | 只授权了 GitHub App，**没在 Railway 里选仓库** | 回 Settings → Source 选 `AI-Server` / `main` |
+
+> 最容易踩的两个组合：① 以为 GitHub 授权完仓库就自动连上了，其实还要在 Railway 选一次；
+> ② 把本机的 `ADMIN_PASSWORD=123456` 照抄到云上，被生产自检拦下，表现为容器反复重启、服务一直 offline。
+
 ---
 
 ## 三、先挂 Volume（最关键，别跳过）
