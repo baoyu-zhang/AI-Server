@@ -1477,7 +1477,7 @@ async function loadThread(id: string) {
   // 恢复期间锁住发送：半恢复状态下发消息会把上下文拼错（曾出现两条一样的用户气泡）
   chatStore.loading = true
   try {
-    const body = await fetchJson<{ messages: Array<Record<string, any>> }>(
+    const body = await fetchJson<{ messages: Array<Record<string, any>>; state?: Record<string, unknown> }>(
       `/api/threads/${encodeURIComponent(id)}/messages`
     )
     const snapshot: Array<Record<string, any>> = Array.isArray(body?.messages) ? body.messages : []
@@ -1496,8 +1496,12 @@ async function loadThread(id: string) {
     // setMessages 不在引擎公开类型里，与 onRetry 处一致地按运行时能力调用
     ;(chatEngine.value as unknown as { setMessages: (items: unknown[], mode?: string) => void } | undefined)
       ?.setMessages(aguiToEngineMessages(snapshot), 'replace')
-    // 服务端快照不含共享 state，下一轮从空 state 开始（引用来源等跨轮信息会丢，可接受）
-    chatStore.agentState = {}
+    // 服务端快照带回了落库时的共享状态（引用来源 sources、phase 等）：
+    // 深拷贝后接管，下一轮请求原样回传，跨轮信息不再因为换设备/清缓存而丢。
+    // 服务端给的对象直接引用会共享引用，后续 STATE_DELTA 改动可能反向污染缓存，必须克隆
+    chatStore.agentState = cloneAgentState(
+      body?.state && typeof body.state === 'object' ? body.state : {}
+    )
     threadId.value = id
     // 附件按 sessionId 绑定，恢复会话不恢复附件，换新 id 避免旧附件被静默检索
     sessionId.value = createSessionId()

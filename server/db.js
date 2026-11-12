@@ -76,4 +76,16 @@ CREATE INDEX IF NOT EXISTS idx_audit_user ON audit_log(user_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_audit_action ON audit_log(action, created_at);
 `)
 
+// ===== 轻量迁移：CREATE TABLE IF NOT EXISTS 对已存在的表不生效，加列只能走 ALTER =====
+// 用 pragma table_info 探测列是否存在，保证重启任意次都幂等。
+// state 存本轮结束时 AG-UI 共享状态的 JSON（sources/phase 等）：恢复历史会话时
+// 服务端把它一起还给前端，引用来源等跨轮信息不再丢。
+{
+  const runCols = db.prepare("PRAGMA table_info(thread_runs)").all().map(c => c.name)
+  if (!runCols.includes('state')) {
+    db.exec('ALTER TABLE thread_runs ADD COLUMN state TEXT;')
+    console.log('[db] thread_runs 已迁移：新增 state 列')
+  }
+}
+
 module.exports = db

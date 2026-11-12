@@ -598,6 +598,23 @@ app.post('/agui', async (req, res) => {
   }
   const priorState = input.state && typeof input.state === 'object' ? input.state : {}
   const priorSources = Array.isArray(priorState.sources) ? priorState.sources : []
+  // 服务端自己跟踪共享状态的最终值：与下发出去的事件严格同步（快照替换、增量应用），
+  // run 结束后随消息快照一起落库。恢复历史会话时原样还给客户端，
+  // 引用来源等跨轮信息不再因为换设备/清缓存而丢（此前客户端丢了就只能从空 state 重来）
+  let finalState = { ...priorState, phase: 'running', sources: [...priorSources] }
+  // 应用 STATE_DELTA 用到的 JSON-Patch 子集：add /sources/-（追加来源）与 replace /<key>（改 phase）
+  // 只实现本服务实际下发的两种 op，协议里其余 op 一出现就忽略——宁可少存也不存错
+  const applyStateOps = (state, ops) => {
+    for (const op of ops || []) {
+      if (!op || typeof op.path !== 'string') continue
+      if (op.op === 'add' && op.path === '/sources/-' && op.value !== undefined) {
+        state.sources = [...(Array.isArray(state.sources) ? state.sources : []), op.value]
+      } else if (op.op === 'replace' && op.path.startsWith('/') && op.path.length > 1) {
+        state[op.path.slice(1)] = op.value
+      }
+    }
+    return state
+  }
 
   res.setHeader('Content-Type', eventEncoder.getContentType())
   res.setHeader('Cache-Control', 'no-cache, no-transform') // 禁止压缩/缓冲，保证逐帧下发
@@ -747,7 +764,10 @@ app.post('/agui', async (req, res) => {
     send({ type: 'RUN_STARTED', threadId, runId })
     // 不再下发 MESSAGES_SNAPSHOT：服务端无状态，历史以客户端 RunAgentInput.messages 为准。
     // 该事件语义是“整段消息列表替换”，只在服务端真的改写历史（如会话存储/压缩）时才发。
-    send({ type: 'STATE_SNAPSHOT', snapshot: { ...priorState, phase: 'running', sources: priorSources } })
+    // 起跑快照：同一个对象既下发也留给 finalState，两边从第一帧起就一致
+    const runningSnapshot = { ...priorState, phase: 'running', sources: [...priorSources] }
+    finalState = runningSnapshot
+    send({ type: 'STATE_SNAPSHOT', snapshot: runningSnapshot })
     // 续跑开始：先把用户确认后的工具结果回传，前端据此把待确认卡片标记为完成
     for (const item of resumeOutputs) {
       send({
@@ -849,10 +869,9 @@ app.post('/agui', async (req, res) => {
         // 检索工具的 sources 走共享状态，前端可直接渲染引用来源
         const sources = Array.isArray(part.output?.sources) ? part.output.sources : []
         if (sources.length) {
-          send({
-            type: 'STATE_DELTA',
-            delta: sources.map(source => ({ op: 'add', path: '/sources/-', value: source }))
-          })
+          const ops = sources.map(source => ({ op: 'add', path: '/sources/-', value: source }))
+          applyStateOps(finalState, ops) // 与下发同步：跟踪的 state 也要长出这些来源
+          send({ type: 'STATE_DELTA', delta: ops })
         }
         // 工具结果之后，模型下一段文本属于新的 assistant 消息
         currentAssistantId = null
@@ -913,7 +932,9 @@ app.post('/agui', async (req, res) => {
       }
       if (pendingApprovals.length) {
         // 有工具调用等用户确认：以 interrupt 结束本次 run，客户端 resume 时再继续
-        send({ type: 'STATE_DELTA', delta: [{ op: 'replace', path: '/phase', value: 'interrupted' }] })
+        const interruptOps = [{ op: 'replace', path: '/phase', value: 'interrupted' }]
+        applyStateOps(finalState, interruptOps)
+        send({ type: 'STATE_DELTA', delta: interruptOps })
         send({
           type: 'RUN_FINISHED',
           threadId,
@@ -935,7 +956,9 @@ app.post('/agui', async (req, res) => {
           }
         })
       } else {
-        send({ type: 'STATE_DELTA', delta: [{ op: 'replace', path: '/phase', value: 'done' }] })
+        const doneOps = [{ op: 'replace', path: '/phase', value: 'done' }]
+        applyStateOps(finalState, doneOps)
+        send({ type: 'STATE_DELTA', delta: doneOps })
         send({ type: 'RUN_FINISHED', threadId, runId })
       }
     }
@@ -954,7 +977,8 @@ app.post('/agui', async (req, res) => {
       // 输入历史 + 本轮新增消息。runMessages 已按发生顺序保存了每段正文、
       // 带 toolCalls 的 assistant 和工具结果，这里只做拼接，不再二次加工
       const snapshot = [...(aguiMessages || []), ...runMessages]
-      saveRun({ threadId, runId, userId, messages: snapshot })
+      // state 一并落库：恢复会话时接口把它还给前端，跨轮信息不丢
+      saveRun({ threadId, runId, userId, messages: snapshot, state: finalState })
     } catch (err) {
       log.error('[threads] 会话落库失败', { threadId, runId, err: err.message })
     }

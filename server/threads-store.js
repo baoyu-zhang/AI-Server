@@ -17,7 +17,7 @@ const db = require('./db')
 const TITLE_MAX = 30
 
 /** 一轮 run 结束（或中断/出错）后落库。同一 runId 重复调用直接覆盖 */
-function saveRun({ threadId, runId, userId, messages }) {
+function saveRun({ threadId, runId, userId, messages, state }) {
   if (!threadId || !runId || !userId) return
   const firstUser = (Array.isArray(messages) ? messages : []).find(m => m?.role === 'user')
   const title = (firstUser ? String(firstUser.content ?? '') : '')
@@ -36,10 +36,11 @@ function saveRun({ threadId, runId, userId, messages }) {
     ON CONFLICT(id) DO UPDATE SET updated_at = excluded.updated_at
   `).run(threadId, userId, title, now)
   db.prepare(`
-    INSERT INTO thread_runs (run_id, thread_id, user_id, messages, created_at)
-    VALUES (?, ?, ?, ?, ?)
-    ON CONFLICT(run_id) DO UPDATE SET messages = excluded.messages, created_at = excluded.created_at
-  `).run(runId, threadId, userId, JSON.stringify(messages || []), now)
+    INSERT INTO thread_runs (run_id, thread_id, user_id, messages, state, created_at)
+    VALUES (?, ?, ?, ?, ?, ?)
+    ON CONFLICT(run_id) DO UPDATE SET
+      messages = excluded.messages, state = excluded.state, created_at = excluded.created_at
+  `).run(runId, threadId, userId, JSON.stringify(messages || []), JSON.stringify(state || {}), now)
 }
 
 /**
@@ -78,16 +79,18 @@ function listThreads(userId) {
   })
 }
 
-/** 取某个会话最新一轮的消息快照；不存在或不属于该用户返回 null */
+/** 取某个会话最新一轮的消息快照与共享状态；不存在或不属于该用户返回 null */
 function getThreadMessages(threadId, userId) {
   const thread = db.prepare('SELECT id FROM threads WHERE id = ? AND user_id = ?').get(threadId, userId)
   if (!thread) return null
   const run = db.prepare(
-    'SELECT messages, created_at FROM thread_runs WHERE thread_id = ? ORDER BY created_at DESC LIMIT 1'
+    'SELECT messages, state, created_at FROM thread_runs WHERE thread_id = ? ORDER BY created_at DESC LIMIT 1'
   ).get(threadId)
   if (!run) return null
   try {
-    return { messages: JSON.parse(run.messages), updatedAt: run.created_at }
+    // state 与 messages 配套：恢复历史时前端用它重建共享状态，
+    // 下一轮请求照常回传，引用来源等跨轮信息不会因为换设备/清缓存而丢
+    return { messages: JSON.parse(run.messages), state: JSON.parse(run.state || '{}'), updatedAt: run.created_at }
   } catch {
     return null // 快照损坏时返回 null，让调用方按"没有历史"处理，不让接口 500
   }
