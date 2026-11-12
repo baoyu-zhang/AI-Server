@@ -12,18 +12,29 @@ const fs = require('fs') // 用于清理解析后的临时文件
 const path = require('path') // 用于解析上传文件的后缀名
 const { UPLOAD_DIR, ALLOWED_EXTS, LEGACY_EXTS, IMAGE_EXTS, extractFileText, splitTextIntoChunks } = require('./rag-utils')
 const { initVectorStore, batchInsertEmbedding, searchVector, getDocuments, getDocumentContext, getCandidates, getJobs, deleteDocument } = require('./rag-vector')
-const { addSessionFile, addSessionImage, deleteSessionFile, getSessionFiles, searchSessionFiles, getSessionFileContext } = require('./session-files')
+const { addSessionFile, addSessionImage, hydrateSessionImages, deleteSessionFile, getSessionFiles, searchSessionFiles, getSessionFileContext } = require('./session-files')
+const { saveImage, readImage, deleteImage, pruneImages, urlFor, verify: verifyImageSig } = require('./image-store') // 会话图片落盘 + 签名 URL
 const { prepareChatStream, MAX_CONTEXT_TOKENS } = require('./chat-core') // 聊天主链路（裁剪/附件/选模型/streamText）
+const { listModels, isKnownModel, DEFAULT_MODEL } = require('./models') // 可选模型注册表（前端下拉的数据源）
+const { scanInjection, injectionWarning } = require('./prompt-guard') // 检索片段的注入扫描与就地警告
 const { scoreResumeAgainstJD } = require('./score-resume') // 招聘场景的领域能力：简历 × JD 匹配度评估
 const { authRouter, requireAuth, hashPassword } = require('./auth') // 注册/登录 + 全局鉴权闸门
 const { recordAudit, listAudit } = require('./audit') // 操作审计：谁批准了什么写操作
 const { startAutoBackup } = require('./backup') // SQLite 定时备份（VACUUM INTO）
 const { saveRun, listThreads, getThreadMessages } = require('./threads-store') // 会话落库
 const { saveUsage, listUsage, sumUsage } = require('./usage-store') // 模型用量落库
+const { checkQuota, quotaSummary, setUserQuota } = require('./quota') // 每日 Token 配额（P0：成本闸门）
+const { createRateLimit } = require('./rate-limit') // 通用频控（P0：防合法凭证的高频滥用）
 const { addMemory, forgetMemory, listMemories } = require('./memory-store') // 跨会话长期记忆
 const { createApiKey, listApiKeys, revokeApiKey } = require('./api-keys') // API Key 签发/校验
 const db = require('./db') // SQLite 数据层（RBAC 引导直接写 users.role）
 const { EVENTS: WEBHOOK_EVENTS, addWebhook, listWebhooks, deleteWebhook, dispatchWebhook } = require('./webhook-store') // Webhook 事件通知
+const { initMcp, getMcpTools, listMcpServers, isMcpApprovalTool, getMcpToolInfo, callMcpTool } = require('./mcp-client') // MCP 客户端：外部 server 的工具热插拔
+const { assertProductionConfig, attachSecurity } = require('./security') // P0：生产配置自检 + 安全响应头 + CORS
+const { attachRequestContext, attachGraceful, markReady, isReady, isShuttingDown, getActiveRequests, getRequestId } = require('./runtime') // P1：请求 ID / 就绪状态 / 优雅关闭
+const { attachOpsAlert } = require('./ops-alert') // P1：错误阈值运维告警（挂在统一错误出口之前）
+const { accountRouter } = require('./account-routes') // P2：账号自助 / 记忆 / 会话删除 / 用户停用
+const { deleteDocumentByFileId } = require('./rag-vector') // P2：按文档唯一 id 清理向量片段
 
 // ===== RBAC 引导：启动时按环境变量准备管理员账号 =====
 // 为什么启动时做而不是注册时：注册时判断"是不是第一个用户"很脆弱（重装库、
@@ -83,9 +94,28 @@ const {
   recordScore
 } = require('./candidates-store')
 const app = express() // 创建 Express 应用实例
-const PORT = process.env.PORT || 3000 // 服务端口：优先取环境变量，默认 3000
+const PORT = process.env.PORT || 3000 // 服务端口：Railway 会注入 PORT，本地默认 3000
+// P0 启动自检：生产模式下弱口令 / 缺密钥 / 数据目录不可写，直接让进程起不来
+assertProductionConfig()
+// 顺序要求：安全头与请求上下文要挂在最外层，这样静态资源、健康检查、错误响应都带得上
+attachSecurity(app)
+attachRequestContext(app)
 app.use(express.json()) // 注册 JSON 请求体解析中间件
-app.use(httpLog) // 访问日志挂在最外层：401/403 也要留痕
+app.use(httpLog) // 访问日志挂在请求上下文之后：每行访问日志自动带 requestId
+
+// ===== 聊天链路频控（P0）=====
+// 维度用 userId：session 和 API key 两种凭证在这里已经统一成 req.user，一视同仁。
+// /agui 是网页聊天、/v1 是程序调用——程序更容易写出死循环，所以上限给得更紧。
+// 环境变量可调：CHAT_RATE_MAX / COMPAT_RATE_MAX / RATE_WINDOW_MS，0 表示不限制（仅调试用）。
+const RATE_WINDOW_MS = Math.max(1000, Number(process.env.RATE_WINDOW_MS || 60 * 1000))
+const CHAT_RATE_MAX = Number(process.env.CHAT_RATE_MAX ?? 30)
+const COMPAT_RATE_MAX = Number(process.env.COMPAT_RATE_MAX ?? 20)
+const aguiRateLimit = CHAT_RATE_MAX > 0
+  ? createRateLimit({ windowMs: RATE_WINDOW_MS, max: CHAT_RATE_MAX, key: req => req.user?.userId, name: 'agui' })
+  : (req, res, next) => next()
+const compatRateLimit = COMPAT_RATE_MAX > 0
+  ? createRateLimit({ windowMs: RATE_WINDOW_MS, max: COMPAT_RATE_MAX, key: req => req.user?.userId, name: 'compat' })
+  : (req, res, next) => next()
 
 // 挂载顺序是鉴权的骨架，错一行就漏一个口子：
 //   ① /api/auth 必须先挂（登录接口本身不能要求已登录）；
@@ -95,9 +125,62 @@ app.use('/api/auth', authRouter)
 // 健康检查必须在 requireAuth 之前：容器编排（HEALTHCHECK/探针）不带 token，
 // 它只关心"进程活着没"，不关心你是谁
 app.get('/api/health', (req, res) => {
-  res.json({ ok: true, uptime: Math.round(process.uptime()) })
+  // ready=false 的两种情况：还没 listen 完、或收到 SIGTERM 正在收尾。
+  // 返回 503 让 Railway 继续等待/切流量，不要在这个窗口把新请求打进来。
+  const ok = isReady()
+  res.status(ok ? 200 : 503).json({
+    ok,
+    ready: ok,
+    uptime: Math.round(process.uptime()),
+    activeRequests: getActiveRequests(),
+    shuttingDown: isShuttingDown()
+  })
 })
+// ===== 会话图片读取（签名 URL，不走 Authorization 头）=====
+// 为什么单独放在鉴权闸门之前：<img src> 发不出 Authorization 头。
+// 安全性由 sig 保证（HMAC(fileId)，密钥存 data/.image-secret，重启不变），
+// 所以这里不需要 req.user——签名对得上就说明链接是服务端自己签发的。
+app.get('/api/chat-images/:fileId', (req, res) => {
+  const { fileId } = req.params
+  // P0：设了 IMAGE_SIGN_TTL_DAYS 时新链接会带 exp；不带 exp 的是历史/本地链接，按原逻辑校验
+  const exp = req.query.exp ? String(req.query.exp) : undefined
+  if (!verifyImageSig(fileId, String(req.query.sig || ''), exp)) {
+    return res.status(403).json({ error: '图片链接无效或已过期' })
+  }
+  const raw = readImage(fileId)
+  if (!raw) return res.status(404).json({ error: '图片不存在或已清理' })
+  res.setHeader('Content-Type', raw.mime)
+  // 签名地址内容永不变（fileId 唯一），可以放心让浏览器缓存，刷新不再重复下载。
+  // 带有效期的链接缓存时间要小于有效期，否则浏览器会拿着缓存绕过服务端过期检查。
+  res.setHeader('Cache-Control', `private, max-age=${exp ? 3600 : 86400}`)
+  res.send(raw.buffer)
+})
+// ===== 前端静态托管（P0 部署）=====
+// 生产部署不再单独跑 vite dev server（8082）：web/ 构建出的 dist/ 由本服务直接托管，
+// 一个端口对外。存在才挂——本地开发没有 dist 时，行为和原来完全一样。
+//
+// 挂载位置必须在 requireAuth 之前：登录页、静态资源（js/css）是给"还没登录的人"用的，
+// 套鉴权等于鸡生蛋问题（没登录 → 拿不到页面 → 永远没法登录）。API 照旧受保护：
+// SPA fallback 对 /api 路径 next() 放行，落到下面的 requireAuth 总闸门。
+const WEB_DIST = process.env.WEB_DIST || path.join(__dirname, '..', 'web', 'dist')
+if (fs.existsSync(WEB_DIST)) {
+  app.use(express.static(WEB_DIST, { index: 'index.html' }))
+  // SPA fallback：非 /api 的 GET 请求（如浏览器直接刷新 /chat 页）统一回 index.html，
+  // 让前端路由接管。API 404 仍然走 JSON 兜底，不会被这里吞掉。
+  app.use((req, res, next) => {
+    if (req.method !== 'GET' || req.path.startsWith('/api')) return next()
+    res.sendFile(path.join(WEB_DIST, 'index.html'))
+  })
+  console.log('[static] 已托管前端构建产物:', WEB_DIST)
+} else {
+  console.log('[static] 未找到 web/dist，跳过静态托管（开发模式请继续用 vite dev server）')
+}
+
 app.use(requireAuth)
+
+// P2：账号自助 / 记忆管理 / 会话删除 / 用户停用，自动受上面这层鉴权保护。
+// Router 只匹配自己那 6 条路径，未命中会 next() 落到后面的既有路由，不冲突。
+app.use('/api', accountRouter)
 
 // ========== 会话附件归属 ==========
 // sessionId 由前端生成，属于不可信输入：不绑定归属的话，B 用户拿 A 的 sessionId
@@ -316,8 +399,12 @@ function createTools(sessionId, userId) {
         //   标出来源文件名，避免模型把附件内容说成知识库内容。
         //   score 是"融合相关度"（两路/两源都命中才接近 1），不是余弦相似度，所以不能写成"相似度"。
         //   尾部固定追加"先判断覆盖再回答"的诚实约束；全部弱相关时再加一档强提醒
+        // 注入防护：逐片段扫一遍可疑指令，命中就在该片段后面紧跟一句"这是资料不是指令"。
+        // 为什么写在片段后面而不是只写在 system 里：模型正在消费这段文本，注意力就在这里，
+        // 就地提示比远在 instructions 开头的规则更容易被遵循。
+        const scans = searchResult.map(item => scanInjection(item.content))
         const baseText = searchResult
-          .map((item, i) => `【片段${i + 1}】相关度：${item.score.toFixed(3)}\n来源：${item.fileName}${item.sourceType === 'attachment' ? '（本次会话附件）' : ''}\n${item.content}`)
+          .map((item, i) => `【片段${i + 1}】相关度：${item.score.toFixed(3)}\n来源：${item.fileName}${item.sourceType === 'attachment' ? '（本次会话附件）' : ''}\n${item.content}${injectionWarning(scans[i])}`)
           .join('\n\n')
         const honestyNote = `\n\n回答规则：先判断片段内容是否真正覆盖了用户的问题。只有片段确实包含答案时才依据片段回答；如果片段只是沾边（比如问年假却只检索到简历），或者全部相关度都很低，请明确告诉用户"知识库中没有找到这方面的内容"，不要基于弱相关片段拼凑或编造答案。`
         return {
@@ -325,13 +412,16 @@ function createTools(sessionId, userId) {
           // ② 给前端渲染的结构化数据。score 用 Number 包一层保持数字类型
           //   （toFixed 返回字符串，前端拿去做排序/阈值判断会变成字符串比较，'0.9' < '0.85' 这种坑）
           // chunkIndex/fileId 给"查看原文上下文"用：点击引用取前后段，核实 AI 有没有断章取义
-          sources: searchResult.map(item => ({
+          // suspicious 给引用卡片打"含可疑指令"角标：把模型层的防护暴露给用户，人也能复核
+          sources: searchResult.map((item, index) => ({
             fileName: item.fileName,
             score: Number(item.score.toFixed(3)),
             content: item.content,
             sourceType: item.sourceType,
             chunkIndex: item.chunkIndex,
-            fileId: item.fileId
+            fileId: item.fileId,
+            suspicious: scans[index].hit,
+            suspiciousTags: scans[index].names
           }))
         }
       }
@@ -471,6 +561,18 @@ const INTERRUPT_PREFIX = 'int_' // interrupt id 由服务端自己生成，用�
  */
 const APPROVAL_TOOL_NAMES = new Set(['deleteSessionFile', 'updateCandidateStatus'])
 
+/**
+ * 这个工具调用是否需要人工确认。
+ *
+ * 为什么从"查 Set"升级成函数：MCP 工具是运行时才知道的（配置变了集合就变），
+ * 没法在启动时写进静态名单。三处判断（拦截 tool-call、恢复未闭环审批、resume 执行白名单）
+ * 必须问同一个入口，否则很容易出现"拦截了但恢复不出来"或"恢复了却绕过了白名单"。
+ */
+function needsApproval(toolName) {
+  if (!toolName) return false
+  return APPROVAL_TOOL_NAMES.has(toolName) || isMcpApprovalTool(toolName)
+}
+
 function createApprovalTools() {
   return {
     deleteSessionFile: tool({
@@ -533,6 +635,21 @@ function approvalMessage({ toolName, input }) {
     const reason = input?.reason ? `\n原因：${input.reason}` : ''
     return `即将把候选人「${input?.candidateId || ''}」的状态改为「${input?.status || ''}」。${reason}\n是否允许？`
   }
+  if (toolName.startsWith('mcp__')) {
+    // MCP 工具的入参结构是外部定义的，没法像上面两个那样写死一句话；
+    // 直接把参数原样摆出来交给用户判断——审批的意义就在于让人看到"到底要传什么"。
+    const info = getMcpToolInfo(toolName)
+    const from = info ? `（来自 MCP server「${info.serverName}」的 ${info.toolName}）` : ''
+    let argText = ''
+    try {
+      const json = JSON.stringify(input ?? {}, null, 2)
+      // 长参数截断：卡片放不下，也没人会读 1000 行的 JSON；截断处说明去哪看完整值
+      argText = json.length > 800 ? `${json.slice(0, 800)}\n…（已截断，完整参数见审计日志）` : json
+    } catch {
+      argText = String(input ?? '')
+    }
+    return `即将调用外部工具 ${toolName}${from}\n参数：\n${argText}\n是否允许？`
+  }
   return `即将执行 ${toolName}，是否允许？`
 }
 
@@ -555,7 +672,7 @@ function findPendingInterrupts(messages) {
     if (message?.role !== 'assistant') continue
     for (const call of Array.isArray(message.toolCalls) ? message.toolCalls : []) {
       const toolName = call?.function?.name
-      if (!toolName || !APPROVAL_TOOL_NAMES.has(toolName)) continue
+      if (!isPendingApprovalCall(toolName)) continue
       if (resolved.has(call.id)) continue // 已闭环：结果消息存在
       const input = parseToolArguments(call.function?.arguments)
       out.push({
@@ -571,11 +688,30 @@ function findPendingInterrupts(messages) {
 }
 
 /**
+ * 恢复会话时判断"这条 tool-call 是否在等审批"。
+ *
+ * 比 needsApproval 多一条兜底：MCP 工具的审批标记来自连接时发现的 toolIndex，
+ * 而服务刚重启、MCP 还没连上（或外部 server 挂了）时 toolIndex 是空的。
+ * 这时如果只查标记，待审批的外部调用会被当成普通调用——快照里又没有对应结果，
+ * 用户看到的是一个永远卡在"执行中"、也没有确认按钮的步骤，这一轮就死在那里了。
+ * 按前缀兜底宁可多恢复一张确认卡片：用户拒绝/批准都会被服务端安全处理。
+ *
+ * 注意这里不能直接改 needsApproval：拦截 tool-call 时用的是它，
+ * 而 AI SDK 对"有 execute 的工具"也会发 tool-call 事件，前缀兜底会让
+ * 已自动执行的只读工具被误记成待审批，凭空多出一个 interrupt。
+ */
+function isPendingApprovalCall(toolName) {
+  if (!toolName) return false
+  if (needsApproval(toolName)) return true
+  return toolName.startsWith('mcp__') && !getMcpToolInfo(toolName)
+}
+
+/**
  * 执行用户已确认的审批工具。
  * 三道校验都不是多余的：resume 的 interruptId 来自客户端，属于不可信输入。
  */
 async function executeApprovalTool(toolName, input, sessionId, userId, ctx = {}) {
-  if (!APPROVAL_TOOL_NAMES.has(toolName)) return `操作失败：未知的审批工具 ${toolName}` // 白名单：防止伪造中断去调别的工具
+  if (!needsApproval(toolName)) return `操作失败：未知的审批工具 ${toolName}` // 白名单：防止伪造中断去调别的工具
 
   // 审计要在"执行之后"记：只有真正跑完才知道结果（成功还是"本次会话没有这个附件"）。
   // 目标对象按工具取不同字段，失败也必须留痕——失败的删除尝试同样是安全事件。
@@ -586,6 +722,19 @@ async function executeApprovalTool(toolName, input, sessionId, userId, ctx = {})
     target,
     detail: { ok, output: String(output).slice(0, 300) }
   })
+
+  // MCP 外部工具：参数结构由对方的 server 定义，这里不做逐字段校验（也校验不了），
+  // 只把调用交给 mcp-client；它内部已有超时、审计、错误翻译。
+  // 注意 context 要带 ip：审批后执行的调用同样属"用户操作"，审计要能追溯到来源。
+  if (toolName.startsWith('mcp__')) {
+    const info = getMcpToolInfo(toolName)
+    const output = await callMcpTool(toolName, input || {}, {
+      userId,
+      recordAudit: entry => recordAudit({ userId, ip: ctx.ip, ...entry })
+    })
+    audit(info ? `${info.serverName}/${info.toolName}` : toolName, !String(output).startsWith('执行失败'), output)
+    return output
+  }
 
   if (toolName === 'deleteSessionFile') {
     const fileName = String(input?.fileName || '').trim()
@@ -654,6 +803,30 @@ function parseToolArguments(raw) {
   } catch {
     return {}
   }
+}
+
+/**
+ * 从 AG-UI 历史里挖出"图片附件"的 fileId
+ *
+ * 为什么用递归遍历而不是按固定结构取：attachment 内容块的形状随协议版本变过
+ * （TDesign 的 data 数组 / AG-UI 的 parts / metadata 嵌套），写死路径会在
+ * 任何一处改动后静默失效——而失效表现是"图片突然看不见了"，很难联想到历史解析。
+ * 这里只认语义标记（kind === 'image' + fileId 字符串），结构变了也照样找得到。
+ */
+function collectImageFileIds(messages) {
+  const ids = new Set()
+  const walk = (node, depth) => {
+    if (!node || depth > 8) return // 深度上限：防止异常输入导致栈过深
+    if (Array.isArray(node)) {
+      for (const item of node) walk(item, depth + 1)
+      return
+    }
+    if (typeof node !== 'object') return
+    if (node.kind === 'image' && typeof node.fileId === 'string') ids.add(node.fileId)
+    for (const value of Object.values(node)) walk(value, depth + 1)
+  }
+  walk(messages, 0)
+  return [...ids]
 }
 
 /**
@@ -727,17 +900,51 @@ function toolOutputText(output) {
   }
 }
 
-app.post('/agui', async (req, res) => {
+app.post('/agui', aguiRateLimit, async (req, res) => {
   const input = req.body || {}
   const aguiMessages = Array.isArray(input.messages) ? input.messages : null
   if (!aguiMessages || !aguiMessages.length) {
     return res.status(400).json({ error: '缺少 messages' })
   }
 
+  // ===== 每日配额检查（P0）：run 开始前拦截，超限明确拒绝而不是流中途掐断 =====
+  // 放在 400 校验之后：参数错误的请求不该消耗配额判断（也不算"今天用了"）
+  const quota = checkQuota(req.user.userId)
+  if (!quota.allowed) {
+    console.warn('[quota] /agui 拒绝：今日配额已用尽 userId=%s used=%d limit=%d', req.user.userId, quota.used, quota.limit)
+    recordAudit({
+      userId: req.user.userId, actor: req.user.username, action: 'quota.exceeded',
+      target: '/agui', detail: { used: quota.used, limit: quota.limit }
+    })
+    return res.status(429).json({
+      error: `今日 Token 配额已用尽（已用 ${quota.used} / 上限 ${quota.limit}），明日 0 点自动恢复；如需调整请联系管理员`,
+      quota: { usedToday: quota.used, dailyLimit: quota.limit }
+    })
+  }
+
   const threadId = input.threadId || randomUUID()
   const runId = input.runId || randomUUID()
   // 前端可以把 sessionId 放在 forwardedProps 里，用于会话附件检索
   const sessionId = input.forwardedProps?.sessionId || input.state?.sessionId || threadId
+  // ===== 模型选择（P1：用户可切换模型 + 深度思考开关）=====
+  // 取值的优先级：顶层字段 > forwardedProps（AG-UI 通用扩展位）。两种都支持是因为
+  // AG-UI 没有"模型"这个标准字段，放顶层是我们自己的约定，放 forwardedProps 更贴近协议习惯。
+  const rawModel = typeof input.model === 'string'
+    ? input.model
+    : (typeof input.forwardedProps?.model === 'string' ? input.forwardedProps.model : '')
+  const rawThinking = typeof input.thinking === 'boolean' ? input.thinking : input.forwardedProps?.thinking
+  // 显式传了注册表之外的模型名 → 直接 400。这是自家前端，拼错要立刻暴露：
+  // 静默回落会让人以为"切了模型"，实际一直在用默认模型，是最难查的一类问题。
+  // 对比 /v1：那边是对外兼容端点，客户端传 gpt-4 也得能跑，所以选择静默回落。
+  if (rawModel && !isKnownModel(rawModel)) {
+    return res.status(400).json({
+      error: `未知模型：${rawModel}`,
+      available: listModels().map(m => m.id)
+    })
+  }
+  const requestedModel = rawModel || undefined // 空字符串按"没指定"处理
+  // 只有布尔值才算有效开关：前端传 "false" 字符串时不要瞎猜，交给默认逻辑
+  const thinking = typeof rawThinking === 'boolean' ? rawThinking : undefined
   // requireAuth 已在中间件层保证 req.user 存在，这里非空断言是给读代码的人看的
   const userId = req.user.userId
   // 会话附件必须归属当前用户：B 用户不能借 A 的 sessionId 读 A 的附件
@@ -877,12 +1084,15 @@ app.post('/agui', async (req, res) => {
         output = await executeApprovalTool(call.name, call.input, sessionId, userId, { ip: req.ip })
       } else {
         // 拒绝也要留痕：审计要能回答"用户看过并拒绝了哪次删除"
+        // MCP 工具没有 fileName/candidateId 这类字段，就用工具名当 target、参数进 detail，
+        // 否则外部工具的拒绝记录会变成一条查不到对象的空审计。
+        const isMcp = call.name.startsWith('mcp__')
         recordAudit({
           userId,
           ip: req.ip,
           action: `tool.${call.name}.rejected`,
-          target: String(call.input?.fileName || call.input?.candidateId || ''),
-          detail: { approved: false }
+          target: String(call.input?.fileName || call.input?.candidateId || (isMcp ? call.name : '')),
+          detail: { approved: false, ...(isMcp ? { args: call.input } : {}) }
         })
         output = '用户拒绝了该操作，未执行'
       }
@@ -896,17 +1106,34 @@ app.post('/agui', async (req, res) => {
     const serverTools = createTools(sessionId, userId)
     const approvalTools = createApprovalTools()
     const frontendTools = createFrontendTools(input.tools, { ...serverTools, ...approvalTools })
-    const tools = { ...serverTools, ...approvalTools, ...frontendTools }
+    // MCP 工具（外部 server 暴露的）：等初始化完成再取，避免首个请求拿到空集合。
+    // 初始化自身不抛错，所以这里不需要 try/catch——没配 MCP 时返回空对象，行为与之前完全一致。
+    await initMcp()
+    const mcpTools = getMcpTools({
+      userId,
+      threadId,
+      recordAudit: audit => recordAudit({ userId, ip: req.ip, ...audit })
+    })
+    const tools = { ...serverTools, ...approvalTools, ...frontendTools, ...mcpTools }
+    const mcpToolNames = Object.keys(mcpTools)
+    if (mcpToolNames.length) console.log('[agui] MCP 工具：%s', mcpToolNames.join(', '))
     const frontendToolNames = Object.keys(frontendTools)
     if (frontendToolNames.length) console.log('[agui] 前端工具：%s', frontendToolNames.join(', '))
     // AG-UI 结构化历史还原成 AI SDK 消息，再交给 chat-core 统一处理
     const chatMessages = aguiToChatMessages(aguiMessages)
+    // 会话图片回填：内存会话重启即空，但历史消息里带着 fileId。
+    // 缺了这一步，刷新/重启后追问"这张图里是什么"时视觉模型收不到图。
+    // 按 sessionId 回填（会话归属已在附件上传时 claim 过），不信任客户端传的 userId。
+    const restoredImages = hydrateSessionImages(sessionId, collectImageFileIds(aguiMessages))
+    if (restoredImages) console.log('[agui] 已从图片仓库回填 %d 张图片到会话 %s', restoredImages, sessionId)
     // 裁剪上下文 + 注入附件清单 + 挂载图片 + 选模型
     // 同一个对象赋给 chatStream：finally 里要拿它 await usage 记账
     const { result, meta } = chatStream = prepareChatStream({
       messages: chatMessages,
       sessionId,
       userId, // 注入跨会话长期记忆（system 层），remember/forget 工具写入也靠它归属
+      model: requestedModel, // 用户选的模型（未传则由 thinking 决定）
+      thinking, // 深度思考开关
       tools,
       abortSignal: abortController.signal, // 客户端断开时中止模型流
       logTag: 'agui'
@@ -937,6 +1164,11 @@ app.post('/agui', async (req, res) => {
         name: 'trim_notice',
         value: { content: '对话过长，已精简早期上下文', droppedMessages: droppedCount, maxTokenLimit: MAX_CONTEXT_TOKENS }
       })
+    }
+    // 模型被自动切换时如实告知（目前唯一场景：用户选了纯文本模型却上传了图片）。
+    // 不告诉用户的话，他会以为回答质量变化是模型问题，实际是"你选的模型看不见图"。
+    if (meta.modelNotice) {
+      send({ type: 'CUSTOM', name: 'model_notice', value: { content: meta.modelNotice, modelId: meta.modelId } })
     }
 
     for await (const part of result.fullStream) {
@@ -989,7 +1221,7 @@ app.post('/agui', async (req, res) => {
         }
         // 审批类工具没有 execute，本轮不会产生 tool-result，先记下来留到收尾转成 interrupt
         // 连 toolName 一起记：收尾时既要用它生成确认文案，也要写进 metadata 供前端区分卡片类型
-        if (APPROVAL_TOOL_NAMES.has(part.toolName)) {
+        if (needsApproval(part.toolName)) {
           pendingApprovals.push({ toolCallId: part.toolCallId, toolName: part.toolName, input: part.input })
         }
         send({
@@ -1318,7 +1550,9 @@ app.post('/api/upload-doc', upload.single('file'), async (req, res) => {
       return res.status(400).json({ error: '未能从文件中解析出文本' })
     }
 
-    const biz = { docType, jobId, candidateId, userId: req.user.userId }
+    // P2：给这份文档一个稳定唯一 id（同一文件所有 chunk 共用），删除向量片段时按它精确匹配，
+    // 不再依赖「文件名全局唯一」这个假设。randomUUID 已在文件顶部引入。
+    const biz = { docType, jobId, candidateId, userId: req.user.userId, fileId: randomUUID() }
     // 同名不同候选人时改名，避免 deleteDocument 把别人的简历删掉
     const fileName = await resolveDocName(uploadName, biz)
     const renamed = fileName !== uploadName
@@ -1379,20 +1613,24 @@ app.get('/api/documents', async (req, res) => {
 // 删到 0 说明文件不存在或不属于你——不能把"别人有这个文件"泄露成删除成功
 app.post('/api/documents/delete', async (req, res) => {
   try {
-    const { fileName } = req.body
-    if (!fileName) return res.status(400).json({ error: '缺少fileName' })
-    const removed = await deleteDocument(fileName, req.user.userId)
+    // P2：前端从 /api/documents 拿到 fileId 后原样回传；老前端/老文档仍按 fileName 删
+    const { fileName, fileId } = req.body || {}
+    const key = fileId || fileName
+    if (!key) return res.status(400).json({ error: '缺少 fileId 或 fileName' })
+    const removed = fileId
+      ? await deleteDocumentByFileId(fileId, req.user.userId)
+      : await deleteDocument(fileName, req.user.userId)
     // 删除失败（别人的文件 / 不存在）同样记一条：越权尝试是最该留痕的动作
     recordAudit({
       userId: req.user.userId,
       actor: req.user.username,
       ip: req.ip,
       action: 'doc.delete',
-      target: String(fileName),
-      detail: { ok: removed > 0, removedChunks: removed }
+      target: String(key),
+      detail: { ok: removed > 0, removedChunks: removed, by: fileId ? 'fileId' : 'fileName' }
     })
     if (!removed) return res.status(404).json({ error: '文档不存在或无权删除' })
-    res.json({ ok: true, fileName, removed })
+    res.json({ ok: true, ...(fileId ? { fileId } : { fileName }), removed })
   } catch (err) {
     console.error('删除文档失败', err)
     res.status(500).json({ error: err.message })
@@ -1514,14 +1752,40 @@ function openAiToChatMessages(list) {
   return { messages: out, systemText: systemParts.join('\n\n') }
 }
 
-app.post('/v1/chat/completions', requireAuth, async (req, res) => {
+app.post('/v1/chat/completions', requireAuth, compatRateLimit, async (req, res) => {
   // ===== 1. 请求解析与校验：尽早失败、失败就说清原因 =====
   const { messages, systemText } = openAiToChatMessages(req.body?.messages)
   if (!messages.length) {
     return res.status(400).json({ error: { message: 'messages 不能为空', type: 'invalid_request_error' } })
   }
-  // OpenAI 客户端会传 model 字段，我们固定用服务端配置的模型：忽略它而不是报错，
-  // 这样客户端代码零改动也能跑（报错反而破坏"兼容"的初衷）。meta 里回真实模型名。
+  // ===== 每日配额检查（P0）：OpenAI 兼容端点同样受配额约束 =====
+  // 错误格式用 OpenAI 风格（type: quota_exceeded），客户端 SDK 能直接解析出 error.message
+  const quota = checkQuota(req.user.userId)
+  if (!quota.allowed) {
+    console.warn('[quota] /v1 拒绝：今日配额已用尽 userId=%s used=%d limit=%d', req.user.userId, quota.used, quota.limit)
+    recordAudit({
+      userId: req.user.userId, actor: req.user.username, action: 'quota.exceeded',
+      target: '/v1/chat/completions', detail: { used: quota.used, limit: quota.limit }
+    })
+    return res.status(429).json({
+      error: {
+        message: `今日 Token 配额已用尽（已用 ${quota.used} / 上限 ${quota.limit}）`,
+        type: 'quota_exceeded',
+        code: 'daily_token_quota_exceeded'
+      }
+    })
+  }
+  // model 字段：OpenAI 客户端必传，但传的多半是 gpt-4o 这种我们并没有的名字。
+  // 策略是"认识就用、不认识就回落默认"，绝不报错——报错会直接破坏兼容端点的初衷
+  // （客户端改个 base_url 就跑不起来）。响应里的 model 始终回真实模型名，便于排查。
+  const requestedModel = isKnownModel(req.body?.model) ? req.body.model : undefined
+  // 深度思考：OpenAI 协议没有对应字段，支持两种扩展写法，都取不到就用服务端默认：
+  //   x_thinking: true/false          —— 本项目自己的约定，最明确
+  //   reasoning_effort: 'none'|'minimal' → 关；low/medium/high → 开（对齐 OpenAI 的语义习惯）
+  const effort = typeof req.body?.reasoning_effort === 'string' ? req.body.reasoning_effort.toLowerCase() : ''
+  const thinking = typeof req.body?.x_thinking === 'boolean'
+    ? req.body.x_thinking
+    : (effort ? !['none', 'minimal'].includes(effort) : undefined)
   const stream = req.body?.stream === true
   // 会话 id：OpenAI 协议没有这个概念，这里从扩展字段拿（curl 传 "x-session-id"）。
   // 不传也能跑——附件/工具里用到会话的功能降级为不可用，纯问答完全正常。
@@ -1534,6 +1798,17 @@ app.post('/v1/chat/completions', requireAuth, async (req, res) => {
   // 刻意不含审批工具（createApprovalTools）：审批交互依赖 AG-UI 的 interrupt/前端确认卡片，
   // OpenAI 客户端没有这套 UI，模型一旦触发就会挂起。写操作走 /agui，兼容端点保持"能查询、不写库"。
   const tools = createTools(sessionId, userId)
+  // MCP 工具同样挂到兼容端点：外部客户端（OpenAI SDK）也能用上项目接的工具，
+  // 这也是"兼容端点不是阉割版"的体现。初始化失败不影响本端点。
+  // skipApproval：需审批的 MCP 工具在这里不挂——OpenAI 客户端没有 interrupt 协议，
+  // 模型发出一个没人执行的调用后会直接停住，用户看到的就是"回答到一半没了"。
+  await initMcp()
+  Object.assign(tools, getMcpTools({
+    userId,
+    threadId: runId,
+    recordAudit: audit => recordAudit({ userId, ip: req.ip, ...audit }),
+    skipApproval: true
+  }))
   const abortController = new AbortController()
   // 客户端中途断开要立刻停模型调用：否则 token 一直在烧，钱一直花。
   // 坑：不能挂 req.on('close')——Node 16+ 的 IncomingMessage 'close' 在请求体读完
@@ -1549,6 +1824,8 @@ app.post('/v1/chat/completions', requireAuth, async (req, res) => {
       systemPrompt: systemText || undefined, // OpenAI 的 system 消息 → AI SDK 的 instructions
       sessionId,
       userId, // API Key 绑定了 userId：记忆注入与 remember 工具同样生效
+      model: requestedModel, // 认识的 model 才用，不认识的已在上方被丢弃
+      thinking, // x_thinking / reasoning_effort 推导出的开关
       tools,
       abortSignal: abortController.signal,
       logTag: 'openai'
@@ -1690,13 +1967,38 @@ app.get('/api/audit', (req, res) => {
     res.status(500).json({ error: err.message })
   }
 })
-// 模型用量：只返回自己的。明细 + 汇总一次给齐，前端用量页签直接渲染
+// 可选模型列表：前端下拉的唯一数据源。
+// 由服务端下发而不是前端硬编码，是为了"加/换模型只改 .env + models.js，前端零改动"；
+// 顺带让前端拿到 reasoning / vision 两个能力位，自己做"深度思考"开关与图片联动。
+app.get('/api/models', (req, res) => {
+  try {
+    res.json({ ok: true, default: DEFAULT_MODEL, data: listModels() })
+  } catch (err) {
+    console.error('读取模型列表失败', err)
+    res.status(500).json({ error: err.message })
+  }
+})
+
+// MCP 连接状态：运维/排查用。返回工具清单但不返回 command/args/headers——
+// 那些字段里常带 token，接口是给"任何登录用户"看的，不能顺带泄漏密钥
+app.get('/api/mcp', async (req, res) => {
+  try {
+    await initMcp()
+    res.json({ ok: true, data: listMcpServers() })
+  } catch (err) {
+    console.error('读取 MCP 状态失败', err)
+    res.status(500).json({ error: err.message })
+  }
+})
+
+// 模型用量：只返回自己的。明细 + 汇总 + 配额进度一次给齐，前端用量页签直接渲染
 app.get('/api/usage', (req, res) => {
   try {
     res.json({
       ok: true,
       detail: listUsage(req.user.userId, req.query.limit),
-      summary: sumUsage(req.user.userId)
+      summary: sumUsage(req.user.userId),
+      quota: quotaSummary(req.user.userId) // 今日已用/上限/剩余：前端画进度条用
     })
   } catch (err) {
     console.error('读取用量失败', err)
@@ -1715,7 +2017,8 @@ app.get('/api/admin/users', requireAuth, requireAdmin, (req, res) => {
   try {
     // LEFT JOIN：没用过模型的人也要出现在列表里（内连接会把他们藏掉）
     const rows = db.prepare(`
-      SELECT u.id, u.username, u.role, u.created_at AS createdAt,
+      SELECT u.id, u.username, u.role, u.created_at AS createdAt, u.quota_daily AS quotaDaily,
+             u.disabled AS disabled, -- P2：前端「停用/启用」按钮的状态来源（db.js 第 4 次迁移追加的列）
              COUNT(mu.run_id) AS runs,
              COALESCE(SUM(mu.total_tokens), 0) AS totalTokens
       FROM users u
@@ -1727,6 +2030,29 @@ app.get('/api/admin/users', requireAuth, requireAdmin, (req, res) => {
   } catch (err) {
     console.error('读取用户列表失败', err)
     res.status(500).json({ error: err.message })
+  }
+})
+
+// 设置用户每日 Token 配额（P0 配额的管理入口）。
+// body: { quotaDaily: number | null } —— 数字 = 覆盖全局默认；null = 恢复跟全局走。
+// 只许 session：admin 的 API key 管不了配额（key 泄露不能变成"改别人限额"的钥匙）。
+app.patch('/api/admin/users/:id/quota', requireAuth, requireAdmin, (req, res) => {
+  if (req.user.authType !== 'session') return res.status(403).json({ error: '管理操作请用网页登录后进行' })
+  try {
+    const { quotaDaily } = req.body || {}
+    if (quotaDaily !== null && quotaDaily !== undefined && (!Number.isFinite(Number(quotaDaily)) || Number(quotaDaily) < 0)) {
+      return res.status(400).json({ error: 'quotaDaily 必须是非负数字或 null（null = 跟全局默认）' })
+    }
+    const ok = setUserQuota(req.params.id, quotaDaily)
+    if (!ok) return res.status(404).json({ error: '用户不存在' })
+    recordAudit({
+      userId: req.user.userId, actor: req.user.username, action: 'admin.set_quota',
+      target: req.params.id, detail: { quotaDaily: quotaDaily ?? null }
+    })
+    res.json({ ok: true, quotaDaily: quotaDaily ?? null })
+  } catch (err) {
+    console.error('设置配额失败', err)
+    res.status(400).json({ error: err.message })
   }
 })
 
@@ -1833,13 +2159,20 @@ app.post('/api/session-files/upload', uploadSessionFile, async (req, res) => {
 
     // 图片不解析文本、不向量化：读成 base64 存入会话，聊天时拼到 user 消息里
     if (IMAGE_EXTS.includes(ext)) {
+      const buffer = await fs.promises.readFile(req.file.path)
+      const mime = IMAGE_MIME[ext] || 'image/png'
+      // 先生成 id：磁盘、内存会话、前端 URL 三处必须用同一个 id，否则刷新后对不上
+      const fileId = `img-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+      const saved = saveImage({ fileId, userId: req.user.userId, fileName, mime, buffer })
       const file = addSessionImage(sessionId, {
+        fileId,
         fileName,
-        mimeType: IMAGE_MIME[ext] || 'image/png',
-        buffer: await fs.promises.readFile(req.file.path),
-        size: req.file.size
+        mimeType: mime,
+        buffer,
+        size: req.file.size,
+        url: saved.url
       })
-      return res.json({ ok: true, file: { ...file, kind: 'image' } })
+      return res.json({ ok: true, file: { ...file, kind: 'image', url: saved.url } })
     }
 
     const rawText = await extractFileText(req.file.path, ext)
@@ -1891,6 +2224,10 @@ app.get('/api/threads/:threadId/messages', (req, res) => {
 // 清空知识库不走 HTTP：原 /api/vector-clear 没有鉴权，部署到公网后一次 POST 就能清库。
 // 需要重建时用 npm run eval:ingest（会先删同名文档再入库），彻底清空直接删 vector-index/ 目录。
 
+// P1 运维告警：必须在下面这个统一错误出口【之前】。那个出口会 res.json() 终结响应、
+// 不再 next(err)，挂在它之后错误就传不到 noteError，阈值永远攒不起来。
+attachOpsAlert(app)
+
 // 统一错误出口：multer 的 fileFilter / limits 错误是在中间件层 next(err) 抛的，
 // 不经过路由里的 try/catch。没有这个中间件时，传一个 .doc 会拿到 Express 默认的
 // HTML 500 页，前端只能显示「Internal Server Error」——用户根本不知道是格式问题。
@@ -1905,11 +2242,42 @@ app.use((err, req, res, next) => {
   // 文件类型不合法同样属于「用户的请求有问题」，返回 400 而不是 500
   const status = /不支持的文件类型/.test(err.message || '') ? 400 : 500
   if (status === 500) console.error('未捕获的服务端错误：', err)
-  res.status(status).json({ error: err.message || '服务端错误' })
+  // P1：把请求 id 一起回给前端，报错时用户截个图就能定位到服务端那条日志
+  res.status(status).json({ error: err.message || '服务端错误', requestId: getRequestId() })
 })
 
-app.listen(PORT, () => { // 启动 HTTP 服务并监听端口
+const server = app.listen(PORT, () => { // 启动 HTTP 服务并监听端口
+  markReady() // P1：listen 成功后健康检查才返回 200，关停时再置回 503
   log.info(`服务启动 http://localhost:${PORT}`, { port: PORT, node: process.version })
+  // 可选预热：embedding 模型首次加载要下载几百 MB，让第一个用户等太久。
+  // 默认关（省内存），云上设 WARMUP_EMBEDDING=1 才在后台预热，且不阻塞健康检查。
+  if (process.env.WARMUP_EMBEDDING === '1') {
+    require('./rag-vector').getEmbedding('预热')
+      .then(() => log.info('[warmup] embedding 模型已就绪'))
+      .catch(err => log.warn('[warmup] 模型预热失败，将在首次检索时重试', { error: err?.message }))
+  }
   // 备份在 listen 之后再起：先让服务能接请求，再去做可能耗时的 IO
   startAutoBackup()
+  // MCP 初始化放后台：外部 server（npx 拉包/远端 HTTP）可能慢，
+  // 不能让它挡住健康检查；首个聊天请求里也会 await 同一个 promise 兜底。
+  initMcp()
+    .then(() => {
+      const list = listMcpServers()
+      if (list.length) {
+        log.info('[mcp] 初始化完成', { servers: list.map(item => ({ name: item.name, connected: item.connected, tools: item.toolCount })) })
+      }
+    })
+    .catch(err => log.error('[mcp] 初始化失败', { error: err?.message })) // 理论上 initMcp 不 reject，保底
+  // 清理过期聊天图片（默认 30 天，CHAT_IMAGE_TTL_DAYS 可调），只在启动时跑一次：
+  // 本地磁盘型存储不需要定时任务的精度，启动即清更省事
+  try {
+    const removed = pruneImages(Number(process.env.CHAT_IMAGE_TTL_DAYS) || 30)
+    if (removed) log.info('[image] 已清理过期聊天图片', { removed })
+  } catch (err) {
+    log.error('[image] 清理过期图片失败', { error: err?.message })
+  }
 })
+
+// P1 优雅关闭：收到 SIGTERM 后先让健康检查转 503、停止接新连接，
+// 等正在流式回答的 SSE 跑完（最多 20 秒）再关库退出，避免 pm2 restart 掐断用户回答。
+attachGraceful(server)

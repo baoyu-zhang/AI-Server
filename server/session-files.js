@@ -58,25 +58,66 @@ async function addSessionFile(sessionId, { fileName, text, size }) {
 /**
  * 存入一张图片附件：图片不做切块和向量化，原图以 base64 保留，
  * 聊天时直接作为多模态内容发给视觉模型
+ *
+ * fileId 可由调用方指定：上传时先落盘到 image-store（生成 id），再回填到内存会话，
+ * 两边用同一个 id，前端拿到的图片 URL 才能和会话里的图片对上。
  * @param {string} sessionId
- * @param {{ fileName: string, mimeType: string, buffer: Buffer, size: number }} payload
+ * @param {{ fileId?: string, fileName: string, mimeType: string, buffer: Buffer, size: number, url?: string }} payload
  */
-function addSessionImage(sessionId, { fileName, mimeType, buffer, size }) {
+function addSessionImage(sessionId, { fileId, fileName, mimeType, buffer, size, url }) {
   const session = getSession(sessionId)
   if (session.files.size >= MAX_FILES_PER_SESSION) {
     throw new Error(`本次会话附件已达上限（${MAX_FILES_PER_SESSION} 个）`)
   }
   const file = {
-    id: createFileId(),
+    id: fileId || createFileId(),
     fileName,
     size,
     kind: 'image',
     mimeType,
     base64: buffer.toString('base64'),
+    url, // 签名地址：刷新/换设备后前端仍能展示这张图
     createdAt: Date.now()
   }
   session.files.set(file.id, file)
-  return { id: file.id, fileName, size, chunkCount: 0, kind: 'image' }
+  return { id: file.id, fileName, size, chunkCount: 0, kind: 'image', url }
+}
+
+/**
+ * 从图片仓库回填会话内存（服务重启后必备）
+ *
+ * 内存会话一重启就空，但对话快照里 attachment 块仍带着 fileId。
+ * 用户接着追问"这张图里的表格第一行是什么"，如果没有回填，
+ * 视觉模型根本收不到图——表现是模型突然"看不见"之前发的图片。
+ * 只补会话里缺的，不覆盖已有内存副本（磁盘是权威源，但内存里有更省事的 base64）。
+ * @param {string} sessionId
+ * @param {string[]} fileIds
+ * @returns {number} 实际回填数量
+ */
+function hydrateSessionImages(sessionId, fileIds = []) {
+  if (!Array.isArray(fileIds) || !fileIds.length) return 0
+  const { getImage, readImage, urlFor } = require('./image-store') // 延迟 require：避免模块加载顺序互相牵制
+  const session = getSession(sessionId)
+  let restored = 0
+  for (const fileId of fileIds) {
+    if (!fileId || session.files.has(fileId)) continue
+    if (!getImage(fileId)) continue // 没落过盘（旧图/已清理）就跳过
+    if (session.files.size >= MAX_FILES_PER_SESSION) break
+    const raw = readImage(fileId)
+    if (!raw) continue
+    session.files.set(fileId, {
+      id: fileId,
+      fileName: getImage(fileId).file_name,
+      size: raw.buffer.length,
+      kind: 'image',
+      mimeType: raw.mime,
+      base64: raw.buffer.toString('base64'),
+      url: urlFor(fileId),
+      createdAt: Date.now()
+    })
+    restored += 1
+  }
+  return restored
 }
 
 /**
@@ -109,7 +150,7 @@ function getSessionImages(sessionId) {
   session.updatedAt = Date.now()
   return Array.from(session.files.values())
     .filter(file => file.kind === 'image')
-    .map(file => ({ fileName: file.fileName, mimeType: file.mimeType, base64: file.base64 }))
+    .map(file => ({ fileId: file.id, fileName: file.fileName, mimeType: file.mimeType, base64: file.base64, url: file.url }))
 }
 
 /**
@@ -174,6 +215,7 @@ function getSessionFileContext(sessionId, fileId, chunkIndex, windowSize = 1) {
 module.exports = {
   addSessionFile,
   addSessionImage,
+  hydrateSessionImages,
   deleteSessionFile,
   getSessionFiles,
   getSessionImages,

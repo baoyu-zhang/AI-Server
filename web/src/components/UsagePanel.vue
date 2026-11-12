@@ -11,6 +11,23 @@
       </t-button>
     </div>
 
+    <!-- 今日配额：进度条比数字更直观，接近上限时变黄/变红，让人提前知道"今天快用完了" -->
+    <div v-if="quota" class="quota-card" :class="{ 'is-warn': quotaPercent >= 80, 'is-over': quota.exceeded }">
+      <div class="quota-card__head">
+        <span class="quota-card__label">今日 Token 配额</span>
+        <span class="quota-card__num">{{ fmt(quota.usedToday) }} / {{ quota.dailyLimit > 0 ? fmt(quota.dailyLimit) : '不限' }}</span>
+      </div>
+      <t-progress
+        :percentage="Math.min(100, quotaPercent)"
+        :label="false"
+        :stroke-width="8"
+        :color="quota.exceeded ? 'var(--td-error-color)' : quotaPercent >= 80 ? 'var(--td-warning-color)' : 'var(--td-brand-color)'"
+      />
+      <div class="quota-card__foot">
+        {{ quota.exceeded ? '已达上限，明日 0 点恢复；需要更多请联系管理员' : `剩余 ${fmt(Math.max(0, quota.remaining))} token` }}
+      </div>
+    </div>
+
     <div class="usage-summary">
       <div class="usage-summary__item">
         <div class="usage-summary__num">{{ summary.runs }}</div>
@@ -52,7 +69,7 @@
 </template>
 
 <script setup lang="ts">
-import { onMounted, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { MessagePlugin } from 'tdesign-vue-next'
 import { ChartIcon, RefreshIcon } from 'tdesign-icons-vue-next'
 import { authHeaders, clearAuth } from '../api/auth'
@@ -71,6 +88,14 @@ interface ModelRow { model: string; runs: number; inputTokens: number; outputTok
 const detail = ref<UsageRow[]>([])
 const summary = ref({ runs: 0, inputTokens: 0, outputTokens: 0 })
 const byModel = ref<ModelRow[]>([])
+// 今日配额：后端 quotaSummary 直接给好 usedToday/dailyLimit/remaining/exceeded，
+// 前端只负责画，不在前端重算（口径只能有一份）
+const quota = ref<{ usedToday: number; dailyLimit: number; remaining: number; exceeded: boolean } | null>(null)
+const quotaPercent = computed(() => {
+  const q = quota.value
+  if (!q || !q.dailyLimit || q.dailyLimit <= 0) return 0 // dailyLimit=0 表示不限额
+  return Math.round((q.usedToday / q.dailyLimit) * 100)
+})
 const loading = ref(false)
 
 const fmt = (n?: number) => (n || 0).toLocaleString('zh-CN')
@@ -89,6 +114,7 @@ async function load() {
     detail.value = data.detail || []
     summary.value = data.summary?.totals || { runs: 0, inputTokens: 0, outputTokens: 0 }
     byModel.value = data.summary?.byModel || []
+    quota.value = data.quota || null
   } catch (err) {
     MessagePlugin.error((err as Error).message)
   } finally {
@@ -131,6 +157,51 @@ defineExpose({ load })
 }
 
 /* 三个总览数字横排：输入/输出/轮次一眼看完 */
+/* 今日配额卡片：进度条 + 剩余量。超限时整卡变红，视觉上比一行文字更容易被注意到 */
+.quota-card {
+  margin-bottom: var(--td-comp-margin-m);
+  padding: var(--td-comp-paddingTB-s) var(--td-comp-paddingLR-s);
+  border-radius: var(--td-radius-medium);
+  background: var(--td-bg-color-container-hover);
+
+  &.is-over {
+    background: var(--td-error-color-1);
+  }
+}
+
+.quota-card__head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  margin-bottom: 6px;
+}
+
+.quota-card__label {
+  font-size: var(--td-font-size-body-small);
+  color: var(--td-text-color-secondary);
+}
+
+.quota-card__num {
+  font-size: var(--td-font-size-body-small);
+  font-weight: 600;
+  color: var(--td-text-color-primary);
+}
+
+.quota-card__foot {
+  margin-top: 4px;
+  font-size: var(--td-font-size-body-small);
+  color: var(--td-text-color-placeholder);
+}
+
+/* 80% 以上提示"快用完了"，用 warning 色，但不要盖掉超限的红色语义 */
+.quota-card.is-warn .quota-card__foot {
+  color: var(--td-warning-color);
+}
+
+.quota-card.is-over .quota-card__foot {
+  color: var(--td-error-color);
+}
+
 .usage-summary {
   display: flex;
   gap: var(--td-comp-margin-xs);

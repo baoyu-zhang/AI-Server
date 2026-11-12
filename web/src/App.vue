@@ -20,16 +20,25 @@
       </t-select>
       <span class="account-badge__name">{{ currentUser?.username }}</span>
       <t-button variant="text" size="small" @click="startNewThread">新会话</t-button>
+      <!-- 删除当前会话：删除不可恢复，先由 t-popconfirm 弹确认再发 DELETE。
+           当前会话还没落库时（threadSelectValue 为空）禁用，避免拿服务端不存在的 id 去删 -->
+      <t-popconfirm content="删除后该会话的历史消息无法恢复，确认删除当前会话？" theme="danger" @confirm="deleteCurrentThread">
+        <t-button variant="text" size="small" theme="danger" :disabled="!threadSelectValue || deletingThread"
+          :loading="deletingThread">
+          删除当前会话
+        </t-button>
+      </t-popconfirm>
       <t-button variant="text" size="small" @click="onLogout">退出</t-button>
     </div>
 
     <!-- 桌面端：文档 / 候选人侧栏常驻左侧 -->
-    <SidePanel v-if="!isNarrow" class="app-shell__aside" @ask="onSend" />
+    <!-- logout 由账号面板冒泡到 SidePanel 再转到这里，复用完整的登出清理逻辑 -->
+    <SidePanel v-if="!isNarrow" class="app-shell__aside" @ask="onSend" @logout="onLogout" />
 
     <!-- 窄屏：侧栏收进左侧抽屉 -->
     <t-drawer v-else v-model:visible="docDrawerVisible" placement="left" size="280px" :header="false"
       :footer="false" class="doc-drawer">
-      <SidePanel class="app-shell__drawer-panel" @ask="onSend" />
+      <SidePanel class="app-shell__drawer-panel" @ask="onSend" @logout="onLogout" />
     </t-drawer>
 
     <!-- 整个聊天面板容器 -->
@@ -102,7 +111,7 @@
           <!-- 用户消息附带的图片：按气泡样式展示缩略图 -->
           <div v-if="msg.role === 'user' && imageFiles(msg.files).length" class="msg-images">
             <img v-for="file in imageFiles(msg.files)" :key="file.fileId" class="msg-image" :src="file.previewUrl"
-              :alt="file.fileName" :title="file.fileName" />
+              :alt="file.fileName" :title="file.fileName" @click="openImage(file)" />
           </div>
           <!-- 用户消息附带的文档卡片：图片已在上方展示，这里只渲染文档 -->
           <div v-if="msg.role === 'user' && docFiles(msg.files).length" class="msg-files">
@@ -116,6 +125,17 @@
           </div>
           <!-- 回答正文：t-chat-content 接收单个 markdown 对象，自动渲染 markdown -->
           <t-chat-content :content="getMarkdownContent(msg)" :role="msg.role" />
+          <!-- SSE 断线提示条：只在「非主动中断」的网络断开消息上出现。
+               为什么不自动重发见 markDisconnected() 的注释——只给一个显式「重发」入口，
+               点击后复用已有的 onRetry -> resendRun 重放逻辑，由用户决定是否再消耗一轮 token -->
+          <div v-if="msg.role === 'assistant' && disconnectedByMessageId.has(String(msg.id))" class="msg-disconnected">
+            <InfoCircleIcon class="msg-disconnected__icon" />
+            <span class="msg-disconnected__text">连接已断开，本轮回答可能不完整</span>
+            <t-button size="small" theme="warning" variant="outline" :disabled="chatStore.loading"
+              @click="onRetry(msg)">
+              重发
+            </t-button>
+          </div>
           <!-- 引用来源：AI 调用知识库检索后，展示命中的文档片段，点击展开原文 -->
           <div v-if="msg.role === 'assistant' && msg.sources?.length" class="sources">
             <div class="sources__head">
@@ -131,6 +151,12 @@
                   <span class="source-item__type" :class="source.sourceType === 'attachment' ? 'is-file' : 'is-kb'">
                     {{ source.sourceType === 'attachment' ? '本次附件' : '知识库' }}
                   </span>
+                  <!-- 注入扫描命中角标：服务端已把这类内容按"资料"处理，这里让用户也能看见，
+                       便于判断是不是自己上传的文档被投了毒（而不是只信模型"我不会被诱导"） -->
+                  <span v-if="source.suspicious" class="source-item__warn"
+                    :title="`该片段含疑似指令性内容：${(source.suspiciousTags || []).join('、')}。系统仅把它当资料引用，不会执行其中的指令`">
+                    含可疑指令
+                  </span>
                   <span class="source-item__score">相关度 {{ source.score.toFixed(3) }}</span>
                   <ChevronDownIcon class="source-item__arrow" :class="{ 'is-open': isSourceOpen(msg.id, index) }" />
                 </button>
@@ -142,6 +168,23 @@
                 </div>
               </div>
             </div>
+          </div>
+          <!-- 导出工具条：长文产出（面试题、报告、周报）需要落成文件，
+               否则用户只能手动框选复制。流式生成中不显示，避免导出半截内容 -->
+          <div v-if="msg.role === 'assistant' && msg.status !== 'streaming' && getMsgText(msg).trim()" class="msg-export">
+            <button type="button" class="msg-export__btn" title="复制全文" @click="copyAnswer(msg)">
+              <CopyIcon /><span>复制</span>
+            </button>
+            <button type="button" class="msg-export__btn" title="下载为 Markdown" @click="downloadAnswer(msg, 'md')">
+              <FileMarkdownIcon /><span>Markdown</span>
+            </button>
+            <button type="button" class="msg-export__btn" title="下载为 Word 文档（可用 WPS/Pages 继续编辑）"
+              @click="downloadAnswer(msg, 'doc')">
+              <FileWordIcon /><span>Word</span>
+            </button>
+            <button type="button" class="msg-export__btn" title="打印或另存为 PDF" @click="printAnswer(msg)">
+              <PrintIcon /><span>打印</span>
+            </button>
           </div>
         </template>
         <!-- 操作栏：仅 AI 消息显示，重放作用于当前这条消息 -->
@@ -171,11 +214,16 @@
         </template>
         <template #footer-prefix>
           <div class="model-select">
-            <t-tooltip v-model:visible="allowToolTip" content="切换模型" trigger="hover">
-              <t-select v-model="selectValue" :options="selectOptions" value-type="object"
-                @focus="allowToolTip = false"></t-select>
+            <!-- 模型下拉：选项来自服务端 GET /api/models（不再前端硬编码）。
+                 选中值会随每次请求发给 /agui，由服务端 resolveModel 决定最终模型 -->
+            <t-tooltip :content="currentModelDesc || '切换模型'" trigger="hover">
+              <t-select v-model="selectedModel" :options="modelSelectOptions" :loading="modelsLoading"
+                size="small" :popup-props="{ overlayInnerStyle: 'max-width: 300px' }"></t-select>
             </t-tooltip>
-            <t-button class="check-box" :class="{ 'is-active': isChecked }" variant="outline" @click="checkClick">
+            <!-- 深度思考开关：不是一个独立参数，而是"切到思考模型"的快捷方式。
+                 两个控件共用 selectedModel，所以永远不会出现"选了快速模型却开着深度思考"的矛盾 -->
+            <t-button class="check-box" :class="{ 'is-active': thinkingOn }" variant="outline"
+              :disabled="!modelsLoading && !modelOptions.some(m => m.reasoning)" @click="toggleThinking">
               <SystemSumIcon />
               <span>深度思考</span>
             </t-button>
@@ -229,11 +277,13 @@ import { isLoggedIn, currentUser, authHeaders, logout as apiLogout, setUnauthori
 import type { TdAttachmentItem } from '@tdesign-vue-next/chat/es/index'
 import { useChat } from '@tdesign-vue-next/chat/es/chat-engine'
 import { MessagePlugin } from 'tdesign-vue-next'
-import { SystemSumIcon, InfoCircleIcon, MenuIcon, BookmarkIcon, ChevronDownIcon, FileIcon } from 'tdesign-icons-vue-next';
+import { SystemSumIcon, InfoCircleIcon, MenuIcon, BookmarkIcon, ChevronDownIcon, FileIcon, CopyIcon, FileMarkdownIcon, FileWordIcon, PrintIcon } from 'tdesign-icons-vue-next';
 // 引入消息类型定义
 import type { ChatMessage, ChatFile, ToolStep, RagSource } from './store/chat'
 // AG-UI 共享状态维护（STATE_SNAPSHOT 替换 / STATE_DELTA 增量合并）
 import { applyStateDelta, applyStateSnapshot, cloneAgentState } from './agui/agentState'
+// 回答导出：Markdown → HTML（下载 .md/.doc 与打印共用同一套版式）
+import { buildHtmlDocument, downloadBlob, printHtml, suggestTitle } from './utils/export-markdown'
 
 // 发送区附件项：在 TDesign 附件项基础上补充后端文件 id 与原始 File（失败重试需要）
 type SenderFile = TdAttachmentItem & {
@@ -257,6 +307,8 @@ setUnauthorizedHandler(() => {
   MessagePlugin.warning('登录已失效，请重新登录')
 })
 function onAuthenticated() {
+  // 模型列表不在这里拉：下面的 watch(authed) 已经覆盖了"登录成功"和"带 token 刷新页面"两种情况，
+  // 在这里再拉一次会重复请求
   authed.value = true
 }
 async function onLogout() {
@@ -293,26 +345,54 @@ const chatStore = useChatStore()
 const chatListRef = ref<{ scrollToBottom: () => void } | null>(null)
 // 输入框内容（与 t-chat-sender 双向绑定）
 const inputText = ref('')
-const allowToolTip = ref(false)
-const isChecked = ref(false)
-const selectOptions = [
-  {
-    label: '默认模型',
-    value: 'default',
-  },
-  {
-    label: 'Deepseek',
-    value: 'deepseek-r1',
-  },
-  {
-    label: '混元',
-    value: 'hunyuan',
-  },
-];
-const selectValue = ref({
-  label: '默认模型',
-  value: 'default',
-});
+// ===== 模型选择（P1）=====
+// 选项由服务端 GET /api/models 下发：加模型/换模型名只改后端 .env + models.js，前端零改动。
+// 每项形如 { id, label, description, reasoning, vision }
+type ModelOption = { id: string; label: string; description: string; reasoning: boolean; vision: boolean }
+const modelOptions = ref<ModelOption[]>([])
+const modelsLoading = ref(false)
+// 空字符串表示"还没拿到服务端列表"，拿到后会被填成默认模型。
+// 持久化到 localStorage：刷新页面后不用每次重新选（属于用户偏好，不该跟着会话走）
+const MODEL_STORAGE_KEY = 'chat.selectedModel'
+const selectedModel = ref<string>(localStorage.getItem(MODEL_STORAGE_KEY) || '')
+// t-select 的 options：只要 value/label 两个字段，description 放到 tooltip 里展示
+const modelSelectOptions = computed(() => modelOptions.value.map(m => ({ value: m.id, label: m.label })))
+// 当前选中模型的说明（用于 tooltip：讲清"什么时候该用它"）
+const currentModelDesc = computed(() => modelOptions.value.find(m => m.id === selectedModel.value)?.description || '')
+// "深度思考"是否点亮：完全由所选模型的能力位决定，避免开关与下拉各说各话
+const thinkingOn = computed(() => modelOptions.value.find(m => m.id === selectedModel.value)?.reasoning === true)
+
+/** 拉取可选模型。失败不阻塞聊天：下拉为空时仍可发消息（服务端会用默认模型） */
+async function loadModels() {
+  modelsLoading.value = true
+  try {
+    const data = await fetchJson<{ default: string; data: ModelOption[] }>('/api/models')
+    modelOptions.value = Array.isArray(data?.data) ? data.data : []
+    // 本地存的值可能已经下线（比如模型改名），此时回落到服务端默认
+    if (!modelOptions.value.some(m => m.id === selectedModel.value)) {
+      selectedModel.value = data?.default || modelOptions.value[0]?.id || ''
+    }
+  } catch (err: any) {
+    console.warn('[models] 模型列表加载失败，将使用服务端默认模型', err?.message)
+  } finally {
+    modelsLoading.value = false
+  }
+}
+
+/** 深度思考开关：在"思考模型"与"快速模型"之间切换（没有一个叫 thinking 的请求参数） */
+function toggleThinking() {
+  const candidates = modelsLoading.value ? [] : modelOptions.value
+  const target = thinkingOn.value
+    ? candidates.find(m => !m.reasoning && !m.vision) // 关：优先非视觉的快速模型
+    : candidates.find(m => m.reasoning) // 开：思考模型
+  if (target) selectedModel.value = target.id
+  else MessagePlugin.warning('当前没有可切换的模型，请检查服务端配置')
+}
+
+// 选择变化就落盘：直接 watch 而不是在每个交互处写，避免遗漏（下拉/toggle/自动回落都能覆盖）
+watch(selectedModel, (id) => {
+  if (id) localStorage.setItem(MODEL_STORAGE_KEY, id)
+})
 // 用户是否点了"停止生成"：中断在引擎里可能被包装成普通错误，用它兜底判断
 let abortRequested = false
 // 发送区附件列表（上传中/成功/失败三态）
@@ -386,6 +466,9 @@ const noticesByMessageId = reactive(new Map<string, string[]>())
 const collapsedByMessageId = reactive(new Map<string, boolean>())
 const stoppedByMessageId = reactive(new Set<string>())
 const errorByMessageId = reactive(new Map<string, string>())
+// 网络断开（非用户主动中断）的 AI 消息 id：模板据此显示「连接已断开 + 重发」提示条。
+// 与 errorByMessageId 分开存，是为了区分「请求报错」和「报错但值得手动重发」这两种语义
+const disconnectedByMessageId = reactive(new Set<string>())
 const toolOutputById = reactive(new Map<string, string>())
 const toolErrorById = reactive(new Map<string, string>())
 const approvalByToolCallId = reactive(new Map<string, { interruptId: string; message?: string }>())
@@ -529,11 +612,13 @@ function mergeSources(base: RagSource[], extra: RagSource[]): RagSource[] {
 // 用户消息 -> 展示模型
 function userView(message: EngineMessage, index: number): ChatMessage {
   const files = attachmentsOf(message)
+  const text = textOf(message)
   return {
     id: message.id,
     engineIndex: index,
     role: 'user',
-    content: [{ type: 'text', data: textOf(message) }],
+    // 纯图片消息的占位文本（【图片】）不入上下文也不展示，气泡里只留图
+    content: [{ type: 'text', data: text === '【图片】' ? '' : text }],
     files: files.length ? files : undefined,
     status: 'complete',
     name: USER_META.name,
@@ -712,6 +797,7 @@ function clearSidecars() {
   collapsedByMessageId.clear()
   stoppedByMessageId.clear()
   errorByMessageId.clear()
+  disconnectedByMessageId.clear()
   toolOutputById.clear()
   toolErrorById.clear()
   approvalByToolCallId.clear()
@@ -723,6 +809,8 @@ function pruneSidecars(keepIds: Set<string>) {
   for (const key of [...collapsedByMessageId.keys()]) if (!keepIds.has(key)) collapsedByMessageId.delete(key)
   for (const key of [...stoppedByMessageId]) if (!keepIds.has(key)) stoppedByMessageId.delete(key)
   for (const key of [...errorByMessageId.keys()]) if (!keepIds.has(key)) errorByMessageId.delete(key)
+  // 重放会截断掉断线的那条 AI 消息，标记随之清除，避免旧提示条挂在新回答上
+  for (const key of [...disconnectedByMessageId]) if (!keepIds.has(key)) disconnectedByMessageId.delete(key)
 }
 
 // 引擎消息 -> AG-UI 请求体：assistant 带 toolCalls，工具结果单独作为 tool 消息
@@ -733,7 +821,29 @@ function engineMessagesToAgui(suppressToolCallIds?: Set<string>): Message[] {
   for (const message of list) {
     if (message.role === 'user') {
       const text = textOf(message)
-      if (text.trim()) messages.push({ id: message.id, role: 'user', content: text })
+      // 附件随消息一起回传（attachments 是 AG-UI 之外的扩展字段，服务端原样存进快照）：
+      // ① 服务端要靠 fileId 把图片从仓库回填进内存会话，否则重启后视觉模型"看不见"；
+      // ② 刷新历史时靠它重建图片气泡。
+      // 只有图片没有文字的消息也要发：否则这轮"只发了张图"就彻底丢了（原来就被跳过了）。
+      const files = attachmentsOf(message)
+      if (!text.trim() && !files.length) continue
+      messages.push({
+        id: message.id,
+        role: 'user',
+        // 纯图片消息给个占位文本：模型侧不接受空内容的 user 消息
+        content: text.trim() ? text : '【图片】',
+        ...(files.length
+          ? {
+              attachments: files.map(file => ({
+                fileId: file.fileId,
+                fileName: file.fileName,
+                size: file.size,
+                kind: file.kind,
+                previewUrl: file.previewUrl
+              }))
+            }
+          : {})
+      } as Message)
       continue
     }
     if (message.role !== 'assistant') continue
@@ -817,6 +927,62 @@ function handleMsgActionClick({ action, msg }: { action: unknown; msg: ChatMessa
   }
 }
 
+// ========== 回答导出：复制 / 下载 / 打印 ==========
+// 起点是"生成一份面试题"这类长文产出：用户要的是文件，不是让他手动选中复制。
+// 三条路径共用同一份 Markdown → HTML 转换，保证屏幕上看到的和导出的一致。
+function answerMarkdown(msg: ChatMessage): string {
+  return getMsgText(msg)
+}
+
+async function copyAnswer(msg: ChatMessage) {
+  const text = answerMarkdown(msg)
+  if (!text.trim()) return
+  try {
+    await navigator.clipboard.writeText(text)
+    MessagePlugin.success('已复制全文')
+  } catch {
+    // 非 HTTPS 或权限被拒时兜底：用临时 textarea + execCommand
+    const area = document.createElement('textarea')
+    area.value = text
+    area.style.cssText = 'position:fixed;opacity:0;'
+    document.body.appendChild(area)
+    area.select()
+    document.execCommand('copy')
+    document.body.removeChild(area)
+    MessagePlugin.success('已复制全文')
+  }
+}
+
+function downloadAnswer(msg: ChatMessage, format: 'md' | 'doc') {
+  const markdown = answerMarkdown(msg)
+  if (!markdown.trim()) {
+    MessagePlugin.warning('这条回答还没有内容')
+    return
+  }
+  const title = suggestTitle(markdown)
+  const meta = `由 AI 助手生成 · ${new Date().toLocaleString('zh-CN', { hour12: false })}`
+  if (format === 'md') {
+    // BOM 头：Windows 记事本/部分编辑器不加会把中文读成乱码
+    downloadBlob(`${title}.md`, `\ufeff${markdown}`, 'text/markdown;charset=utf-8')
+    MessagePlugin.success('已下载 Markdown')
+    return
+  }
+  // .doc 用 HTML 载体：Word / WPS / Pages 都能直接打开并继续编辑排版，
+  // 比纯文本有用得多，也不用为此在服务端加一个 docx 依赖
+  downloadBlob(`${title}.doc`, buildHtmlDocument(title, markdown, meta), 'application/msword;charset=utf-8')
+  MessagePlugin.success('已下载 Word 文档')
+}
+
+function printAnswer(msg: ChatMessage) {
+  const markdown = answerMarkdown(msg)
+  if (!markdown.trim()) {
+    MessagePlugin.warning('这条回答还没有内容')
+    return
+  }
+  const title = suggestTitle(markdown)
+  printHtml(buildHtmlDocument(title, markdown, `由 AI 助手生成 · ${new Date().toLocaleString('zh-CN', { hour12: false })}`))
+}
+
 // 监听展示模型变化，DOM 更新后自动滚动到底部（流式输出时持续滚动）
 // 注意：必须放在 useChat 之后注册，因为 watch 会立即求值 computed（messages 尚未初始化会触发 TDZ）
 function setupScrollWatcher() {
@@ -841,7 +1007,14 @@ const TOOL_LABELS: Record<string, string> = {
   deleteSessionFile: '删除会话附件'
 }
 function getToolLabel(name: string) {
-  return TOOL_LABELS[name] || name
+  if (TOOL_LABELS[name]) return TOOL_LABELS[name]
+  // MCP 工具名是 mcp__<server>__<tool> 这种机器名，直接显示对用户没意义。
+  // 拆成「外部工具 server/tool」，一眼能看出"这不是本项目的工具，是外接的"。
+  if (name.startsWith('mcp__')) {
+    const [, server, ...rest] = name.split('__')
+    return `外部工具 ${server}/${rest.join('__')}`
+  }
+  return name
 }
 // 判断工具入参是否有内容，避免渲染空行
 function hasToolInput(input: unknown) {
@@ -1052,6 +1225,12 @@ function setupAgentEvents() {
         if (raw.name === 'trim_notice' && value.content && id) {
           const list = noticesByMessageId.get(id) || []
           if (!list.includes(value.content)) noticesByMessageId.set(id, [...list, value.content])
+        } else if (raw.name === 'model_notice' && value.content && id) {
+          // 服务端自动换了模型（如选了纯文本模型却上传了图片）：提示里带上真实模型 id，
+          // 用户下次就知道"该选哪个模型才能读图"
+          const text = value.content + (value.modelId ? `（本轮模型：${value.modelId}）` : '')
+          const list = noticesByMessageId.get(id) || []
+          if (!list.includes(text)) noticesByMessageId.set(id, [...list, text])
         } else if (raw.name === 'tool_error' && value.toolCallId) {
           toolErrorById.set(value.toolCallId, value.message || '工具执行失败')
         }
@@ -1074,23 +1253,34 @@ function setupAgentEvents() {
       abandonActiveTools('用户已停止生成，工具未执行')
       persistViewSnapshotSoon()
     }),
+    // request:error 有两种来源，必须分开处理：
+    // ① 用户点了「停止生成」：onStop() 置 abortRequested=true，abortChat() 断开 SSE 时
+    //    引擎把这个断流包装成 request:error 抛回来，属于预期行为而非故障；
+    // ② 真正的网络断开 / 服务端提前关闭流：需要提示并可手动重发。
     bus.on(EVENT_REQUEST_ERROR, ({ messageId, error }) => {
       const id = currentAiId(messageId)
       chatStore.loading = false
       if (abortRequested) {
+        // 主动中断：按「已停止」标记即可，不弹断线提示、也不提供重发
         if (id) stoppedByMessageId.add(id)
         abandonActiveTools('用户已停止生成，工具未执行')
         persistViewSnapshotSoon()
         return
       }
+      const message = (error as any)?.message || '请求出错'
       if (id) {
-        const message = (error as any)?.message || '请求出错'
-        errorByMessageId.set(id, message)
+        // 网络断开：只做 UI 标记 + warning，绝不自动重试（理由见 markDisconnected 注释），
+        // 由用户点气泡里的「重发」按钮决定要不要重跑这一轮
+        markDisconnected(id, message)
+      } else {
+        // 拿不到消息 id 的极端情况：没有可挂「重发」的气泡，退回全局错误提示
         notifyRunError(message)
       }
       abandonActiveTools('请求出错，工具未执行')
       persistViewSnapshotSoon()
     }),
+    // agui:run:error 保持原样：它多半是服务端业务错误（模型报错、限流等），
+    // 文案不该笼统写成「连接已断开」，上面的 request:error 才是连接层断流的入口
     bus.on(EVENT_RUN_ERROR, ({ error }) => {
       chatStore.loading = false
       if (abortRequested || (error as any)?.code === 'abort' || /abort/i.test((error as any)?.message ?? '')) {
@@ -1206,6 +1396,9 @@ function buildAguiBody(resume?: ResumeEntry[]): Record<string, unknown> {
     messages: engineMessagesToAgui(suppress),  // input.messages，**必填**，缺了直接 400
     tools: frontendToolDefinitions,  // input.tools，前端工具定义
     forwardedProps: { sessionId: sessionId.value }, // input.forwardedProps.sessionId
+    // 用户选的模型：为空串时整个字段被 JSON.stringify 丢掉，服务端按默认模型处理。
+    // 不传 thinking：前端用"选哪个模型"表达思考与否，两个参数同时传反而会打架
+    ...(selectedModel.value ? { model: selectedModel.value } : {}),
     ...(resume?.length ? { resume } : {})  // input.resume 在**顶层**，不是 forwardedProps
   }
 }
@@ -1233,6 +1426,26 @@ function notifyRunError(raw?: unknown) {
   } else {
     MessagePlugin.error(`发送失败：${message}`)
   }
+}
+
+/**
+ * 网络断开（非用户主动中断）的统一收口：在最后一条 AI 消息上标记「可重发」并弹提示。
+ *
+ * 为什么不自动无限重试：
+ * 1) SSE 断流时前端无从得知服务端已经生成到哪、token 账单记了多少，重发是整轮请求重跑，
+ *    工具调用、知识库检索都可能再执行一次，既重复消耗 token 也可能产生副作用；
+ * 2) 网络抖动可能是持续的，自动重试会形成请求风暴，用户完全无法叫停；
+ * 3) 本项目 SSE 由 TDesign chat-engine 托管，没有 EventSource/AbortController 可自建重连，
+ *    唯一可控的重跑入口就是 resendRun()/onRetry()。
+ * 因此只把「重发」做成显式按钮交给用户决定，不偷偷发起任何请求。
+ *
+ * 刷新后该标记不会恢复（ChatMessage 快照里不存这个字段），但每条 AI 消息的
+ * actionbar 一直有「重放」按钮，历史消息仍可手动重发，不会走进死胡同。
+ */
+function markDisconnected(id: string, message: string) {
+  errorByMessageId.set(id, message) // 气泡内保留 ❌ 错误原因，同时让半截回答不进入下一轮上下文
+  disconnectedByMessageId.add(id) // 模板据此显示断线提示条 + 「重发」按钮
+  MessagePlugin.warning('连接已断开，可点击重发继续')
 }
 
 // 每次发起 run 前重置本轮工具状态
@@ -1434,9 +1647,11 @@ function onStop() {
 // 这里负责把快照还原回引擎消息——重登/换设备/清缓存后界面不再空白。
 // 注意运行时口径不变：对话仍以客户端 messages 为准，落库只是恢复用的兜底副本。
 
-// 统一请求：auth.request 已带鉴权与 401 翻登录层，这里只补 JSON 解析与非 2xx 抛错
-async function fetchJson<T = Record<string, any>>(url: string): Promise<T> {
-  const res = (await request(url)) as unknown as Response
+// 统一请求：auth.request 已带鉴权与 401 翻登录层，这里只补 JSON 解析与非 2xx 抛错。
+// options 透传给底层 request：带 body 的 POST（如 /api/documents/context）必须能传进去，
+// 否则会被静默降级成无参数 GET——接口 400，前端还以为是自己写错了 URL
+async function fetchJson<T = Record<string, any>>(url: string, options: RequestInit = {}): Promise<T> {
+  const res = (await request(url, options)) as unknown as Response
   const body = await res.json().catch(() => ({}))
   if (!res.ok) throw new Error(body?.error || `请求失败（${res.status}）`)
   return body as T
@@ -1475,10 +1690,21 @@ function aguiToEngineMessages(list: Array<Record<string, any>>): EngineMessage[]
   const out: EngineMessage[] = []
   for (const item of list) {
     if (item.role === 'user') {
+      const content: EngineContent[] = [{ type: 'text', data: String(item.content ?? '') }]
+      // 快照里带回了这条消息的附件（服务端原样保存）：重建 attachment 内容块，
+      // userView() 才能从 metadata 里取回 fileId / previewUrl，刷新后图片气泡不再消失
+      if (Array.isArray(item.attachments) && item.attachments.length) {
+        content.push({
+          type: 'attachment',
+          data: (item.attachments as ChatFile[])
+            .filter(file => file?.fileId)
+            .map(file => chatFileToAttachment(file))
+        })
+      }
       out.push({
         id: String(item.id),
         role: 'user',
-        content: [{ type: 'text', data: String(item.content ?? '') }],
+        content,
         status: 'complete'
       })
       continue
@@ -1600,15 +1826,18 @@ async function loadThread(id: string) {
 // 只看"引擎里有没有消息"才可靠；id 相等时重复拉取是幂等的一次请求，代价可忽略
 async function initHistory() {
   await refreshThreads()
-  const latest = threadsList.value[0]
-  if (latest && !requestList().length) {
-    await loadThread(latest.id)
+  // 优先恢复"刷新前正在聊的那个会话"，而不是简单地取列表第一个：
+  // 用户可能在翻旧会话，刷新后却被弹到最新一条，会以为"我的对话没了"
+  const current = threadsList.value.find(item => item.id === chatStore.threadId)
+  const target = current || threadsList.value[0]
+  if (target && !requestList().length) {
+    await loadThread(target.id)
   }
 }
 
 watch(authed, value => {
   // immediate 覆盖"带 token 直接刷新页面"的情况：此时 authed 初始就是 true，不会触发变更
-  if (value) void initHistory()
+  if (value) { void initHistory(); void loadModels() }
 }, { immediate: true })
 
 // 会话时间：今天只给时分（下拉里空间有限），更早给月-日
@@ -1650,6 +1879,34 @@ function startNewThread() {
   MessagePlugin.success('已开启新会话')
 }
 
+// ========== 删除当前会话（P2 产品化） ==========
+const deletingThread = ref(false) // 防连点：DELETE 与后续刷新完成前不再响应第二次点击
+
+/**
+ * 删除「当前正在看的」已落库会话。t-popconfirm 已承担确认环节。
+ * 为什么成功后先 startNewThread() 再 refreshThreads()：删掉的 threadId 在服务端已不存在，
+ * 必须轮换到全新会话（顺带清掉引擎里的旧消息与 sidecar），再刷新下拉；
+ * 否则界面会停留在一个指向空记录的 id 上，下一轮消息也就无处落库。
+ */
+async function deleteCurrentThread() {
+  // threadSelectValue 只在「当前 threadId 确实出现在服务端列表里」时有值，
+  // 正好等价于「当前有一个已落库、可删除的会话」；没会话时按钮已禁用，这里再兜一次底
+  const id = threadSelectValue.value
+  if (!id || deletingThread.value) return
+  deletingThread.value = true
+  try {
+    // fetchJson 复用 App 内的统一请求：带 Authorization、401 自动翻登录层、非 2xx 抛 body.error
+    await fetchJson(`/api/threads/${encodeURIComponent(id)}`, { method: 'DELETE' })
+    MessagePlugin.success('会话已删除')
+    startNewThread()
+    await refreshThreads()
+  } catch (err: any) {
+    MessagePlugin.error(err?.message || '删除会话失败')
+  } finally {
+    deletingThread.value = false
+  }
+}
+
 // ========== 附件上传 ==========
 const MAX_ATTACHMENTS = 5 // 单次对话最多 5 个附件
 const MAX_ATTACHMENT_SIZE = 20 * 1024 * 1024 // 单个附件上限 10MB
@@ -1674,9 +1931,14 @@ function formatSize(bytes: number) {
   return `${(bytes / 1024 / 1024).toFixed(1)} MB`
 }
 
-// 已发送消息里的图片：有本地预览地址才能展示缩略图
+// 已发送消息里的图片：有预览地址才能展示缩略图
 function imageFiles(files?: ChatFile[]) {
   return (files || []).filter(file => file.kind === 'image' && file.previewUrl)
+}
+
+// 点缩略图看原图：新标签页打开签名 URL（同源，浏览器直接显示图片本身）
+function openImage(file: ChatFile) {
+  if (file.previewUrl) window.open(file.previewUrl, '_blank', 'noopener')
 }
 
 // 已发送消息里的文档：继续用文件卡片展示
@@ -1726,13 +1988,21 @@ function uploadOne(file: File) {
       payload = null
     }
     if (xhr.status >= 200 && xhr.status < 300 && payload?.ok) {
-      const { id, chunkCount, size, kind } = payload.file
+      const { id, chunkCount, size, kind, url } = payload.file
+      // 图片：上传成功后把临时 blob 地址换成服务端签名地址。
+      // blob 是页面级对象，刷新即失效（这就是"刷新后图片不见了"的根因）；
+      // 服务端地址刷新/换设备都能取回，且能一路存进消息与历史快照。
+      if (kind === 'image' && url) {
+        const local = filesList.value.find(item => item.key === key)?.url
+        if (local?.startsWith('blob:')) URL.revokeObjectURL(local)
+      }
       patchFile(key, {
         status: 'success',
         percent: 100,
         fileId: id,
         chunkCount,
         kind: kind === 'image' ? 'image' : 'doc',
+        ...(kind === 'image' && url ? { url } : {}),
         description: kind === 'image'
           ? `${formatSize(size)} · 图片已就绪`
           : `${formatSize(size)} · 已解析 ${chunkCount} 个片段`
@@ -1824,9 +2094,6 @@ function onPaste(e: ClipboardEvent) {
   e.preventDefault()
   handleFiles(files)
 }
-const checkClick = () => {
-  isChecked.value = !isChecked.value;
-};
 // 挂载后订阅一次；发送前也会再调一次（幂等），卸载时解绑
 onMounted(() => setupAgentEvents())
 onUnmounted(() => teardownAgentEvents())
@@ -1957,6 +2224,30 @@ onUnmounted(() => teardownAgentEvents())
   color: var(--td-warning-color);
 }
 
+/* SSE 断线提示条：与服务端提示横幅同一套配色，多一个「重发」按钮 */
+.msg-disconnected {
+  display: flex;
+  align-items: center;
+  gap: var(--td-comp-margin-s);
+  margin-top: var(--td-comp-margin-s);
+  padding: var(--td-comp-paddingTB-xs) var(--td-comp-paddingLR-s);
+  border: 1px solid var(--td-warning-color-3);
+  border-radius: var(--td-radius-medium);
+  background: var(--td-warning-color-1);
+  color: var(--td-text-color-primary);
+  font-size: var(--td-font-size-body-small);
+}
+
+.msg-disconnected__icon {
+  flex: none;
+  color: var(--td-warning-color);
+}
+
+.msg-disconnected__text {
+  flex: 1;
+  min-width: 0;
+}
+
 /* ===== 用户消息内的附件卡片 ===== */
 /* 用户消息里的图片：缩略图右对齐，圆角与气泡一致 */
 .msg-images {
@@ -1976,6 +2267,44 @@ onUnmounted(() => teardownAgentEvents())
   border-radius: var(--td-radius-large);
   border: 1px solid var(--td-component-stroke);
   background: var(--td-bg-color-container);
+  cursor: zoom-in;
+}
+
+/* 导出工具条：默认低调，悬停整条消息时才明显，避免每轮回答都堆一排按钮 */
+.msg-export {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--td-comp-margin-xs);
+  margin-top: var(--td-comp-margin-s);
+  opacity: 0.55;
+  transition: opacity 0.2s;
+
+  &:hover {
+    opacity: 1;
+  }
+}
+
+.msg-export__btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 10px;
+  font-size: 12px;
+  color: var(--td-text-color-secondary);
+  background: var(--td-bg-color-container);
+  border: 1px solid var(--td-component-stroke);
+  border-radius: var(--td-radius-default);
+  cursor: pointer;
+  transition: all 0.2s;
+
+  &:hover {
+    color: var(--td-brand-color);
+    border-color: var(--td-brand-color);
+  }
+
+  svg {
+    font-size: 14px;
+  }
 }
 
 .msg-files {
@@ -2092,6 +2421,10 @@ onUnmounted(() => teardownAgentEvents())
 .tool-step__approval-text {
   color: var(--td-text-color-primary);
   margin-bottom: var(--td-comp-margin-s);
+  /* MCP 外部工具的确认文案带完整 JSON 参数：保留换行与缩进，否则一长串挤成一行没法读 */
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-variant-numeric: tabular-nums;
 }
 
 .tool-step__approval-actions {
@@ -2233,6 +2566,19 @@ onUnmounted(() => teardownAgentEvents())
   &.is-open {
     transform: rotate(180deg);
   }
+}
+
+/* 疑似注入角标：用 danger 色而不是 warning，因为它的含义是"这份资料可能被投毒"，
+   和"本次附件"那个 warning 色标签不是同一类信息，不能撞色 */
+.source-item__warn {
+  flex: none;
+  padding: 0 6px;
+  border-radius: 4px;
+  font-size: 12px;
+  line-height: 18px;
+  background: var(--td-error-color-1);
+  color: var(--td-error-color);
+  cursor: help;
 }
 
 .source-item__body {

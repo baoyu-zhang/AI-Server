@@ -99,6 +99,7 @@ import { authHeaders, clearAuth } from '../api/auth'
 // 文档条目：后端按 fileName 聚合后的结果，业务标签可能为空（历史语料没有）
 interface DocItem {
   fileName: string
+  fileId?: string // 新版本后端会回传文件 id；旧缓存/老语料可能没有，删文档时要能回落
   chunkCount: number
   createdAt?: number
   docType?: string
@@ -226,14 +227,16 @@ async function onFileChange(e: Event) {
   }
 }
 
-// 删除文档：按文件名移除全部片段
+// 删除文档：优先用 fileId 精确定位（同名文件归不同候选人时不会误删），
+// 老数据没有 fileId 时回落到 fileName，保证只认文件名的旧后端也照常工作
 async function removeDocument(doc: DocItem) {
   deleting.value = doc.fileName
   try {
+    const payload = doc.fileId ? { fileId: doc.fileId } : { fileName: doc.fileName }
     const data = await request<{ removed: number }>('/api/documents/delete', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ fileName: doc.fileName })
+      body: JSON.stringify(payload)
     })
     documents.value = documents.value.filter(item => item.fileName !== doc.fileName)
     MessagePlugin.success(`已删除《${doc.fileName}》，移除 ${data.removed} 个片段`)

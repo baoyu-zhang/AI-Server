@@ -19,12 +19,21 @@
  * 因此独立成表，写入点只有一处（executeApprovalTool），不改就查得到。
  *
  * 路径可用 APP_DB_FILE 覆盖：测试脚本指到 /tmp，不碰正式库。
+ *
+ * ===== 幂等迁移序号（统一走 PRAGMA table_info 探测 + ALTER TABLE） =====
+ *   第 1 次：thread_runs.state      —— 恢复历史会话时一并还原共享状态
+ *   第 2 次：users.role             —— RBAC 管理员
+ *   第 3 次：users.quota_daily      —— 用户级每日 Token 配额
+ *   第 4 次：users.disabled         —— P2「产品化」账号停用开关（见文件末尾）
+ * 每次都只在列不存在时才 ALTER，因此重启任意次都安全、不会重复加列。
  */
 const { DatabaseSync } = require('node:sqlite')
 const path = require('node:path')
 const fs = require('node:fs')
 
-const DB_FILE = process.env.APP_DB_FILE || path.join(__dirname, 'data', 'app.db')
+// 路径统一由 paths.js 决定：本机仍是 server/data，云上则指向挂载卷（见 paths.js 顶部说明）。
+// 仍支持旧的 APP_DB_FILE 覆盖，测试脚本可以指到 /tmp 而不碰正式库。
+const DB_FILE = require('./paths').PATHS.DB_FILE
 fs.mkdirSync(path.dirname(DB_FILE), { recursive: true })
 
 const db = new DatabaseSync(DB_FILE)
@@ -100,6 +109,21 @@ CREATE TABLE IF NOT EXISTS user_memory (
   created_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_memory_user ON user_memory(user_id, created_at);
+
+-- ===== 会话图片（聊天里发的图） =====
+-- 图片本体放磁盘（data/images），这里只存元数据与路径：
+-- ① 消息快照每轮都整份存一遍，图片塞进 JSON 会指数级放大；
+-- ② 图片要能按用户归属做鉴权（签名 URL 由 image-store.js 生成）。
+CREATE TABLE IF NOT EXISTS chat_images (
+  file_id    TEXT PRIMARY KEY,           -- 上传时生成，同时拼进图片访问 URL
+  user_id    TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  file_name  TEXT NOT NULL,
+  mime       TEXT NOT NULL,
+  size       INTEGER NOT NULL,
+  path       TEXT NOT NULL,              -- 磁盘绝对路径
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_chat_images_user ON chat_images(user_id, created_at);
 `)
 
 // ===== 轻量迁移：CREATE TABLE IF NOT EXISTS 对已存在的表不生效，加列只能走 ALTER =====
@@ -123,6 +147,28 @@ CREATE INDEX IF NOT EXISTS idx_memory_user ON user_memory(user_id, created_at);
   if (!userCols.includes('role')) {
     db.exec("ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'user';")
     console.log('[db] users 已迁移：新增 role 列')
+  }
+  // 每日 Token 配额的用户级覆盖（NULL = 跟全局默认走，见 quota.js）。
+  // 为什么不用单独一张表：一个用户最多一条配置，加列比建表少一次 JOIN。
+  if (!userCols.includes('quota_daily')) {
+    db.exec('ALTER TABLE users ADD COLUMN quota_daily INTEGER;')
+    console.log('[db] users 已迁移：新增 quota_daily 列')
+  }
+}
+
+// ===== 第 4 次迁移：users.disabled（P2「产品化」账号停用开关） =====
+// 为什么加这一列：管理员要能停用/启用账号，停用后 requireAuth 必须立刻拦住该用户的
+// 所有凭证（session 与 API Key）。停用状态要持久化在用户行上，不能只放内存——
+// 进程重启、多实例都得一致，且每次鉴权查用户行时顺手就能读到，不用多一次查询。
+// 沿用前 3 次的范式：PRAGMA table_info 探测列是否存在，不存在才 ALTER，重启任意次幂等。
+// INTEGER NOT NULL DEFAULT 0：0 = 正常，1 = 停用。默认值让所有历史账号、
+// 以及 INSERT 时没显式带该列的旧代码（注册、RBAC 引导建管理员）自动落在「正常」，
+// 不会一升级就把整库用户锁死；NOT NULL 也避免下游判断时出现 undefined 的歧义。
+{
+  const userCols = db.prepare("PRAGMA table_info(users)").all().map(c => c.name)
+  if (!userCols.includes('disabled')) {
+    db.exec('ALTER TABLE users ADD COLUMN disabled INTEGER NOT NULL DEFAULT 0;')
+    console.log('[db] users 已迁移：新增 disabled 列（第 4 次迁移）')
   }
 }
 

@@ -19,7 +19,8 @@ const LEGACY_EXTS = ['.doc']
 const IMAGE_EXTS = ['.png', '.jpg', '.jpeg', '.webp', '.gif']
 
 // 确保uploads文件夹存在
-const UPLOAD_DIR = path.join(__dirname, 'uploads') // 上传文件的落盘目录：当前文件所在目录下的 uploads
+// 上传原件落盘目录：统一收进数据卷（云上只挂这一个卷即可保住全部状态）
+const UPLOAD_DIR = require('./paths').PATHS.UPLOAD_DIR
 if (!fs.existsSync(UPLOAD_DIR)) { // 检查 uploads 目录是否已经存在
   fs.mkdirSync(UPLOAD_DIR, { recursive: true }) // 不存在则递归创建，避免父目录缺失时报错
 }

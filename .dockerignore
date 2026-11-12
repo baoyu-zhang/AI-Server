@@ -1,0 +1,27 @@
+# 构建上下文排除清单：这些文件既不该进镜像，也会让构建缓存频繁失效
+# 注意 .env 必须排除——API Key 一旦被打进镜像层，删文件也抹不掉历史层
+**/node_modules
+**/.env
+**/.env.*
+!**/.env.example
+!**/.env.production.example
+!.env.production.example
+
+# 运行时状态：容器里必须是空的，由挂载卷提供
+server/data
+server/uploads
+server/vector-index
+server/logs
+server/data/images
+server/data/backups
+
+# 前端产物由 Dockerfile 第一阶段重新构建，不复制宿主机上的旧 dist
+web/dist
+
+# 其它
+.git
+.gitignore
+output
+**/*.log
+**/.DS_Store
+server/eval/results

@@ -26,3 +26,6 @@ data/
 
 # 每次跑评测都会覆盖的产物，基线文件（baseline*.json）才是要留的
 server/eval/results/latest.json
+
+# 本地生成的备份 / 接线说明 / 复盘中间产物（不进 GitHub）
+output/

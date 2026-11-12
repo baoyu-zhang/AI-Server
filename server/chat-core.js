@@ -14,16 +14,19 @@
  */
 const path = require('path')
 require('dotenv').config({ path: path.join(__dirname, '.env') }) // 单独 require 本模块时（如写单测）也能读到 .env
-const { streamText, stepCountIs } = require('ai') // 流式生成 + 工具步数上限
+const { streamText, stepCountIs, wrapLanguageModel } = require('ai') // 流式生成 + 工具步数上限 + 模型中间件（降级用）
 const { createDeepSeek } = require('@ai-sdk/deepseek') // DeepSeek 模型提供方
 const { getEncoding } = require('js-tiktoken') // BPE 分词器，用于近似统计 token
 const { getSessionFiles, getSessionImages } = require('./session-files') // 会话级临时附件
 const { listMemories } = require('./memory-store') // 跨会话长期记忆（按用户维度）
+const { resolveModel, DEFAULT_MODEL, MODEL_REASONING, MODEL_FAST, MODEL_VISION } = require('./models') // 模型注册表与选模型规则
+const { SAFETY_INSTRUCTIONS } = require('./prompt-guard') // Prompt 注入防护：资料≠指令的常驻边界
+const { createFallbackMiddleware } = require('./model-fallback') // 建流失败时换模型重试一次
 
 // ===== 1. 可调参数：全部支持环境变量覆盖，避免硬编码 =====
 // 单独抽出来的意义：改模型 / 改预算不用碰逻辑代码，出问题也能用环境变量快速回滚。
-const MODEL_REASONING = process.env.MODEL_REASONING || 'deepseek-reasoner' // 纯文本默认模型
-const MODEL_VISION = process.env.MODEL_VISION || 'deepseek-flash' // 带图片时切换的视觉模型
+// 模型 id 的定义搬到了 models.js（前端下拉、用量统计、这里三处共用一份），
+// 本文件只负责"按规则挑一个"——挑的规则也在 models.js 的 resolveModel 里，读那一处即可。
 const MAX_AGENT_STEPS = Number(process.env.MAX_AGENT_STEPS) || 5 // 单轮最多连续工具调用步数
 // 默认 1000 是历史遗留的保守值（≈700 个汉字，只够 2~3 轮对话）。
 // 配合 trimMessages 里"至少保留 10 条"的兜底，实际效果会变成"每次请求只带最后 10 条"，
@@ -304,14 +307,18 @@ function defaultStepLogger(tag) {
  * @param {AbortSignal} [params.abortSignal] 客户端断开时中止模型流
  * @param {Function} [params.onFinish] 生成结束回调（协议层写自己的结束事件）
  * @param {Function} [params.onStepFinish] 覆盖默认的单步日志
+ * @param {string} [params.model] 调用方指定的模型 id（须在 models.js 注册表内）；不传则按 thinking 选默认
+ * @param {boolean} [params.thinking] 深度思考开关：仅在未显式指定 model 时生效（true=reasoner，false=chat）
  * @param {string} [params.logTag] 日志前缀，区分是哪个端点
- * @returns {{result: object, meta: {modelId: string, isTrimmed: boolean, droppedCount: number, imageCount: number, inputCount: number, tokenCount: number}}}
+ * @returns {{result: object, meta: {modelId: string, reasoning: boolean, modelNotice?: string, isTrimmed: boolean, droppedCount: number, imageCount: number, inputCount: number, tokenCount: number}}}
  */
 function prepareChatStream({
   messages,
   systemPrompt,
   sessionId,
   userId,
+  model,
+  thinking,
   tools,
   abortSignal,
   onFinish,
@@ -323,17 +330,36 @@ function prepareChatStream({
   // + 附件清单（本次会话）+ 长期记忆（跨会话，按用户）。
   // filter(Boolean) 去掉空段再 join，避免出现连续空行；都为空时 instructions 为 ''，
   // 调用处 `|| undefined` 会把它转成不传。
+  // 安全边界固定排第一：它约束的是"后面所有资料"，必须比资料先被模型读到。
   const instructions = [
+    SAFETY_INSTRUCTIONS,
     systemPrompt,
     buildMemorySystemPrompt(userId), // 记忆放附件清单前面：身份类信息比"上传了什么"更靠前
     buildAttachmentSystemPrompt(sessionId)
   ].filter(Boolean).join('\n\n')
   const images = getSessionImages(sessionId) // 图片附件（多模态）
   const modelMessages = attachImagesToLastUserMessage(trimmedMessages, images) // 图片挂到最后一条 user 消息
-  const modelId = images.length ? MODEL_VISION : MODEL_REASONING // 有图走视觉模型
+  // 选模型：带图强制视觉模型、显式指定优先、否则由深度思考开关决定（规则细节见 models.js）
+  // 放在 attach 之后，正是因为要依赖 images.length
+  const picked = resolveModel({ requested: model, thinking, hasImages: images.length > 0 })
+  const modelId = picked.modelId
+  // 备用模型：主用快速模型时备份到思考模型（可能是"这类问题快速模型处理不了"），
+  // 其他情况一律备份到最便宜的快速模型。固定两档，不会原地打转。
+  const fallbackId = modelId === MODEL_FAST ? MODEL_REASONING : MODEL_FAST
+  // 用 middleware 包一层：建流阶段失败（模型服务 5xx / 网络断 / 模型名不支持）自动换模型重试。
+  // 之所以不在协议层 catch 重试：流一旦开始发事件，换模型重放会让前端收到两套事件。
+  const modelWithFallback = wrapLanguageModel({
+    model: getDeepSeekClient()(modelId),
+    middleware: createFallbackMiddleware({
+      primaryId: modelId,
+      fallbackId,
+      getModel: id => getDeepSeekClient()(id),
+      onFallback: info => console.warn(`[model] 主模型失败，降级重试：${info.from} → ${info.to}｜原因：${info.error.slice(0, 160)}`)
+    })
+  })
 
   const result = streamText({
-    model: getDeepSeekClient()(modelId),
+    model: modelWithFallback,
     instructions: instructions || undefined,
     messages: modelMessages,
     tools,
@@ -353,6 +379,11 @@ function prepareChatStream({
     // 与裁剪时算的入参口径不完全一致，看日志时别把两个数直接对比。
     meta: {
       modelId,
+      // reasoning 让协议层/前端知道"这轮到底思不思考"：思考模型才会有 reasoning 流，
+      // 前端据此决定要不要预留"思考中"的占位，而不是等第一条 reasoning-delta 出现才反应过来
+      reasoning: picked.reasoning,
+      // 用户选了不支持图片的模型时，这里带着"已自动切换"的原因，由协议层下发成一条提示
+      modelNotice: picked.notice,
       isTrimmed,
       droppedCount,
       imageCount: images.length,
@@ -372,7 +403,9 @@ module.exports = {
   buildAttachmentSystemPrompt,
   buildMemorySystemPrompt,
   MODEL_REASONING,
+  MODEL_FAST,
   MODEL_VISION,
+  DEFAULT_MODEL,
   MAX_AGENT_STEPS,
   MAX_CONTEXT_TOKENS
 }

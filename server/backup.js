@@ -21,8 +21,11 @@ const path = require('node:path')
 const db = require('./db')
 const { log } = require('./logger')
 
-const DB_FILE = process.env.APP_DB_FILE || path.join(__dirname, 'data', 'app.db')
-const BACKUP_DIR = process.env.BACKUP_DIR || path.join(path.dirname(DB_FILE), 'backups')
+// 与 db.js 必须用同一个 DB_FILE：备份是 VACUUM INTO 这个文件，指错了会备到空库。
+// BACKUP_DIR 默认跟随数据卷，这样备份文件也落在 Volume 里（注意：卷本身仍需外部备份）。
+const { PATHS } = require('./paths')
+const DB_FILE = PATHS.DB_FILE
+const BACKUP_DIR = PATHS.BACKUP_DIR
 const KEEP = Math.max(1, Number(process.env.BACKUP_KEEP || 7))
 const INTERVAL_HOURS = Math.max(1, Number(process.env.BACKUP_INTERVAL_HOURS || 24))
 const DISABLED = process.env.BACKUP_DISABLED === '1'
@@ -56,6 +59,24 @@ function prune() {
  */
 function backupNow(tag = 'auto') {
   if (DISABLED) return { ok: false, error: 'BACKUP_DISABLED=1，已跳过' }
+  const res = vacuumInto(tag)
+  if (res.ok) return res
+
+  // ===== 自愈重试：disk I/O error 多半是 WAL 热状态 =====
+  // 多个进程反复开关后 -wal/-shm 可能处于"需要 recovery"的状态，VACUUM INTO 读
+  // 未合并的 WAL 页时会报 disk I/O error。先 checkpoint（把 WAL 合并回主文件）再试
+  // 一次——实测能把这类失败救回来。仍失败才算真失败。
+  log.warn('[backup] 首次备份失败，尝试 checkpoint 后重试', { error: res.error })
+  try {
+    db.exec('PRAGMA wal_checkpoint(TRUNCATE);')
+  } catch (err) {
+    log.warn('[backup] checkpoint 失败', { error: err?.message })
+  }
+  return vacuumInto(tag)
+}
+
+/** 实际执行 VACUUM INTO。备份失败只告警，绝不影响服务：这是运维兜底，不是业务前置条件 */
+function vacuumInto(tag) {
   try {
     fs.mkdirSync(BACKUP_DIR, { recursive: true })
     let name = `app-${stamp()}-${tag}.db`
@@ -74,6 +95,12 @@ function backupNow(tag = 'auto') {
     return { ok: true, file: full, size }
   } catch (err) {
     log.error('[backup] 备份失败', { error: err?.message })
+    // 失败时清掉半成品文件：留着会误导恢复操作（恢复到一半的库比没备份更危险）
+    try {
+      const partial = path.join(BACKUP_DIR, `app-${stamp()}-${tag}.db`)
+      if (fs.existsSync(partial)) fs.unlinkSync(partial)
+      if (fs.existsSync(partial + '-journal')) fs.unlinkSync(partial + '-journal')
+    } catch { /* 清理失败不影响主流程 */ }
     return { ok: false, error: err?.message || String(err) }
   }
 }

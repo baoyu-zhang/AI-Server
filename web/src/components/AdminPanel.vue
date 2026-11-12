@@ -8,7 +8,7 @@
 <script setup lang="ts">
 import { onMounted, ref } from 'vue'
 import { MessagePlugin } from 'tdesign-vue-next'
-import { authHeaders, clearAuth } from '../api/auth'
+import { authHeaders, clearAuth, currentUser } from '../api/auth'
 
 // 统一请求封装（与 DocPanel/KeyPanel 同一套约定）
 async function request<T>(url: string, options?: RequestInit): Promise<T> {
@@ -28,8 +28,10 @@ interface AdminUserRow {
   username: string
   role: string
   createdAt: number
+  quotaDaily: number // 每日 token 配额（0 表示不限），仅展示，不改
   runs: number // 总轮次（没有用量的用户为 0，LEFT JOIN 保证不丢行）
   totalTokens: number
+  disabled: boolean // 是否被停用：PATCH /status 改的就是这个字段
 }
 
 /** 全局审计行：比个人审计多 userId 字段（admin 视角要知道是谁） */
@@ -85,6 +87,34 @@ async function load() {
   }
 }
 
+/**
+ * 是否当前登录用户本人。服务端本来就拒绝「停用自己的账号」（返回 403），
+ * 前端先用 currentUser.userId 把按钮禁掉：省掉一次注定失败的请求，更避免管理员手滑把自己锁在外面。
+ */
+function isSelf(row: AdminUserRow): boolean {
+  return Boolean(currentUser.value && currentUser.value.userId === row.id)
+}
+
+/**
+ * 停用 / 启用一个用户。确认环节由模板里的 t-popconfirm 承担（状态变更影响别人能否登录，先问一句）。
+ * 成功后重拉整页：列表里的 disabled 状态以服务端为准，不靠本地改一个字段假装成功。
+ */
+async function toggleStatus(row: AdminUserRow) {
+  if (isSelf(row)) return // 双保险：即便绕过禁用态也不对自己发 PATCH
+  const disabled = !row.disabled // 当前停用 → 改成启用；当前正常 → 改成停用
+  try {
+    await request(`/api/admin/users/${encodeURIComponent(row.id)}/status`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ disabled })
+    })
+    MessagePlugin.success(disabled ? '已停用该用户' : '已启用该用户')
+    await load()
+  } catch (e: any) {
+    MessagePlugin.error(e?.message || '操作失败')
+  }
+}
+
 onMounted(load)
 
 defineExpose({ load })
@@ -108,6 +138,30 @@ defineExpose({ load })
       </t-column>
       <t-column col-key="runs" title="对话轮次" :width="90" align="right" />
       <t-column col-key="totalTokens" title="累计 token" :width="110" align="right" />
+      <!-- 状态列：一眼看出谁被停用了，避免只靠操作按钮的文字猜当前状态 -->
+      <t-column col-key="disabled" title="状态" :width="80">
+        <template #cell="{ row }">
+          <t-tag :theme="row.disabled ? 'danger' : 'success'" variant="light">
+            {{ row.disabled ? '已停用' : '正常' }}
+          </t-tag>
+        </template>
+      </t-column>
+      <!-- 操作列：停用/启用前二次确认；本人那行按钮禁用，且不弹确认 -->
+      <t-column col-key="op" title="操作" :width="80">
+        <template #cell="{ row }">
+          <t-popconfirm
+            :content="row.disabled ? '确认启用该用户？' : '停用后该用户将无法登录和调用接口，确认停用？'"
+            theme="danger"
+            @confirm="toggleStatus(row)"
+          >
+            <t-link
+              :theme="row.disabled ? 'primary' : 'danger'"
+              hover="color"
+              :disabled="isSelf(row)"
+            >{{ isSelf(row) ? '本人' : row.disabled ? '启用' : '停用' }}</t-link>
+          </t-popconfirm>
+        </template>
+      </t-column>
     </t-table>
 
     <!-- 块二：全局用量（总账 + 按模型拆分） -->

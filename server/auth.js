@@ -56,6 +56,48 @@ function revokeSession(token) {
 }
 
 /**
+ * 账号被停用时的统一收口：撤销本次出示的凭证 → 写审计 → 返回中文 403。
+ *
+ * 为什么单独抽一个函数：requireAuth 有 session / API Key 两条分支，两处都要
+ * 「停用即拒绝」，逻辑收敛到一份才不会只挡住浏览器那条路；而"撤销凭证"两种
+ * 凭证做法不同，集中在这里按 authType 分流最清楚。
+ *
+ * 撤销的是「本次请求出示的那一个凭证」，不是全量清空：
+ *   - session：删 sessions 表里这一行（revokeSession），该 token 立即失效；
+ *   - api-key：key 不进 sessions 表，按明文 SHA256 哈希把 api_keys 软吊销
+ *     （哈希口径与 api-keys.js 的 sha256 完全一致，不引入新依赖）。
+ * 真正的兜底是 requireAuth 每次都读 disabled——只要账号还停着，任何凭证
+ * 都过不了这道闸门；撤销只是让"被拒的那把凭证"当场作废、不留活口。
+ *
+ * @param {object} req Express 请求（取 req.ip 写审计）
+ * @param {object} res Express 响应（用于返回 403）
+ * @param {object} ctx 本次被拒凭证的上下文，解构出以下四个字段
+ * @param {string} ctx.token 本次请求出示的 Bearer 凭证明文
+ * @param {'session'|'api-key'} ctx.authType 凭证类型，决定用哪种方式撤销
+ * @param {string} ctx.userId 被停用用户的 id（写审计）
+ * @param {string} ctx.username 被停用用户的用户名（写审计 actor）
+ */
+function denyDisabled(req, res, { token, authType, userId, username }) {
+  if (authType === 'api-key') {
+    // sk- 凭证不在 sessions 表，单独按 key_hash 精确吊销（ revoked_at IS NULL 防重复刷时间 ）
+    const keyHash = crypto.createHash('sha256').update(token).digest('hex')
+    db.prepare('UPDATE api_keys SET revoked_at = ? WHERE key_hash = ? AND revoked_at IS NULL')
+      .run(Date.now(), keyHash)
+  } else {
+    revokeSession(token)
+  }
+  recordAudit({
+    userId,
+    actor: username,
+    action: 'auth.disabled_denied',
+    target: username,
+    detail: { authType },
+    ip: req.ip
+  })
+  return res.status(403).json({ error: '账号已被停用' })
+}
+
+/**
  * 鉴权中间件：所有业务端点的闸门。
  * 挂载顺序是关键——必须放在 /api/auth 路由之后，登录接口本身不能要求已登录。
  *
@@ -76,16 +118,19 @@ function requireAuth(req, res, next) {
     const apiKeyAuth = require('./api-keys') // 函数内 require 避免 auth.js <-> api-keys.js 循环依赖
     const hit = apiKeyAuth.authenticateApiKey(token)
     if (!hit) return res.status(401).json({ error: 'API Key 无效或已吊销' })
-    // key 只绑 userId，username/role 现查一次（审计、日志、权限判断都要用）
-    const user = db.prepare('SELECT id, username, role FROM users WHERE id = ?').get(hit.userId)
+    // key 只绑 userId，username/role/disabled 现查一次（审计、日志、权限、停用判断都要用）
+    // 多查一列 disabled：账号被停用后 key 也必须立刻失效，不能只挡 session 那条路
+    const user = db.prepare('SELECT id, username, role, disabled FROM users WHERE id = ?').get(hit.userId)
     if (!user) return res.status(401).json({ error: 'API Key 归属用户不存在' })
+    if (user.disabled) return denyDisabled(req, res, { token, authType: 'api-key', userId: user.id, username: user.username })
     req.user = { userId: user.id, username: user.username, role: user.role, token: null, authType: 'api-key' }
     return next()
   }
 
   // ---- 分支二：登录 session（原有逻辑不变） ----
+  // 多查一列 u.disabled：停用账号的会话也要在闸门这里被拦下并撤销
   const row = db.prepare(`
-    SELECT s.token, s.expires_at, u.id AS user_id, u.username, u.role
+    SELECT s.token, s.expires_at, u.id AS user_id, u.username, u.role, u.disabled
     FROM sessions s JOIN users u ON u.id = s.user_id
     WHERE s.token = ?
   `).get(token)
@@ -94,6 +139,7 @@ function requireAuth(req, res, next) {
     revokeSession(token) // 过期顺手清掉，不留给定时任务
     return res.status(401).json({ error: '登录已过期，请重新登录' })
   }
+  if (row.disabled) return denyDisabled(req, res, { token, authType: 'session', userId: row.user_id, username: row.username })
   req.user = { userId: row.user_id, username: row.username, role: row.role, token, authType: 'session' }
   next()
 }

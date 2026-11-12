@@ -1,16 +1,20 @@
-/**
- * Dockerfile —— M1 的可部署形态
- *
- * 构建要点（都是踩出来的）：
- *   ① 基础镜像用 node:22-alpine：node:sqlite 需要 22+，alpine 体积小；
- *      网络层用完整镜像源安装依赖（alpine 上 native 模块编译需要 python3/make/g++，
- *      本项目依赖全是纯 JS 或带 prebuilt，不需要编译工具链）。
- *   ② 本地 embedding 模型（@xenova/transformers）首次运行会从 HuggingFace 下载 bge-small-zh
- *      到缓存目录，容器内每次重建都要重新下载几百 MB——挂卷缓存，见 compose 的 transformers-cache。
- *   ③ vector-index / uploads / data 是运行时数据，打镜像时不带进去，运行时挂卷。
- *      打进去的话，重建镜像 = 抹掉所有人的知识库。
- */
-FROM node:22-alpine AS base
+# server/Dockerfile —— 历史遗留的「仅后端」镜像，保留给本地单独跑 API 用。
+#
+# ⚠️ 部署到 Railway / 对外提供页面请一律用仓库根目录的 Dockerfile：
+#    那一份会在构建阶段编译 web/ 并一起打进镜像，Express 单端口同时托管页面和 API。
+#    这一份只有后端，打开域名会看到 404，不是可用的线上形态。
+#
+# 构建要点（都是踩出来的）：
+#   ① 基础镜像用 node:22：node:sqlite 需要 22+。
+#      注意 alpine 是 musl，onnxruntime-node 的预编译二进制常加载失败，
+#      根 Dockerfile 已换成 Debian slim，这里同步改掉。
+#   ② 本地 embedding 模型首次运行会从 HuggingFace 下载 bge-small-zh 到缓存目录，
+#      容器内每次重建都要重下几百 MB——挂卷缓存，见 compose 的 transformers-cache。
+#   ③ vector-index / uploads / data 是运行时数据，打镜像时不带进去，运行时挂卷。
+#      打进去的话，重建镜像 = 抹掉所有人的知识库。
+#
+# 之前的版本错误地用 JS 的 /* ... */ 写注释，Dockerfile 只认 #，会直接构建失败。
+FROM node:22-bookworm-slim AS base
 WORKDIR /app
 ENV NODE_ENV=production
 

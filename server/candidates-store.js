@@ -16,7 +16,8 @@
 const fs = require('node:fs')
 const path = require('node:path')
 
-const DATA_DIR = path.join(__dirname, 'data')
+// 候选人状态表也进数据卷，避免部署后演示数据被清空
+const DATA_DIR = require('./paths').PATHS.DATA_DIR
 // 允许用环境变量换一份数据文件：测试脚本要跑"改状态/评分写回"这些有副作用的用例，
 // 直接写正式表会把演示数据搅乱，指到临时文件上就能随便造。
 const STORE_FILE = process.env.CANDIDATES_STORE_FILE || path.join(DATA_DIR, 'candidates.json')

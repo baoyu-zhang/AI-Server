@@ -31,7 +31,8 @@ const current = LEVELS[String(process.env.LOG_LEVEL || 'info').toLowerCase()] ||
 
 // ============ 文件落盘 ============
 const FILE_ENABLED = process.env.LOG_TO_FILE !== '0'
-const LOG_DIR = path.resolve(process.env.LOG_DIR || path.join(__dirname, 'logs'))
+// 默认跟随统一数据卷；云平台上也可设 LOG_TO_FILE=0 只输出 stdout（平台自己会收集日志）
+const LOG_DIR = path.resolve(process.env.LOG_DIR || require('./paths').PATHS.LOG_DIR)
 const MAX_BYTES = Number(process.env.LOG_MAX_BYTES || 10 * 1024 * 1024)
 const KEEP_DAYS = Number(process.env.LOG_KEEP_DAYS || 7)
 
@@ -140,6 +141,13 @@ function logFile() {
 function emit(level, args) {
   if (LEVELS[level] < current) return
   const entry = { ts: new Date().toISOString(), level }
+  // P1：把当前请求的 id 自动写进每条日志。runtime.js 用 AsyncLocalStorage 维护上下文，
+  // 这里用惰性 require 避免「logger → runtime → logger」的加载循环；
+  // 启动期（还没有请求上下文）getRequestId() 返回 undefined，就不会带这个字段。
+  try {
+    const rid = require('./runtime').getRequestId()
+    if (rid) entry.requestId = rid
+  } catch { /* runtime 尚未加载：启动期日志，忽略即可 */ }
   // 第一个参数若是字符串当 message，其余原样并排——保持 console.log 的手感，但结构化
   if (typeof args[0] === 'string') {
     entry.msg = args[0]

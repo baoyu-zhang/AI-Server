@@ -9,8 +9,15 @@ env.remoteHost = process.env.HF_ENDPOINT || 'https://hf-mirror.com/';
 // 本地 embedding 模型：bge-small-zh-v1.5，中文检索效果好，输出 512 维向量
 const EMBEDDING_MODEL = process.env.EMBEDDING_MODEL || 'Xenova/bge-small-zh-v1.5';
 
-// 向量库文件夹
-const index = new LocalIndex(path.join(__dirname, 'vector-index'));
+// 向量索引与 embedding 模型缓存都放统一数据卷：
+// ① 索引是运行时状态，重建容器不能丢；
+// ② 模型首次要下载几百 MB，放进卷后重新部署不必重下（否则冷启动会顶爆健康检查超时）。
+const { PATHS } = require('./paths');
+// 本机不设 cacheDir（沿用 ~/.cache 里已下载的模型），云上才把缓存放进卷避免每次部署重下
+if (process.env.TRANSFORMERS_CACHE || PATHS.MODEL_CACHE_DIR) {
+  env.cacheDir = process.env.TRANSFORMERS_CACHE || PATHS.MODEL_CACHE_DIR;
+}
+const index = new LocalIndex(PATHS.VECTOR_INDEX_DIR);
 
 // 初始化向量库
 async function initVectorStore() {
@@ -70,7 +77,7 @@ async function getEmbeddings(texts) {
  * 批量将chunk数组向量化，插入向量库
  * @param {string[]} chunks 文本片段数组
  * @param {string} fileName 文档名称（元数据）
- * @param {{docType?: string, jobId?: string, candidateId?: string}} meta 业务标签，可选
+ * @param {{docType?: string, jobId?: string, candidateId?: string, userId?: string, fileId?: string}} meta 业务标签，可选
  */
 async function batchInsertEmbedding(chunks, fileName, meta = {}) {
   const vectors = await getEmbeddings(chunks)
@@ -82,11 +89,16 @@ async function batchInsertEmbedding(chunks, fileName, meta = {}) {
     candidateId: meta.candidateId,
     userId: meta.userId
   }
+  // fileId：P2「产品化」新增的文档唯一标识，由调用方（上传接口）生成并原样回给前端，
+  // 之后前端按它删除，不再靠 fileName——两个用户传同名文件时也不会互相误删。
+  // 没传就回落到 fileName，保证旧调用方与历史数据（本来就没有 fileId）行为不变。
+  const fileId = meta.fileId || fileName
   for (let i = 0; i < chunks.length; i++) {
     await index.insertItem({
       vector: vectors[i],
       metadata: {
         fileName,
+        fileId, // 文档级唯一标识；老数据没有该字段，列表/删除侧都用 fileName 兜底
         content: chunks[i],
         // 片段在原文中的序号：引用定位（点击引用看前后段）全靠它排序取邻域。
         // 旧语料没有这个字段，定位接口要按缺失兜底
@@ -415,7 +427,7 @@ async function getAllItems() {
  * 业务标签（docType / jobId / candidateId）之所以要带出来：`/api/upload-doc` 判断
  * "这次上传是不是同一份业务对象"全靠它。没有它，两个候选人都传「简历.md」时，
  * 后传的那份会把前一个人的片段删掉——覆盖变成互相覆盖。
- * @returns {Promise<Array<{fileName: string, chunkCount: number, createdAt: number, docType?: string, jobId?: string, candidateId?: string}>>}
+ * @returns {Promise<Array<{fileName: string, fileId: string, chunkCount: number, createdAt: number, docType?: string, jobId?: string, candidateId?: string}>>}
  */
 async function getDocuments(userId) {
   const items = await index.listItems()
@@ -429,6 +441,9 @@ async function getDocuments(userId) {
     if (!map.has(fileName)) {
       map.set(fileName, {
         fileName,
+        // P2：回传 fileId 给前端，删除接口据此精确删自己那一份。
+        // 老条目入库时还没有 fileId，回落成 fileName，前端按旧契约传 fileName 也删得动
+        fileId: meta.fileId || fileName,
         chunkCount: 0,
         createdAt: meta.createdAt || 0,
         // 同一文件的所有片段共享同一组标签，取第一条即可（旧语料没有这些字段，值为 undefined）
@@ -508,6 +523,41 @@ async function deleteDocument(fileName, userId) {
 }
 
 /**
+ * 按 fileId 删除文档：删除该文件对应的全部向量片段（P2「产品化」新增）。
+ *
+ * 与 deleteDocument(fileName) 的区别：过滤键换成 metadata.fileId 而不是 fileName。
+ * fileName 是给人看的、会重复（两个候选人都叫「简历.md」）；fileId 是文档级唯一标识，
+ * 前端从 /api/documents 拿到后原样传回，删除就能精确到「自己那一份」，不误伤同名文档。
+ *
+ * 兼容旧数据：老条目入库时还没有 fileId 字段，此时回落到 fileName 匹配——
+ * 调用方按旧契约把 fileName 当作 fileId 传进来（getDocuments 对老条目也返回 fileName）
+ * 一样删得动，不会出现「升级后老文档删不掉」。
+ *
+ * 可见性过滤完全照抄 deleteDocument：传入 userId 时只删该用户可见范围内的片段，
+ * 别人的文档连命中都不算；返回 0 表示「你没有这个文件」。
+ *
+ * @param {string} fileId 文档唯一标识（老数据场景可直接传 fileName）
+ * @param {string} [userId] 传入时只删可见范围内的片段，防越权
+ * @returns {Promise<number>} 删除的片段数（0 = 不存在或无权删除）
+ */
+async function deleteDocumentByFileId(fileId, userId) {
+  const items = await index.listItems()
+  const vis = visibilityFilter(userId);
+  const ids = items
+    .filter(item => {
+      const meta = item.metadata || {}
+      // 有 fileId 的新条目按 fileId 精确匹配；没有 fileId 的老条目回落到 fileName 匹配
+      if (meta.fileId !== undefined && meta.fileId !== null) return meta.fileId === fileId
+      return meta.fileName === fileId
+    })
+    .filter(item => !vis || matchesFilter(item.metadata, vis))
+    .map(item => item.id)
+  if (ids.length) await index.deleteItems(ids)
+  invalidateBm25() // 删完必须重建倒排，否则被删的片段还能被关键词召回
+  return ids.length
+}
+
+/**
  * 引用定位：取某片段在原文中的前后邻域
  *
  * 点击【引用来源】时前端调它，把被引片段前后的段落一起展示出来——
@@ -566,5 +616,6 @@ module.exports = {
   getCandidates, // 候选人清单：按 metadata.candidateId 聚合
   getJobs, // 岗位清单：按 metadata.jobId 聚合
   deleteDocument,
+  deleteDocumentByFileId, // P2：按 metadata.fileId 精确删除（老条目回落 fileName 匹配）
   clearVectorIndex
 }

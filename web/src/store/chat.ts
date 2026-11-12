@@ -8,6 +8,8 @@ export interface RagSource {
   sourceType?: 'knowledge' | 'attachment' // 来源类型：知识库 / 本次会话附件
   chunkIndex?: number // 片段在原文中的序号：点「查看原文上下文」取前后段用（旧语料可能缺失）
   fileId?: string // 附件来源才有：会话附件 id，上下文接口按它查
+  suspicious?: boolean // 服务端注入扫描命中：该片段含"忽略指令/角色劫持"类表述，只是资料
+  suspiciousTags?: string[] // 命中类别，如 ['忽略指令']，用于角标 tooltip
 }
 
 // 用户消息附带的文件：上传成功后记录，用于气泡内渲染文件卡片

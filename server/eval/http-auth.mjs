@@ -9,12 +9,30 @@ const BASE_URL = (process.env.BASE_URL || 'http://localhost:3000').replace(/\/+$
 
 let token = null
 
+/**
+ * 带一次重试的 fetch，只重试"连接根本没建起来"的网络错误。
+ *
+ * 为什么需要：长脚本连续发请求时偶发 ECONNRESET（undici 复用了一条已被对端
+ * 关掉的 keep-alive 连接，POST 又不会被自动重试），表现为"服务明明在线却连不上"。
+ * 这种错误发生在请求到达服务端之前，重发一次没有副作用；业务错误（4xx/5xx）绝不重试。
+ */
+async function fetchWithRetry(url, options) {
+  try {
+    return await fetch(url, options)
+  } catch (err) {
+    const code = err?.cause?.code || err?.code
+    if (!['ECONNRESET', 'ECONNREFUSED', 'EPIPE', 'UND_ERR_SOCKET'].includes(code)) throw err
+    await new Promise(resolve => setTimeout(resolve, 200))
+    return fetch(url, options)
+  }
+}
+
 export async function login({ username, password } = {}) {
   const user = username || `eval_${process.pid}_${Date.now().toString(36)}`
   const pass = password || 'eval-pass-123456'
   // 用户名长度上限 32，超了截断（不影响唯一性，后面还拼了 pid + 时间戳）
   const name = user.slice(0, 32)
-  const regRes = await fetch(`${BASE_URL}/api/auth/register`, {
+  const regRes = await fetchWithRetry(`${BASE_URL}/api/auth/register`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ username: name, password: pass })
@@ -23,7 +41,7 @@ export async function login({ username, password } = {}) {
     token = (await regRes.json()).token
     return { token, username: name }
   }
-  const loginRes = await fetch(`${BASE_URL}/api/auth/login`, {
+  const loginRes = await fetchWithRetry(`${BASE_URL}/api/auth/login`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ username: name, password: pass })

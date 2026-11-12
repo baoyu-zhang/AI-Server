@@ -7,13 +7,18 @@
  *   node scripts/db.mjs messages <threadId>  某个会话每轮的消息角色序列
  *   node scripts/db.mjs sql "SELECT ..."     执行任意 SQL（SELECT 走表格，其他返回影响行数）
  *   node scripts/db.mjs path                 打印数据库文件路径与大小
+ *   node scripts/db.mjs restore <备份文件名> [--force]  从备份恢复数据库（见 server/restore.js）
+ *   node scripts/db.mjs verify-backup <备份文件名>      只读校验备份是否可恢复（恢复演练）
  *
  * 默认只读打开：防止手抖 UPDATE 掉生产数据。要写库显式加 --write。
+ * restore / verify-backup 是例外：它们委托给 server/restore.js 的独立进程，不走本文件
+ * 的只读连接——恢复会覆盖 app.db，和这里打开的句柄会冲突（详见下方早分支注释）。
  */
 import { DatabaseSync } from 'node:sqlite'
 import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { spawnSync } from 'node:child_process' // 新增：restore / verify-backup 用独立进程调用 CommonJS 的 restore.js
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const DB_PATH = process.env.DB_PATH || path.join(ROOT, 'server/data/app.db')
@@ -22,6 +27,27 @@ const argv = process.argv.slice(2)
 const write = argv.includes('--write')
 const args = argv.filter(a => a !== '--write')
 const cmd = args[0] || 'users'
+
+// ===== 新增子命令：restore / verify-backup，委托给 CommonJS 的 server/restore.js =====
+// 为什么放在打开数据库之前、且用独立进程：
+//   ① restore 会覆盖 app.db，而本文件下面会 new DatabaseSync(DB_PATH) 打开一个到 app.db
+//      的句柄；两个连接并存时覆盖文件，句柄会指向旧 inode，语义混乱。独立进程彼此隔离。
+//   ② verify-backup 只校验备份文件，跟 app.db 存不存在无关，不能被下面的存在性检查拦住。
+//   ③ restore.js 是 CommonJS（module.exports），这里是 ESM：用 spawnSync 跑它的 CLI 最省事，
+//      直接复用写好的 --restore / --verify，不必处理 CJS/ESM 互操作。
+// 处理完直接退出，绝不落到下面的 switch / finally（那里会 close 一个没打开的连接）。
+if (cmd === 'restore' || cmd === 'verify-backup') {
+  const fileName = args[1]
+  if (!fileName) {
+    console.error(`用法：node scripts/db.mjs ${cmd} <备份文件名>${cmd === 'restore' ? ' [--force]' : ''}`)
+    process.exit(1)
+  }
+  const restoreScript = path.join(ROOT, 'server', 'restore.js')
+  const cli = [restoreScript, cmd === 'restore' ? '--restore' : '--verify', fileName]
+  if (cmd === 'restore' && args.includes('--force')) cli.push('--force') // --force 才允许覆盖正式库
+  const result = spawnSync(process.execPath, cli, { stdio: 'inherit', cwd: ROOT })
+  process.exit(result.status ?? 1) // 子进程被信号杀死时 status 为 null，按失败处理
+}
 
 if (!fs.existsSync(DB_PATH)) {
   console.error(`数据库不存在：${DB_PATH}\n后端启动过就会有（npm start）`)
@@ -154,7 +180,7 @@ try {
     }
 
     default:
-      console.log('命令：users | threads [n] | messages <threadId> | audit [n] | sql "<SQL>" [--write] | clean [--write] | path')
+      console.log('命令：users | threads [n] | messages <threadId> | audit [n] | sql "<SQL>" [--write] | clean [--write] | path | restore <file> [--force] | verify-backup <file>')
   }
 } finally {
   db.close()

@@ -96,4 +96,129 @@ function getThreadMessages(threadId, userId) {
   }
 }
 
-module.exports = { saveRun, listThreads, getThreadMessages }
+// ============================================================================
+// P2「产品化」新增：账号自助能力（删会话 / 导出个人数据）
+//
+// 为什么这两个函数放在 threads-store 而不是各自写在路由里：
+//   ① 它们都要读多张以 userId 为锚点的表，跟已有 saveRun / listThreads / getThreadMessages
+//      是同一类「会话落库」代码，放一起复用同一个 db 句柄与代码风格；
+//   ② 路由层只负责 HTTP（取 req.user、拼响应、设下载头），SQL 全部收口在这里，
+//      方便单独测，也保证「所有查询都带 userId」这条安全约束只看一个文件就能审。
+//
+// 安全铁律（导出接口是越权高发区，下面每一行都照此实现）：
+//   - 所有 SQL 参数化，绝不把 threadId / id 拼进字符串；
+//   - 所有查询都带 userId 过滤；profile 用列白名单 SELECT，物理上带不出 password_hash；
+//   - audit 只取「关于自己」的记录（user_id=自己 OR actor=自己用户名），
+//     与 audit.js 的 listAudit 同一口径，不把别人的审计行带出来。
+// ============================================================================
+
+/**
+ * 删除某个会话（连同它下面每轮的消息快照）。
+ *
+ * 归属校验直接写进 DELETE 的 WHERE：id = ? AND user_id = ?，两步合一——
+ * 「先 SELECT 校验再 DELETE」如果没有事务会留竞态窗口，而且多一次查询。
+ * B 用户就算猜到 A 的 threadId 也匹配不到任何行 → changes=0，天然不越权。
+ * thread_runs 借外键 ON DELETE CASCADE 连带清理（db.js 已开 PRAGMA foreign_keys=ON），
+ * 不用手动删两遍，也不会留下孤儿快照。
+ *
+ * @param {string} threadId 会话 id（AG-UI 的 threadId，来自 URL，属不可信输入）
+ * @param {string} userId   归属用户（来自 req.user.userId，绝不接受 body 传入）
+ * @returns {number} 实际删掉的会话数；0 = 不存在或不属于该用户
+ */
+function deleteThread(threadId, userId) {
+  // 两个参数都做空值兜底：缺一个就不执行 DELETE（SQL 里 user_id = NULL 本来就匹配不到，
+  // 但提前返回语义更清楚，也避免把 undefined 传进 prepare）
+  if (!threadId || !userId) return 0
+  const info = db.prepare('DELETE FROM threads WHERE id = ? AND user_id = ?').run(threadId, userId)
+  return info.changes
+}
+
+/**
+ * 导出某用户的全部个人数据（「带走我的数据」）。
+ *
+ * 返回结构：
+ *   {
+ *     profile:  { id, username, role, createdAt } | null,
+ *     threads:  [ { id, title, updatedAt, runs: [ { runId, messages, state, createdAt } ] } ],
+ *     memories: [ { id, content, createdAt } ],
+ *     usage:    [ { id, threadId, runId, model, inputTokens, outputTokens, totalTokens, steps, createdAt } ],
+ *     audit:    [ { id, userId, actor, action, target, detail, ip, createdAt } ]
+ *   }
+ *
+ * 刻意不导出：password_hash（列白名单挡住）、token / session / api_key
+ * （这些表的哈希/明文列根本没被查，且全部按 userId 圈定）、其它用户的数据
+ * （每张表都 WHERE user_id = ?，审计另加 actor 归属判断）。
+ *
+ * 为什么把每轮 messages 从 JSON 字符串 parse 成数组再导出：这是给人看的下载文件，
+ * 解析成真正的 JSON 结构才可用；单条快照损坏时按空数组兜底，不让一条脏数据
+ * 把整个导出拖成 500。
+ *
+ * @param {string} userId 归属用户（调用方只传 req.user.userId）
+ * @returns {object} 见上
+ */
+function exportUserData(userId) {
+  // userId 缺失时返回结构完整的空导出，避免调用方拿到 undefined 再自己兜底
+  if (!userId) return { profile: null, threads: [], memories: [], usage: [], audit: [] }
+
+  // ① profile：列白名单，只给 id / username / role / createdAt，
+  //    绝不含 password_hash，也不含 disabled 等内部状态列
+  const profile = db.prepare(
+    'SELECT id, username, role, created_at AS createdAt FROM users WHERE id = ?'
+  ).get(userId) || null
+
+  // ② threads 列表 + 每轮 run 的 messages / state 快照
+  //    一次性把该用户所有 run 取出来再按 threadId 分组，避免「每个会话查一次」的 N+1
+  const threadRows = db.prepare(
+    'SELECT id, title, updated_at AS updatedAt FROM threads WHERE user_id = ? ORDER BY updated_at DESC'
+  ).all(userId)
+  const runs = db.prepare(
+    `SELECT thread_id AS threadId, run_id AS runId, messages, state, created_at AS createdAt
+       FROM thread_runs WHERE user_id = ? ORDER BY created_at ASC, run_id ASC`
+  ).all(userId)
+  const runsByThread = new Map()
+  for (const run of runs) {
+    let messages = []
+    let state = {}
+    try { messages = JSON.parse(run.messages || '[]') } catch { /* 损坏快照按空数组 */ }
+    try { state = JSON.parse(run.state || '{}') } catch { /* 损坏状态按空对象 */ }
+    const item = { runId: run.runId, messages, state, createdAt: run.createdAt }
+    if (!runsByThread.has(run.threadId)) runsByThread.set(run.threadId, [])
+    runsByThread.get(run.threadId).push(item)
+  }
+  const threads = threadRows.map(t => ({
+    id: t.id,
+    title: t.title,
+    updatedAt: t.updatedAt,
+    runs: runsByThread.get(t.id) || [] // 没有 run 的会话（异常数据）也给空数组，结构统一
+  }))
+
+  // ③ 跨会话长期记忆
+  const memories = db.prepare(
+    'SELECT id, content, created_at AS createdAt FROM user_memory WHERE user_id = ? ORDER BY created_at ASC, id ASC'
+  ).all(userId)
+
+  // ④ 模型用量明细（成本/账单一并带走）
+  const usage = db.prepare(
+    `SELECT id, thread_id AS threadId, run_id AS runId, model,
+            input_tokens AS inputTokens, output_tokens AS outputTokens,
+            total_tokens AS totalTokens, steps, created_at AS createdAt
+       FROM model_usage WHERE user_id = ? ORDER BY created_at ASC, id ASC`
+  ).all(userId)
+
+  // ⑤ 审计：只取「关于自己」的记录（user_id=自己 OR actor=自己用户名）。
+  //    与 listAudit 同口径：登录失败/锁定发生在认证前，那时 user_id 为空、只有 actor，
+  //    靠 actor 匹配用户才能看到「有人在试我的密码」这类记录。用户名在库里唯一，
+  //    actor 匹配不会串到别人；username 为空时用 (? IS NOT NULL AND ...) 守卫，
+  //    避免 actor = NULL 退化成恒假/误匹配。
+  const username = profile?.username || null
+  const audit = db.prepare(
+    `SELECT id, user_id AS userId, actor, action, target, detail, ip, created_at AS createdAt
+       FROM audit_log
+      WHERE user_id = ? OR (? IS NOT NULL AND actor = ?)
+      ORDER BY created_at ASC, id ASC`
+  ).all(userId, username, username)
+
+  return { profile, threads, memories, usage, audit }
+}
+
+module.exports = { saveRun, listThreads, getThreadMessages, deleteThread, exportUserData }
