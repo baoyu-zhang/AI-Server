@@ -25,11 +25,16 @@ function saveRun({ threadId, runId, userId, messages }) {
     .trim()
     .slice(0, TITLE_MAX)
   const now = Date.now()
-  db.prepare('INSERT INTO threads (id, user_id, title, updated_at) VALUES (?, ?, ?, ?)')
-    .run(threadId, userId, title, now)
-  // title 只在创建时写：后续轮次的旧消息不该改写首条消息定下的标题
-  db.prepare('UPDATE threads SET updated_at = ? WHERE id = ? AND updated_at < ?')
-    .run(now, threadId, now)
+  // 线程 id 由客户端生成：若已被别人占用，直接放弃本次落库。
+  // 不写比"写进别人会话"安全——getThreadMessages 按归属过滤，混写会让会话主人读到他人消息
+  const owner = db.prepare('SELECT user_id FROM threads WHERE id = ?').get(threadId)
+  if (owner && owner.user_id !== userId) return
+  // 同一线程的第二轮起必须 UPSERT：threadId 持久化后（刷新继续同一线程）这是常态，
+  // 之前裸 INSERT 会撞主键、整段 saveRun 抛异常被上层 catch 吞掉——表现就是"聊了但没存"
+  db.prepare(`
+    INSERT INTO threads (id, user_id, title, updated_at) VALUES (?, ?, ?, ?)
+    ON CONFLICT(id) DO UPDATE SET updated_at = excluded.updated_at
+  `).run(threadId, userId, title, now)
   db.prepare(`
     INSERT INTO thread_runs (run_id, thread_id, user_id, messages, created_at)
     VALUES (?, ?, ?, ?, ?)

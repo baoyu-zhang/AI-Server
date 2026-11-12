@@ -172,6 +172,34 @@ async function testThreads({ a, b }) {
   check('快照包含 user 与 assistant 消息', roles.includes('user') && roles.includes('assistant'), roles)
   check('快照包含工具结果', roles.includes('tool'), roles)
 
+  // 同一会话第二轮：threads 表必须是 UPSERT。threadId 持久化后"同一线程连发多条"是常态，
+  // 裸 INSERT 会撞主键、整段 saveRun 抛异常被上层吞掉——界面 200 正常，库里什么都没写
+  await fetch(`${BASE_URL}/agui`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Accept: 'text/event-stream', Authorization: `Bearer ${a.token}` },
+    body: JSON.stringify({
+      threadId,
+      runId: randomUUID(),
+      messages: [
+        { id: 'm1', role: 'user', content: '计算 23 乘 4 等于多少' },
+        { id: 'm2', role: 'assistant', content: '92' },
+        { id: 'm3', role: 'user', content: '再算 5 加 6 等于多少' }
+      ],
+      forwardedProps: { sessionId: threadId },
+      state: {}
+    }),
+    signal: AbortSignal.timeout(TIMEOUT_MS)
+  }).then(r => r.text())
+
+  const second = await raw(`/api/threads/${threadId}/messages`, { headers: { Authorization: `Bearer ${a.token}` } })
+  const secondMessages = second.body.messages || []
+  check(
+    '同一会话第二轮仍落库（快照含第二问）',
+    secondMessages.some(m => String(m.content).includes('再算 5 加 6')),
+    secondMessages.map(m => String(m.content).slice(0, 20))
+  )
+  check('快照首条仍是首轮用户消息（标题不被改写）', secondMessages[0]?.content === '计算 23 乘 4 等于多少', secondMessages[0]?.content)
+
   const cross = await raw(`/api/threads/${threadId}/messages`, { headers: { Authorization: `Bearer ${b.token}` } })
   check('B 读 A 的会话 404', cross.status === 404, cross.status)
 
