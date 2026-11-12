@@ -263,7 +263,9 @@ function defaultStepLogger(tag) {
  * 这是整个项目最容易被改坏的一行。
  *
  * @param {object} params
- * @param {Array} params.messages 已经是 AI SDK 格式的消息
+ * @param {Array} params.messages 已经是 AI SDK 格式的消息（不含 system 角色——AI SDK 禁止）
+ * @param {string} [params.systemPrompt] 调用方自带的系统提示（如 OpenAI 兼容端点收到的 system 消息），
+ *        与附件清单 instructions 拼接后走 streamText 的 instructions 选项
  * @param {string} [params.sessionId] 会话 id，用于取本次会话的附件
  * @param {object} params.tools 工具集合（含 execute）
  * @param {AbortSignal} [params.abortSignal] 客户端断开时中止模型流
@@ -274,6 +276,7 @@ function defaultStepLogger(tag) {
  */
 function prepareChatStream({
   messages,
+  systemPrompt,
   sessionId,
   tools,
   abortSignal,
@@ -282,7 +285,10 @@ function prepareChatStream({
   logTag = 'chat'
 }) {
   const { trimmedMessages, isTrimmed, droppedCount } = trimMessages(messages) // 控制上下文长度
-  const instructions = buildAttachmentSystemPrompt(sessionId) // 附件清单注入
+  // 系统提示分两路来源拼成一份：调用方自带（OpenAI 兼容端点转发的 system 消息）+ 附件清单。
+  // filter(Boolean) 去掉空段再 join，避免出现连续空行；都为空时 instructions 为 ''，
+  // 调用处 `|| undefined` 会把它转成不传。
+  const instructions = [systemPrompt, buildAttachmentSystemPrompt(sessionId)].filter(Boolean).join('\n\n')
   const images = getSessionImages(sessionId) // 图片附件（多模态）
   const modelMessages = attachImagesToLastUserMessage(trimmedMessages, images) // 图片挂到最后一条 user 消息
   const modelId = images.length ? MODEL_VISION : MODEL_REASONING // 有图走视觉模型

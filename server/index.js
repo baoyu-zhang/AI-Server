@@ -20,6 +20,7 @@ const { recordAudit, listAudit } = require('./audit') // 操作审计：谁批�
 const { startAutoBackup } = require('./backup') // SQLite 定时备份（VACUUM INTO）
 const { saveRun, listThreads, getThreadMessages } = require('./threads-store') // 会话落库
 const { saveUsage, listUsage, sumUsage } = require('./usage-store') // 模型用量落库
+const { createApiKey, listApiKeys, revokeApiKey } = require('./api-keys') // API Key 签发/校验
 const {
   CANDIDATE_STATUS, // 状态白名单，工具入参的 enum 与写库校验共用一份
   listCandidates: listCandidateRecords,
@@ -1313,6 +1314,219 @@ app.post('/api/documents/context', async (req, res) => {
     res.status(500).json({ error: err.message })
   }
 })
+// ============ API Key 管理 ============
+// 三个接口都要求 authType === 'session'（浏览器本人操作）：
+// 不允许"用一把 key 去签发/吊销另一把 key"——凭证自举意味着泄露一把 key
+// 攻击者就能抹掉痕迹再签发新 key，等于吊销机制完全失效。
+
+// 签发：响应里的 key 是完整明文，只此一次。前端要提示用户立刻保存。
+app.post('/api/keys', requireAuth, (req, res) => {
+  if (req.user.authType !== 'session') {
+    return res.status(403).json({ error: 'API Key 不能用于管理其他 Key，请在网页登录后操作' })
+  }
+  try {
+    const { key, record } = createApiKey(req.user.userId, req.body?.name)
+    recordAudit({ userId: req.user.userId, actor: req.user.username, action: 'apikey.create', target: record.keyPrefix, ip: req.ip })
+    res.json({ ok: true, key, record })
+  } catch (err) {
+    console.error('签发 API Key 失败', err)
+    res.status(500).json({ error: err.message })
+  }
+})
+
+// 列表：脱敏展示（前缀 + 用没用过 + 有没有吊销），永远不含明文和哈希
+app.get('/api/keys', requireAuth, (req, res) => {
+  if (req.user.authType !== 'session') {
+    return res.status(403).json({ error: 'API Key 不能用于管理其他 Key，请在网页登录后操作' })
+  }
+  res.json({ ok: true, data: listApiKeys(req.user.userId) })
+})
+
+// 吊销：立即失效（authenticateApiKey 看到 revoked_at 直接拒），无法恢复，只能重新签发
+app.post('/api/keys/:id/revoke', requireAuth, (req, res) => {
+  if (req.user.authType !== 'session') {
+    return res.status(403).json({ error: 'API Key 不能用于管理其他 Key，请在网页登录后操作' })
+  }
+  try {
+    const ok = revokeApiKey(req.user.userId, req.params.id)
+    if (!ok) return res.status(404).json({ error: 'Key 不存在或已吊销' })
+    recordAudit({ userId: req.user.userId, actor: req.user.username, action: 'apikey.revoke', target: req.params.id, ip: req.ip })
+    res.json({ ok: true })
+  } catch (err) {
+    console.error('吊销 API Key 失败', err)
+    res.status(500).json({ error: err.message })
+  }
+})
+
+// ============ OpenAI 兼容端点 ============
+// ===== 为什么做这个 =====
+// 生态里一大半现成工具（curl / openai SDK / 各类客户端 / LangChain）都只会说 OpenAI 协议。
+// 暴露 /v1/chat/completions 后，这些工具把 baseURL 指向本服务 + 填上签发的 API Key 就能直接用，
+// 不需要为每个客户端写一遍 AG-UI 适配。AG-UI 端点服务"自家的前端"，这个端点服务"别人家的程序"。
+
+/**
+ * OpenAI 消息 → AI SDK 消息。
+ * OpenAI 的 content 可以是字符串，也可以是 [{type:'text',text}] 数组（视觉/多段），
+ * 这里只保留文本语义拼成字符串——兼容端点是给纯文本程序用的，图片走 /agui 上传链路。
+ * tool / tool_calls 两种消息做最小兼容：tool 结果转成我们的 {role:'tool', toolCallId} 形态，
+ * 悬空结果（前面没有对应 assistant.tool_calls）会被 trimMessages 清掉，不会 400。
+ *
+ * 返回 { messages, systemText } 两份：AI SDK 禁止 messages 里出现 system 角色
+ * （"Use the instructions option instead"），system 消息必须单独抽出来走 instructions，
+ * 不能留在 messages 里一起传——否则 streamText 直接 InvalidPromptError。
+ */
+function openAiToChatMessages(list) {
+  // 非数组直接给空：让后续流程按"没有历史"处理，而不是在这里抛异常把请求打成 500
+  if (!Array.isArray(list)) return { messages: [], systemText: '' }
+  const out = []
+  const systemParts = [] // 收集所有 system 消息的正文，最后 join 成一份系统提示
+  for (const m of list) {
+    let content = m?.content
+    // 数组形态：只取 text part 拼接；非 text part（image_url 等）显式丢弃并注释，避免静默变成 [object Object]
+    if (Array.isArray(content)) {
+      content = content
+        .map(part => (typeof part === 'string' ? part : (part?.type === 'text' ? part.text : '')))
+        .join('')
+    }
+    content = String(content ?? '')
+    if (m?.role === 'system') {
+      // system 不进 messages，攒起来给 prepareChatStream 的 systemPrompt 参数
+      if (content) systemParts.push(content)
+    } else if (m?.role === 'user' || m?.role === 'assistant') {
+      out.push({ role: m.role, content })
+    } else if (m?.role === 'tool') {
+      // OpenAI 的 tool 结果带 tool_call_id（下划线），我们的是 toolCallId（驼峰）
+      out.push({ role: 'tool', content, toolCallId: m.tool_call_id })
+    }
+    // 其他未知 role（function 等历史遗留）直接忽略：宽容输入，拒绝的代价是整个请求 400
+  }
+  // 多条 system 按顺序拼成一份，中间空行分隔，语义等同 OpenAI 的多条 system 叠加
+  return { messages: out, systemText: systemParts.join('\n\n') }
+}
+
+app.post('/v1/chat/completions', requireAuth, async (req, res) => {
+  // ===== 1. 请求解析与校验：尽早失败、失败就说清原因 =====
+  const { messages, systemText } = openAiToChatMessages(req.body?.messages)
+  if (!messages.length) {
+    return res.status(400).json({ error: { message: 'messages 不能为空', type: 'invalid_request_error' } })
+  }
+  // OpenAI 客户端会传 model 字段，我们固定用服务端配置的模型：忽略它而不是报错，
+  // 这样客户端代码零改动也能跑（报错反而破坏"兼容"的初衷）。meta 里回真实模型名。
+  const stream = req.body?.stream === true
+  // 会话 id：OpenAI 协议没有这个概念，这里从扩展字段拿（curl 传 "x-session-id"）。
+  // 不传也能跑——附件/工具里用到会话的功能降级为不可用，纯问答完全正常。
+  const sessionId = typeof req.body?.x_session_id === 'string' ? req.body.x_session_id.slice(0, 64) : ''
+  const chatId = 'chatcmpl-' + randomUUID() // OpenAI 风格的响应 id，流式所有 chunk 共用
+  const runId = 'compat-' + randomUUID()    // 用量记账用的 runId，和 /agui 的 run 空间区分开
+  const userId = req.user.userId
+
+  // ===== 2. 组装工具集：只给服务端只读工具 =====
+  // 刻意不含审批工具（createApprovalTools）：审批交互依赖 AG-UI 的 interrupt/前端确认卡片，
+  // OpenAI 客户端没有这套 UI，模型一旦触发就会挂起。写操作走 /agui，兼容端点保持"能查询、不写库"。
+  const tools = createTools(sessionId, userId)
+  const abortController = new AbortController()
+  // 客户端中途断开要立刻停模型调用：否则 token 一直在烧，钱一直花。
+  // 坑：不能挂 req.on('close')——Node 16+ 的 IncomingMessage 'close' 在请求体读完
+  // 就触发（不是连接断开），会把刚发起的调用秒 abort。正确做法是挂 res 并区分
+  // "正常结束"（writableEnded=true）与"客户端提前断开"（=false 才 abort）。
+  res.on('close', () => {
+    if (!res.writableEnded) abortController.abort()
+  })
+
+  try {
+    const { result, meta } = prepareChatStream({
+      messages,
+      systemPrompt: systemText || undefined, // OpenAI 的 system 消息 → AI SDK 的 instructions
+      sessionId,
+      tools,
+      abortSignal: abortController.signal,
+      logTag: 'openai'
+    })
+
+    // ===== 3a. 流式：按 OpenAI chunk 格式逐段下发 =====
+    if (stream) {
+      // SSE 三件套头；express.json 不影响响应，这里手工写 SSE 帧
+      res.setHeader('Content-Type', 'text/event-stream; charset=utf-8')
+      res.setHeader('Cache-Control', 'no-cache') // 代理别缓存流
+      res.setHeader('Connection', 'keep-alive')
+      res.flushHeaders()
+      // OpenAI 流式协议：role 先声明（第一个 chunk，delta.content 为空），之后每个 chunk 带一段正文
+      const writeChunk = (delta, finishReason = null) => {
+        res.write(`data: ${JSON.stringify({
+          id: chatId,
+          object: 'chat.completion.chunk',
+          created: Math.floor(Date.now() / 1000),
+          model: meta.modelId,
+          choices: [{ index: 0, delta, finish_reason: finishReason }]
+        })}\n\n`)
+      }
+      writeChunk({ role: 'assistant' }) // 开头先发角色声明
+      for await (const delta of result.textStream) {
+        if (delta) writeChunk({ content: delta }) // 空串也发会浪费一帧，跳过
+      }
+      // 用量 chunk（可选，OpenAI 以 stream_options.include_usage 控制请求时才要求）：
+      // 无条件多发一帧不违反协议（客户端不读就忽略），但能让支持方直接拿到真实 token 数
+      const usage = await result.usage
+      if (usage) {
+        res.write(`data: ${JSON.stringify({
+          id: chatId, object: 'chat.completion.chunk',
+          created: Math.floor(Date.now() / 1000), model: meta.modelId,
+          choices: [], // usage chunk 按 OpenAI 规范 choices 为空数组
+          usage: {
+            prompt_tokens: Number(usage.inputTokens) || 0,
+            completion_tokens: Number(usage.outputTokens) || 0,
+            total_tokens: Number(usage.totalTokens) || 0
+          }
+        })}\n\n`)
+      }
+      writeChunk({}, 'stop') // 结尾 chunk：finish_reason 标 stop，客户端才知道生成完了
+      res.write('data: [DONE]\n\n') // OpenAI 流式的固定结束帧
+      res.end()
+    } else {
+      // ===== 3b. 非流式：等全量生成完，一次给齐 =====
+      const text = await result.text // text 是 Promise，resolve 即全部生成完毕
+      const usage = await result.usage
+      res.json({
+        id: chatId,
+        object: 'chat.completion',
+        created: Math.floor(Date.now() / 1000),
+        model: meta.modelId,
+        choices: [{
+          index: 0,
+          message: { role: 'assistant', content: text },
+          finish_reason: 'stop'
+        }],
+        usage: {
+          prompt_tokens: Number(usage?.inputTokens) || 0,
+          completion_tokens: Number(usage?.outputTokens) || 0,
+          total_tokens: Number(usage?.totalTokens) || 0
+        }
+      })
+    }
+
+    // ===== 4. 用量记账：与非流式/流式无关，生成结束都要记（失败只打日志，不影响响应） =====
+    const usage = await result.usage.catch(() => null) // 客户端断开时 usage 会 reject，别让它炸到 500
+    saveUsage({
+      threadId: sessionId || `compat-${userId}`, // 没传会话 id 就记到"兼容端点匿名"桶里，按人聚合仍然准确
+      runId,
+      userId,
+      model: meta.modelId,
+      usage,
+      steps: await result.steps.then(s => s.length).catch(() => 1)
+    })
+  } catch (err) {
+    console.error('[openai] 生成失败', err)
+    // 已经开始流式后才发现错误没法改状态码，只能按 OpenAI 惯例在流里发一帧错误再收尾
+    if (res.headersSent) {
+      res.write(`data: ${JSON.stringify({ error: { message: err.message, type: 'server_error' } })}\n\n`)
+      res.write('data: [DONE]\n\n')
+      res.end()
+    } else {
+      res.status(500).json({ error: { message: err.message, type: 'server_error' } })
+    }
+  }
+})
+
 // 审计查询：只返回自己的记录（管理员全局视图要等有了角色体系再做）
 app.get('/api/audit', (req, res) => {
   try {

@@ -58,11 +58,32 @@ function revokeSession(token) {
 /**
  * 鉴权中间件：所有业务端点的闸门。
  * 挂载顺序是关键——必须放在 /api/auth 路由之后，登录接口本身不能要求已登录。
+ *
+ * ===== 双凭证设计 =====
+ * Authorization: Bearer 后面跟两种东西，按前缀分流：
+ *   - sk-开头  → API Key（给脚本/程序用，见 api-keys.js）
+ *   - 其他     → 登录 session token（给人/浏览器用）
+ * 两条路最终都把身份挂到 req.user 上，下游接口不感知凭证类型差异；
+ * 需要区分的场景（如 key 管理接口只许本人浏览器操作）读 req.user.authType。
  */
 function requireAuth(req, res, next) {
   const header = req.headers.authorization || ''
   const token = header.startsWith('Bearer ') ? header.slice(7) : ''
   if (!token) return res.status(401).json({ error: '未登录，请先登录' })
+
+  // ---- 分支一：API Key ----
+  if (token.startsWith('sk-')) {
+    const apiKeyAuth = require('./api-keys') // 函数内 require 避免 auth.js <-> api-keys.js 循环依赖
+    const hit = apiKeyAuth.authenticateApiKey(token)
+    if (!hit) return res.status(401).json({ error: 'API Key 无效或已吊销' })
+    // key 只绑 userId，username 现查一次（审计、日志里都要写用户名）
+    const user = db.prepare('SELECT id, username FROM users WHERE id = ?').get(hit.userId)
+    if (!user) return res.status(401).json({ error: 'API Key 归属用户不存在' })
+    req.user = { userId: user.id, username: user.username, token: null, authType: 'api-key' }
+    return next()
+  }
+
+  // ---- 分支二：登录 session（原有逻辑不变） ----
   const row = db.prepare(`
     SELECT s.token, s.expires_at, u.id AS user_id, u.username
     FROM sessions s JOIN users u ON u.id = s.user_id
@@ -73,7 +94,7 @@ function requireAuth(req, res, next) {
     revokeSession(token) // 过期顺手清掉，不留给定时任务
     return res.status(401).json({ error: '登录已过期，请重新登录' })
   }
-  req.user = { userId: row.user_id, username: row.username, token }
+  req.user = { userId: row.user_id, username: row.username, token, authType: 'session' }
   next()
 }
 

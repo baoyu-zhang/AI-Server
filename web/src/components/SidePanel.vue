@@ -15,6 +15,9 @@
       <t-tab-panel value="usage" label="用量">
         <UsagePanel ref="usageRef" />
       </t-tab-panel>
+      <t-tab-panel value="keys" label="密钥">
+        <KeyPanel ref="keyRef" />
+      </t-tab-panel>
     </t-tabs>
   </aside>
 </template>
@@ -24,15 +27,17 @@ import { ref } from 'vue'
 import DocPanel from './DocPanel.vue'
 import CandidatePanel from './CandidatePanel.vue'
 import UsagePanel from './UsagePanel.vue'
+import KeyPanel from './KeyPanel.vue'
 
 // 候选人面板里的"评估 / 改状态"不自己发请求，而是让上层往对话里发一句话——
 // 这样改状态仍然走 interrupt 审批，不会出现"界面上点一下就把人淘汰了"的旁路。
 const emit = defineEmits<{ ask: [text: string] }>()
 
-const tab = ref<'docs' | 'candidates' | 'usage'>('docs')
+const tab = ref<'docs' | 'candidates' | 'usage' | 'keys'>('docs')
 const docRef = ref<InstanceType<typeof DocPanel> | null>(null)
 const candRef = ref<InstanceType<typeof CandidatePanel> | null>(null)
 const usageRef = ref<InstanceType<typeof UsagePanel> | null>(null)
+const keyRef = ref<InstanceType<typeof KeyPanel> | null>(null)
 
 // 上传/删除文档后候选人会变（简历入库即登记），顺手刷新候选人页
 function onDocsChanged() {
@@ -49,6 +54,8 @@ function onTabChange(value: string | number) {
   if (value === 'candidates') void candRef.value?.load()
   // 用量也是对话期间持续增长的数据，切过来时刷新
   if (value === 'usage') void usageRef.value?.load()
+  // 密钥列表不在对话里变动，但为了防"两处页面改了状态"，切过来也刷一次
+  if (value === 'keys') void keyRef.value?.load()
 }
 
 defineExpose({
