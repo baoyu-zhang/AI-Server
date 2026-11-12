@@ -75,6 +75,9 @@ export const useChatStore = defineStore('chat', {
     messageList: [] as ChatMessage[],
     // AG-UI 共享状态（STATE_SNAPSHOT / STATE_DELTA 的结果），每轮请求回传给服务端
     agentState: {} as Record<string, unknown>,
+    // 当前线程 id：必须持久化，否则刷新后前端另起新线程，
+    // 服务端落库的历史和新消息会对不上号
+    threadId: '',
     loading: false
   }),
   actions: {
@@ -84,7 +87,7 @@ export const useChatStore = defineStore('chat', {
   },
   // 只持久化消息与共享状态：loading 等运行时状态不能落盘，否则刷新后会一直禁用发送
   persist: {
-    pick: ['messageList', 'agentState']
+    pick: ['messageList', 'agentState', 'threadId']
   }
 })
 

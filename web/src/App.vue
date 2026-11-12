@@ -3,9 +3,12 @@
   <LoginGate v-if="!authed" @authenticated="onAuthenticated" />
   <!-- 登录后：整体两栏布局：左侧知识库文档栏 + 右侧聊天区 -->
   <div v-else class="app-shell">
-    <!-- 右上角账号角标：显示当前用户，登出后回到登录门 -->
+    <!-- 右上角账号角标：历史会话切换 + 当前用户 + 登出入口 -->
     <div class="account-badge">
+      <t-select class="thread-select" :value="threadSelectValue" :options="threadOptions" :loading="threadsLoading"
+        placeholder="历史会话" size="small" @visible-change="onThreadsVisible" @change="onPickThread" />
       <span class="account-badge__name">{{ currentUser?.username }}</span>
+      <t-button variant="text" size="small" @click="startNewThread">新会话</t-button>
       <t-button variant="text" size="small" @click="onLogout">退出</t-button>
     </div>
 
@@ -185,7 +188,7 @@ import SidePanel from './components/SidePanel.vue'
 // 登录门：未登录时替代整个主界面
 import LoginGate from './components/LoginGate.vue'
 // 鉴权：token 存取、请求头、401 统一处理
-import { isLoggedIn, currentUser, authHeaders, logout as apiLogout, setUnauthorizedHandler } from './api/auth'
+import { isLoggedIn, currentUser, authHeaders, logout as apiLogout, setUnauthorizedHandler, request } from './api/auth'
 // 引入文件上传组件类型定义
 import type { TdAttachmentItem } from '@tdesign-vue-next/chat/es/index'
 import { useChat } from '@tdesign-vue-next/chat/es/chat-engine'
@@ -224,6 +227,9 @@ async function onLogout() {
   // 清掉本地持久化的消息与共享状态：换账号登录时不能看到上一个人的会话
   chatStore.clearMessages()
   chatStore.agentState = {}
+  // 线程 id 一起作废：下一账号第一次进来自动回到新会话
+  chatStore.threadId = ''
+  threadsList.value = []
   authed.value = false
 }
 
@@ -267,11 +273,15 @@ function createSessionId() {
   return `s-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`
 }
 const sessionId = ref(createSessionId())
-// AG-UI 的线程标识：同一次对话复用，清空对话时轮换
+// AG-UI 的线程标识：同一次对话复用，清空对话时轮换。
+// 从持久化里恢复：刷新后必须继续写同一个线程，否则服务端落库的历史与新消息对不上
 function createThreadId() {
   return `t-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`
 }
-const threadId = ref(createThreadId())
+const threadId = ref(chatStore.threadId || createThreadId())
+watch(threadId, value => {
+  chatStore.threadId = value
+})
 // 根据消息状态返回要显示的操作按钮数组（名称只能是 copy/good/bad/replay/share）
 // - 始终显示复制、点赞、点踩、分享、重放（重放只作用于被点击的那条消息）
 function getMsgActions() {
@@ -956,6 +966,8 @@ function setupAgentEvents() {
       currentAiId(messageId)
       chatStore.loading = false
       persistViewSnapshotSoon()
+      // 服务端在 res.end 前已完成落库，这里刷新会话列表即可看到本轮对话
+      void refreshThreads()
     }),
     bus.on(EVENT_REQUEST_ABORT, ({ messageId }) => {
       const id = currentAiId(messageId)
@@ -1300,6 +1312,158 @@ function onStop() {
   void chatEngine.value?.abortChat().catch(() => {})
 }
 
+// ========== 会话历史：从服务端落库恢复 ==========
+// 后端每轮 run 在 /agui 的 finally 里把完整消息快照写进 SQLite（threads / thread_runs），
+// 这里负责把快照还原回引擎消息——重登/换设备/清缓存后界面不再空白。
+// 注意运行时口径不变：对话仍以客户端 messages 为准，落库只是恢复用的兜底副本。
+
+// 统一请求：auth.request 已带鉴权与 401 翻登录层，这里只补 JSON 解析与非 2xx 抛错
+async function fetchJson<T = Record<string, any>>(url: string): Promise<T> {
+  const res = (await request(url)) as unknown as Response
+  const body = await res.json().catch(() => ({}))
+  if (!res.ok) throw new Error(body?.error || `请求失败（${res.status}）`)
+  return body as T
+}
+
+type ThreadItem = { id: string; title: string; updated_at: number }
+
+const threadsList = ref<ThreadItem[]>([])
+const threadsLoading = ref(false)
+
+// 拉取当前账号的会话列表（服务端已按最近活跃排序，且只返回本人会话）
+async function refreshThreads() {
+  threadsLoading.value = true
+  try {
+    const body = await fetchJson<{ data: ThreadItem[] }>('/api/threads')
+    threadsList.value = Array.isArray(body?.data) ? body.data : []
+  } catch {
+    /* 历史拉不到不阻塞聊天，静默即可 */
+  } finally {
+    threadsLoading.value = false
+  }
+}
+
+// 服务端快照（AG-UI Message[]）-> 引擎消息（内容块格式）。
+// 快照里工具结果是独立的 role:'tool' 消息，这里按 toolCallId 配对塞回 toolcall 块：
+// 展示层（toolStepsOf）与下一轮请求（collectToolData 读 block.data.result）都从这里取
+function aguiToEngineMessages(list: Array<Record<string, any>>): EngineMessage[] {
+  const toolResults = new Map<string, string>()
+  for (const item of list) {
+    if (item.role === 'tool' && typeof item.toolCallId === 'string') {
+      toolResults.set(item.toolCallId, String(item.content ?? ''))
+    }
+  }
+  const out: EngineMessage[] = []
+  for (const item of list) {
+    if (item.role === 'user') {
+      out.push({
+        id: String(item.id),
+        role: 'user',
+        content: [{ type: 'text', data: String(item.content ?? '') }],
+        status: 'complete'
+      })
+      continue
+    }
+    if (item.role !== 'assistant') continue
+    const content: EngineContent[] = []
+    for (const call of item.toolCalls || []) {
+      const id = String(call?.id || '')
+      const args = call?.function?.arguments
+      content.push({
+        type: `toolcall-${call?.function?.name || id}-${id}`,
+        data: {
+          toolCallId: id,
+          toolCallName: String(call?.function?.name || ''),
+          args: typeof args === 'string' ? args : JSON.stringify(args ?? {}),
+          result: toolResults.get(id) || ''
+        },
+        status: 'complete',
+        strategy: 'append'
+      })
+    }
+    const text = String(item.content ?? '')
+    // 有正文补 markdown 块；纯工具调用消息没有正文，靠后续消息合并展示
+    if (text.trim() || !content.length) {
+      content.push({ type: 'markdown', data: text, status: 'complete', strategy: 'append' })
+    }
+    out.push({ id: String(item.id), role: 'assistant', content, status: 'complete' })
+  }
+  return out
+}
+
+// 加载某个历史会话：拉快照 -> 还原引擎消息 -> 接管 threadId
+async function loadThread(id: string) {
+  if (chatStore.loading) {
+    MessagePlugin.warning('回复生成中，请稍后再切换会话')
+    return
+  }
+  try {
+    const body = await fetchJson<{ messages: Array<Record<string, any>> }>(
+      `/api/threads/${encodeURIComponent(id)}/messages`
+    )
+    const snapshot: Array<Record<string, any>> = Array.isArray(body?.messages) ? body.messages : []
+    if (!snapshot.length) {
+      MessagePlugin.warning('该会话暂无可恢复的消息')
+      return
+    }
+    // 旧线程的挂起中断与运行时工具状态全部作废
+    pendingInterrupts = []
+    activeToolIds.clear()
+    toolCallNames.clear()
+    toolRounds = 0
+    abortRequested = false
+    activeAiId = ''
+    clearSidecars()
+    // setMessages 不在引擎公开类型里，与 onRetry 处一致地按运行时能力调用
+    ;(chatEngine.value as unknown as { setMessages: (items: unknown[], mode?: string) => void } | undefined)
+      ?.setMessages(aguiToEngineMessages(snapshot), 'replace')
+    // 服务端快照不含共享 state，下一轮从空 state 开始（引用来源等跨轮信息会丢，可接受）
+    chatStore.agentState = {}
+    threadId.value = id
+    // 附件按 sessionId 绑定，恢复会话不恢复附件，换新 id 避免旧附件被静默检索
+    sessionId.value = createSessionId()
+    persistViewSnapshot()
+    MessagePlugin.success('已恢复该会话')
+  } catch (err: any) {
+    MessagePlugin.error(err?.message || '恢复会话失败')
+  }
+}
+
+// 登录/刷新后本地为空时，自动恢复最近一个会话；本地有消息则不动
+async function initHistory() {
+  await refreshThreads()
+  const latest = threadsList.value[0]
+  if (latest && !engineList().length && latest.id !== threadId.value) {
+    await loadThread(latest.id)
+  }
+}
+
+watch(authed, value => {
+  // immediate 覆盖"带 token 直接刷新页面"的情况：此时 authed 初始就是 true，不会触发变更
+  if (value) void initHistory()
+}, { immediate: true })
+
+const threadOptions = computed(() =>
+  threadsList.value.map(item => ({ label: item.title || '未命名会话', value: item.id }))
+)
+// 当前线程还没落库（新会话没发过消息）时下拉里没有对应项，置空让组件显示 placeholder
+const threadSelectValue = computed(() =>
+  threadOptions.value.some(option => option.value === threadId.value) ? threadId.value : undefined
+)
+function onThreadsVisible(visible: boolean) {
+  // 打开下拉时拉一次最新列表：本轮对话刚结束的快照这时才进列表
+  if (visible) void refreshThreads()
+}
+function onPickThread(value: unknown) {
+  const id = typeof value === 'string' ? value : ''
+  if (id && id !== threadId.value) void loadThread(id)
+}
+// 主动开新会话：与清空按钮同一套逻辑（附件/中断/线程 id 全部轮换）
+function startNewThread() {
+  handleClear()
+  MessagePlugin.success('已开启新会话')
+}
+
 // ========== 附件上传 ==========
 const MAX_ATTACHMENTS = 5 // 单次对话最多 5 个附件
 const MAX_ATTACHMENT_SIZE = 20 * 1024 * 1024 // 单个附件上限 10MB
@@ -1508,6 +1672,15 @@ onUnmounted(() => teardownAgentEvents())
   border-radius: var(--td-radius-medium, 6px);
   font-size: var(--td-font-size-body-small, 12px);
   color: var(--td-text-color-secondary);
+}
+
+/* 历史会话下拉：窄宽度，标题截断展示 */
+.thread-select {
+  width: 168px;
+
+  :deep(.t-input) {
+    font-size: var(--td-font-size-body-small, 12px);
+  }
 }
 
 .app-shell__aside {
