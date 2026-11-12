@@ -21,7 +21,32 @@ const { startAutoBackup } = require('./backup') // SQLite 定时备份（VACUUM 
 const { saveRun, listThreads, getThreadMessages } = require('./threads-store') // 会话落库
 const { saveUsage, listUsage, sumUsage } = require('./usage-store') // 模型用量落库
 const { createApiKey, listApiKeys, revokeApiKey } = require('./api-keys') // API Key 签发/校验
+const db = require('./db') // SQLite 数据层（RBAC 引导直接写 users.role）
 const { EVENTS: WEBHOOK_EVENTS, addWebhook, listWebhooks, deleteWebhook, dispatchWebhook } = require('./webhook-store') // Webhook 事件通知
+
+// ===== RBAC 引导：启动时把 ADMIN_USERNAME 指定的用户提升为 admin =====
+// 为什么启动时做而不是注册时：注册时判断"是不是第一个用户"很脆弱（重装库、
+// 测试造数据都会改变结果）；环境变量是显式声明，改管理员 = 改 env 重启，可预期。
+// 库里 role 只存结果：env 没设时没有任何人是 admin，管理接口对所有人都 403（安全默认值）。
+{
+  const adminName = process.env.ADMIN_USERNAME
+  if (adminName) {
+    const updated = db.prepare("UPDATE users SET role = 'admin' WHERE username = ? AND role != 'admin'").run(adminName)
+    if (updated.changes) console.log('[rbac] 已提升管理员:', adminName)
+  }
+}
+
+/**
+ * requireAdmin —— 管理接口的角色闸门（必须挂在 requireAuth 之后：先有身份，再谈权限）。
+ * 为什么写中间件而不是每个接口里 if：判断逻辑一处收敛，漏判的风险只有"忘挂中间件"一种，
+ * 而且忘挂了接口还在 requireAuth 之后，最多是自己看自己——不会变成无鉴权的公开接口。
+ */
+function requireAdmin(req, res, next) {
+  if (req.user?.role !== 'admin') {
+    return res.status(403).json({ error: '需要管理员权限' })
+  }
+  next()
+}
 const {
   CANDIDATE_STATUS, // 状态白名单，工具入参的 enum 与写库校验共用一份
   listCandidates: listCandidateRecords,
@@ -1603,6 +1628,74 @@ app.get('/api/usage', (req, res) => {
     res.status(500).json({ error: err.message })
   }
 })
+
+// ============ 管理员接口（RBAC）============
+// 三个接口覆盖 admin 最核心的三种"俯视"需求：有哪些人、全体审计、全体成本。
+// 都要求 authType === 'session'：管理动作必须可追溯到"浏览器里的那个人"，
+// API Key 即使是 admin 签发的也不给管理权限——key 泄露的爆炸半径由此封顶。
+
+// 用户列表：含每人用量汇总（JOIN 一次拿齐，前端管理页一屏看完）
+app.get('/api/admin/users', requireAuth, requireAdmin, (req, res) => {
+  if (req.user.authType !== 'session') return res.status(403).json({ error: '管理操作请用网页登录后进行' })
+  try {
+    // LEFT JOIN：没用过模型的人也要出现在列表里（内连接会把他们藏掉）
+    const rows = db.prepare(`
+      SELECT u.id, u.username, u.role, u.created_at AS createdAt,
+             COUNT(mu.run_id) AS runs,
+             COALESCE(SUM(mu.total_tokens), 0) AS totalTokens
+      FROM users u
+      LEFT JOIN model_usage mu ON mu.user_id = u.id
+      GROUP BY u.id
+      ORDER BY u.created_at ASC
+    `).all()
+    res.json({ ok: true, data: rows })
+  } catch (err) {
+    console.error('读取用户列表失败', err)
+    res.status(500).json({ error: err.message })
+  }
+})
+
+// 全局审计：admin 看所有人的记录（对比 /api/audit 只看自己）。
+// 不复用 listAudit：它的 WHERE 是 user_id = ?（传 null 恒假）+ actor 匹配，
+// 语义就是"查某个人"，硬塞 null 会静默返回空列表——宁可这里写一条明确的 SQL。
+app.get('/api/admin/audit', requireAuth, requireAdmin, (req, res) => {
+  if (req.user.authType !== 'session') return res.status(403).json({ error: '管理操作请用网页登录后进行' })
+  try {
+    const n = Math.min(Math.max(Number(req.query.limit) || 50, 1), 200)
+    const data = db.prepare(`
+      SELECT id, user_id AS userId, actor, action, target, detail, ip, created_at AS createdAt
+      FROM audit_log ORDER BY created_at DESC, id DESC LIMIT ?
+    `).all(n)
+    res.json({ ok: true, data })
+  } catch (err) {
+    console.error('读取全局审计失败', err)
+    res.status(500).json({ error: err.message })
+  }
+})
+
+// 全局用量汇总：全体 token 消耗 + 按模型拆分（成本视角从"人"切到"账"）
+app.get('/api/admin/usage', requireAuth, requireAdmin, (req, res) => {
+  if (req.user.authType !== 'session') return res.status(403).json({ error: '管理操作请用网页登录后进行' })
+  try {
+    const totals = db.prepare(`
+      SELECT COUNT(*) AS runs, COALESCE(SUM(input_tokens), 0) AS inputTokens,
+             COALESCE(SUM(output_tokens), 0) AS outputTokens,
+             COALESCE(SUM(total_tokens), 0) AS totalTokens
+      FROM model_usage
+    `).get()
+    const byModel = db.prepare(`
+      SELECT model, COUNT(*) AS runs,
+             COALESCE(SUM(input_tokens), 0) AS inputTokens,
+             COALESCE(SUM(output_tokens), 0) AS outputTokens
+      FROM model_usage GROUP BY model ORDER BY SUM(total_tokens) DESC
+    `).all()
+    res.json({ ok: true, totals, byModel })
+  } catch (err) {
+    console.error('读取全局用量失败', err)
+    res.status(500).json({ error: err.message })
+  }
+})
+
 // 候选人列表：前端候选人表格的数据源
 // 与 listCandidates 工具读的是同一份数据，但两个出口的用途不同——
 //   工具 → 拼成一段文案给模型读；这里 → 结构化字段给表格渲染和筛选

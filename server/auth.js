@@ -76,16 +76,16 @@ function requireAuth(req, res, next) {
     const apiKeyAuth = require('./api-keys') // 函数内 require 避免 auth.js <-> api-keys.js 循环依赖
     const hit = apiKeyAuth.authenticateApiKey(token)
     if (!hit) return res.status(401).json({ error: 'API Key 无效或已吊销' })
-    // key 只绑 userId，username 现查一次（审计、日志里都要写用户名）
-    const user = db.prepare('SELECT id, username FROM users WHERE id = ?').get(hit.userId)
+    // key 只绑 userId，username/role 现查一次（审计、日志、权限判断都要用）
+    const user = db.prepare('SELECT id, username, role FROM users WHERE id = ?').get(hit.userId)
     if (!user) return res.status(401).json({ error: 'API Key 归属用户不存在' })
-    req.user = { userId: user.id, username: user.username, token: null, authType: 'api-key' }
+    req.user = { userId: user.id, username: user.username, role: user.role, token: null, authType: 'api-key' }
     return next()
   }
 
   // ---- 分支二：登录 session（原有逻辑不变） ----
   const row = db.prepare(`
-    SELECT s.token, s.expires_at, u.id AS user_id, u.username
+    SELECT s.token, s.expires_at, u.id AS user_id, u.username, u.role
     FROM sessions s JOIN users u ON u.id = s.user_id
     WHERE s.token = ?
   `).get(token)
@@ -94,7 +94,7 @@ function requireAuth(req, res, next) {
     revokeSession(token) // 过期顺手清掉，不留给定时任务
     return res.status(401).json({ error: '登录已过期，请重新登录' })
   }
-  req.user = { userId: row.user_id, username: row.username, token, authType: 'session' }
+  req.user = { userId: row.user_id, username: row.username, role: row.role, token, authType: 'session' }
   next()
 }
 
@@ -158,7 +158,7 @@ authRouter.post('/register', (req, res) => {
     .run(id, username, hashPassword(password), Date.now())
   registerHits.get(req.ip || 'unknown')?.push(Date.now())
   recordAudit({ userId: id, actor: username, action: 'auth.register', target: username, ip: req.ip })
-  res.json({ ok: true, token: createSession(id), user: { userId: id, username } })
+  res.json({ ok: true, token: createSession(id), user: { userId: id, username, role: 'user' } })
 })
 
 authRouter.post('/login', (req, res) => {
@@ -180,7 +180,7 @@ authRouter.post('/login', (req, res) => {
     return res.status(429).json({ error: `尝试次数过多，请 ${Math.ceil(wait / 60)} 分钟后再试` })
   }
 
-  const user = db.prepare('SELECT id, username, password_hash FROM users WHERE username = ?').get(username)
+  const user = db.prepare('SELECT id, username, password_hash, role FROM users WHERE username = ?').get(username)
   // 用户不存在和密码错误返回同一句话：提示"用户不存在"等于告诉攻击者哪些用户名是真实的
   if (!user || !verifyPassword(password, user.password_hash)) {
     const now = Date.now()
@@ -208,7 +208,7 @@ authRouter.post('/login', (req, res) => {
   // 2) 成功：清掉计数，记一条登录审计
   attempts.delete(key)
   recordAudit({ userId: user.id, actor: user.username, action: 'auth.login', target: user.username, ip: req.ip })
-  res.json({ ok: true, token: createSession(user.id), user: { userId: user.id, username: user.username } })
+  res.json({ ok: true, token: createSession(user.id), user: { userId: user.id, username: user.username, role: user.role } })
 })
 
 authRouter.post('/logout', (req, res) => {
@@ -219,7 +219,8 @@ authRouter.post('/logout', (req, res) => {
 })
 
 authRouter.get('/me', requireAuth, (req, res) => {
-  res.json({ ok: true, user: { userId: req.user.userId, username: req.user.username } })
+  // role 一并返回：前端据此决定是否显示「管理」页签，不用再猜
+  res.json({ ok: true, user: { userId: req.user.userId, username: req.user.username, role: req.user.role } })
 })
 
 module.exports = { authRouter, requireAuth, hashPassword, verifyPassword, createSession, revokeSession }

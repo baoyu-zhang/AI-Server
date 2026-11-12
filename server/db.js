@@ -101,4 +101,16 @@ CREATE INDEX IF NOT EXISTS idx_usage_user ON model_usage(user_id, created_at);
   }
 }
 
+// ===== RBAC：users.role 列（'user' 默认 / 'admin' 管理员） =====
+// 同样是幂等迁移：pragma 探测列不存在才 ALTER，重启任意次安全。
+// 谁是 admin 由 ADMIN_USERNAME 环境变量指定（见下方启动逻辑），
+// 数据库里只存结果——不存"配置来源"，环境变量丢了也不会出现无主的管理员。
+{
+  const userCols = db.prepare("PRAGMA table_info(users)").all().map(c => c.name)
+  if (!userCols.includes('role')) {
+    db.exec("ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'user';")
+    console.log('[db] users 已迁移：新增 role 列')
+  }
+}
+
 module.exports = db

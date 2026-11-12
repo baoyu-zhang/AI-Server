@@ -12,6 +12,7 @@ const USER_KEY = 'auth_user'
 export interface AuthUser {
   userId: string
   username: string
+  role?: 'user' | 'admin' // 可选：旧缓存里可能没有这个字段，缺省按普通用户处理
 }
 
 const user = ref<AuthUser | null>(JSON.parse(localStorage.getItem(USER_KEY) || 'null'))

@@ -21,6 +21,11 @@
       <t-tab-panel value="webhooks" label="通知">
         <WebhookPanel ref="whRef" />
       </t-tab-panel>
+      <!-- 管理页签只在 admin 登录时出现：前端隐藏是体验优化，
+           真正防线在服务端 requireAdmin（普通用户 curl 也会 403） -->
+      <t-tab-panel v-if="isAdmin" value="admin" label="管理">
+        <AdminPanel ref="adminRef" />
+      </t-tab-panel>
     </t-tabs>
   </aside>
 </template>
@@ -32,17 +37,24 @@ import CandidatePanel from './CandidatePanel.vue'
 import UsagePanel from './UsagePanel.vue'
 import KeyPanel from './KeyPanel.vue'
 import WebhookPanel from './WebhookPanel.vue'
+import AdminPanel from './AdminPanel.vue'
+import { computed } from 'vue'
+import { currentUser } from '../api/auth'
 
 // 候选人面板里的"评估 / 改状态"不自己发请求，而是让上层往对话里发一句话——
 // 这样改状态仍然走 interrupt 审批，不会出现"界面上点一下就把人淘汰了"的旁路。
 const emit = defineEmits<{ ask: [text: string] }>()
 
-const tab = ref<'docs' | 'candidates' | 'usage' | 'keys' | 'webhooks'>('docs')
+const tab = ref<'docs' | 'candidates' | 'usage' | 'keys' | 'webhooks' | 'admin'>('docs')
 const docRef = ref<InstanceType<typeof DocPanel> | null>(null)
 const candRef = ref<InstanceType<typeof CandidatePanel> | null>(null)
 const usageRef = ref<InstanceType<typeof UsagePanel> | null>(null)
 const keyRef = ref<InstanceType<typeof KeyPanel> | null>(null)
 const whRef = ref<InstanceType<typeof WebhookPanel> | null>(null)
+const adminRef = ref<InstanceType<typeof AdminPanel> | null>(null)
+
+// 当前登录用户是否管理员：role 字段来自登录响应/旧缓存（缺省 undefined 按 non-admin）
+const isAdmin = computed(() => currentUser.value?.role === 'admin')
 
 // 上传/删除文档后候选人会变（简历入库即登记），顺手刷新候选人页
 function onDocsChanged() {
@@ -63,6 +75,8 @@ function onTabChange(value: string | number) {
   if (value === 'keys') void keyRef.value?.load()
   // Webhook 列表同理
   if (value === 'webhooks') void whRef.value?.load()
+  // 管理页：数据随时会被其他用户改变，每次切入都重新拉
+  if (value === 'admin') void adminRef.value?.load()
 }
 
 defineExpose({
