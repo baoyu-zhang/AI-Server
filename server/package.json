@@ -4,6 +4,12 @@
   "description": "",
   "main": "index.js",
   "scripts": {
+    "start": "node index.js",
+    "dev": "LOG_LEVEL=debug node index.js",
+    "logs": "bash ../scripts/logs.sh",
+    "logs:err": "bash ../scripts/logs.sh err",
+    "logs:ls": "bash ../scripts/logs.sh ls",
+    "db": "node ../scripts/db.mjs",
     "test": "echo \"Error: no test specified\" && exit 1",
     "test:agui": "node test-agui-protocol.mjs",
     "eval": "node eval/run-eval.js",

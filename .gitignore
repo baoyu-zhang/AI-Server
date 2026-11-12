@@ -6,6 +6,7 @@ node_modules
 
 # 日志
 *.log
+server/logs/
 npm-debug.log*
 
 # 向量库、上传文件缓存（本地 RAG 运行时产物，不进仓库）

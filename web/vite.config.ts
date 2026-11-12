@@ -5,7 +5,11 @@ import { defineConfig } from 'vite'
 export default defineConfig({
   plugins: [vue()],
   server: {
-    port: 8080,
+    // 固定 8082 并 strictPort：不加 strictPort 时端口被占 vite 会静默 +1，
+    // 于是同一份代码跑出 8081/8082 两个实例，localStorage 按端口隔离，
+    // 登录态和本地快照互不相通——排查时会误判成"改了没生效"
+    port: 8082,
+    strictPort: true,
     proxy: {
       '/api': {
         target: 'http://127.0.0.1:3000',

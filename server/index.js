@@ -1,3 +1,6 @@
+// 结构化日志必须第一个加载：它要接管 stdout/stderr 把输出落盘，
+// 晚于 dotenv/其他模块加载的话，启动期那几行（injected env、模型加载）就漏了
+const { log, httpLog } = require('./logger')
 require('dotenv').config() // 加载 .env 中的环境变量（DEEPSEEK_API_KEY）
 const express = require('express') // 引入 Express 框架
 const { tool, jsonSchema } = require('ai') // 引入 AI SDK 的工具定义与 JSON Schema 适配（流式主链路已抽到 chat-core.js）
@@ -13,7 +16,6 @@ const { addSessionFile, addSessionImage, deleteSessionFile, getSessionFiles, sea
 const { prepareChatStream, MAX_CONTEXT_TOKENS } = require('./chat-core') // 聊天主链路（裁剪/附件/选模型/streamText）
 const { scoreResumeAgainstJD } = require('./score-resume') // 招聘场景的领域能力：简历 × JD 匹配度评估
 const { authRouter, requireAuth } = require('./auth') // 注册/登录 + 全局鉴权闸门
-const { log, httpLog } = require('./logger') // 结构化日志：JSON 行 + 级别开关
 const { saveRun, listThreads, getThreadMessages } = require('./threads-store') // 会话落库
 const {
   CANDIDATE_STATUS, // 状态白名单，工具入参的 enum 与写库校验共用一份
