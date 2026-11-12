@@ -112,6 +112,7 @@
 
 | 看到什么 | 原因 | 怎么做 |
 |---|---|---|
+| `Root directory "baoyu-zhang/AI-Server" was not found in the deployed source` | Root Directory 被自动填成了仓库名，但它是**仓库内子目录**路径 | Settings → Source → Root Directory 改成 `/`（或清空）→ 保存 → Redeploy。详见 2.3 节 |
 | `Undeployed service` / `There is no active deployment for this service` | 只 Apply 了变更，从没触发过构建 | 点页面中间的 **`Make a deployment to get started.`**。注意 staged change 应用后顶部 `Deploy` 横幅会消失，别再找它；也可 Cmd/Ctrl+K → `Deploy latest commit` |
 | `❌ .env 缺少 DEEPSEEK_API_KEY` | `index.js:203` 是硬检查，缺了直接 `exit(1)` | Variables 补 `DEEPSEEK_API_KEY` |
 | `[security] 生产配置自检未通过：ADMIN_PASSWORD 是弱口令` | `security.js` 的 `WEAK_PASSWORDS` 会拦 `admin`、纯数字短口令等常见弱口令（含本机 `.env` 里的演示口令） | 换 ≥12 位随机串：`openssl rand -hex 16` |

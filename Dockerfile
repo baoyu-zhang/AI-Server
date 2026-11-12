@@ -27,6 +27,13 @@ RUN npm run build
 # ---------- 阶段 2：运行镜像 ----------
 FROM node:22-bookworm-slim AS app
 WORKDIR /app
+# 运行阶段必须补 libgomp1：@xenova/transformers → onnxruntime-node 的 Linux 预编译二进制
+# 链接了 GCC 的 OpenMP 运行时（libgomp.so.1），而 bookworm-slim 为了体积把它裁掉了。
+# index.js 第 14 行是【顶层】require('./rag-vector')，后者又顶层 require('@xenova/transformers')，
+# 所以缺这个库不是「用到知识库才崩」，而是容器一启动就 dlopen 失败、服务直接退出。
+# 本机 macOS 用 dylib 不会暴露这个问题，只有 Linux slim 镜像会踩，属于典型的「本地能跑云上崩」。
+RUN apt-get update && apt-get install -y --no-install-recommends libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
 ENV NODE_ENV=production \
     APP_DATA_DIR=/app/data \
     LOG_TO_FILE=0 \
