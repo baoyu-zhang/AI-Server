@@ -985,7 +985,11 @@ function setupAgentEvents() {
         persistViewSnapshotSoon()
         return
       }
-      if (id) errorByMessageId.set(id, (error as any)?.message || '请求出错')
+      if (id) {
+        const message = (error as any)?.message || '请求出错'
+        errorByMessageId.set(id, message)
+        notifyRunError(message)
+      }
       abandonActiveTools('请求出错，工具未执行')
       persistViewSnapshotSoon()
     }),
@@ -997,7 +1001,11 @@ function setupAgentEvents() {
         persistViewSnapshotSoon()
         return
       }
-      if (activeAiId) errorByMessageId.set(activeAiId, (error as any)?.message || '请求出错')
+      if (activeAiId) {
+        const message = (error as any)?.message || '请求出错'
+        errorByMessageId.set(activeAiId, message)
+        notifyRunError(message)
+      }
       abandonActiveTools('请求出错，工具未执行')
       persistViewSnapshotSoon()
     })
@@ -1116,6 +1124,17 @@ function abandonPendingInterrupts() {
     activeToolIds.delete(toolCallId)
   }
   pendingInterrupts = []
+}
+
+// 请求失败的统一提示：气泡内标红之外必须再弹全局 toast——
+// 否则失败淹没在聊天流里，用户以为发出去了，实际请求没到服务端（会话也就不会落库）
+function notifyRunError(raw?: unknown) {
+  const message = String((raw as any)?.message || raw || '请求出错')
+  if (/401|unauthorized|登录已失效/i.test(message)) {
+    MessagePlugin.error('登录已失效，请重新登录')
+  } else {
+    MessagePlugin.error(`发送失败：${message}`)
+  }
 }
 
 // 每次发起 run 前重置本轮工具状态
