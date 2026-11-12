@@ -88,7 +88,8 @@
 
 1. Service → **Volumes** → **New Volume**
 2. Mount Path 填：`/app/data`（必须与 `APP_DATA_DIR` 完全一致，大小写敏感）
-3. Size：演示 1GB 起，建议 5GB（Hobby）
+3. Size：**试用计划上限 0.5GB，填 0.5GB**（纯聊天够用，见 2.1 节）；
+   Hobby 计划可填 5GB，需要开知识库检索时再升级
 4. Create → Railway 会自动重新部署
 
 为什么只有这一个目录：所有运行时状态都收敛到了 `server/paths.js` 里定义的 `APP_DATA_DIR`
