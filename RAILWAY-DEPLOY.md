@@ -51,6 +51,30 @@
 > 如果面板里 Builder 没自动切到 Dockerfile，到 **Service → Settings → Build** 手动选 Dockerfile，
 > 并把 Config File 路径写成 `/railway.json`（注意是仓库根的绝对路径）。
 
+### 2.1 新版控制台（Staged Changes）该怎么点
+
+新界面把「新建服务」变成一条**待应用变更**，画布上显示 `Service will be created`、
+顶部出现 `Apply 1 change` / `Details` / `Deploy`。这不是部署失败，是服务还没真正创建。
+按这个顺序点，别一进来就 Deploy：
+
+1. **Settings → Source → Connect Repo**：确认已关联 `baoyu-zhang/AI-Server` 的 `main` 分支。
+   如果这里还显示 `Connect Repo` / `Connect Image` 两个按钮，说明仓库没连上，先连；
+   显示的是仓库名 + 分支名才是已连好。没连仓库就 Deploy 会得到一个空服务。
+2. **Root Directory 保持 `/`**（截图里已正确）。这是 CLI 部署时的子目录，**不要**改成 `/server`，
+   否则根 `Dockerfile` / `railway.json` / `web/` 都读不到。
+3. **Variables 页签**：先把第四节那 5 个必填变量填完。缺 `DEEPSEEK_API_KEY` 会让容器
+   `exit(1)` 反复重启，白烧试用额度。
+4. 再点顶部 **`Deploy`**：它会把那条 staged change 一起提交并触发首次构建
+   （只想应用配置、不触发构建，用 `Apply 1 change`，等价官方的 Alt + Deploy）。
+5. 服务真正创建出来之后，才挂卷：**Variables 页签往下滚到 Volumes**（部分版本在
+   Settings → Volumes）→ New Volume → Mount Path 填 `/app/data` → 自动重新部署。
+   > 面板不允许在创建前挂卷也没关系：顺序改成「填变量 → Deploy → 挂卷 → 自动重新部署」，
+   > 只要**在产生真实数据之前**挂好就行，此时还没有数据可丢。
+6. 最后 Networking → **Generate Domain**，再按第五节验证。
+
+> 右上角 `8 days or $3.91 left` 的含义：试用剩 8 天**或**剩 $3.91 额度，谁先到算谁。
+> 所以先把配置一次填对再部署，别用「反复重试」去试错，失败重启也在计费。
+
 ---
 
 ## 三、先挂 Volume（最关键，别跳过）
