@@ -21,6 +21,7 @@ const { startAutoBackup } = require('./backup') // SQLite 定时备份（VACUUM 
 const { saveRun, listThreads, getThreadMessages } = require('./threads-store') // 会话落库
 const { saveUsage, listUsage, sumUsage } = require('./usage-store') // 模型用量落库
 const { createApiKey, listApiKeys, revokeApiKey } = require('./api-keys') // API Key 签发/校验
+const { EVENTS: WEBHOOK_EVENTS, addWebhook, listWebhooks, deleteWebhook, dispatchWebhook } = require('./webhook-store') // Webhook 事件通知
 const {
   CANDIDATE_STATUS, // 状态白名单，工具入参的 enum 与写库校验共用一份
   listCandidates: listCandidateRecords,
@@ -988,26 +989,27 @@ app.post('/agui', async (req, res) => {
         const interruptOps = [{ op: 'replace', path: '/phase', value: 'interrupted' }]
         applyStateOps(finalState, interruptOps)
         send({ type: 'STATE_DELTA', delta: interruptOps })
+        const interrupts = pendingApprovals.map(item => ({
+          id: `${INTERRUPT_PREFIX}${item.toolCallId}`,
+          reason: 'approval',
+          message: approvalMessage(item),
+          toolCallId: item.toolCallId,
+          responseSchema: {
+            type: 'object',
+            properties: { approved: { type: 'boolean', description: '是否允许执行该操作' } },
+            required: ['approved']
+          },
+          metadata: { toolName: item.toolName, input: item.input }
+        }))
         send({
           type: 'RUN_FINISHED',
           threadId,
           runId,
-          outcome: {
-            type: 'interrupt',
-            interrupts: pendingApprovals.map(item => ({
-              id: `${INTERRUPT_PREFIX}${item.toolCallId}`,
-              reason: 'approval',
-              message: approvalMessage(item),
-              toolCallId: item.toolCallId,
-              responseSchema: {
-                type: 'object',
-                properties: { approved: { type: 'boolean', description: '是否允许执行该操作' } },
-                required: ['approved']
-              },
-              metadata: { toolName: item.toolName, input: item.input }
-            }))
-          }
+          outcome: { type: 'interrupt', interrupts }
         })
+        // Webhook：有人要等审批了——通知外部系统（如推送到群机器人提醒用户去网页确认）。
+        // fire-and-forget 不 await：通知不能拖慢本次响应的收尾
+        dispatchWebhook(userId, 'approval.pending', { threadId, runId, interrupts })
       } else {
         const doneOps = [{ op: 'replace', path: '/phase', value: 'done' }]
         applyStateOps(finalState, doneOps)
@@ -1046,6 +1048,15 @@ app.post('/agui', async (req, res) => {
           model: chatStream.meta.modelId,
           usage,
           steps: chatStream.result.steps?.length
+        })
+        // Webhook：run 结束（正常/审批挂起/中断都算）——给外部系统对账、记录用
+        dispatchWebhook(userId, 'run.finished', {
+          threadId,
+          runId,
+          phase: finalState?.phase || 'done',   // done / interrupted：接收方可据此区分要不要提醒审批
+          model: chatStream.meta.modelId,
+          inputTokens: usage?.inputTokens || 0, // 真实 token，口径与 /api/usage 一致
+          outputTokens: usage?.outputTokens || 0
         })
       } catch (err) {
         log.error('[usage] 用量记录失败', { threadId, runId, err: err?.message })
@@ -1524,6 +1535,48 @@ app.post('/v1/chat/completions', requireAuth, async (req, res) => {
     } else {
       res.status(500).json({ error: { message: err.message, type: 'server_error' } })
     }
+  }
+})
+
+// ============ Webhook 管理 ============
+// 与 API Key 同一原则：管理操作只许 session 凭证（浏览器本人），
+// 否则泄露的 key 能改通知地址把事件导走，等于给攻击者开了一条数据外带通道。
+
+// 注册：secret 只在这一次响应里出现，接收方要拿它校验请求签名
+app.post('/api/webhooks', requireAuth, (req, res) => {
+  if (req.user.authType !== 'session') {
+    return res.status(403).json({ error: 'API Key 不能管理 Webhook，请在网页登录后操作' })
+  }
+  try {
+    const record = addWebhook(req.user.userId, req.body?.url, req.body?.events)
+    recordAudit({ userId: req.user.userId, actor: req.user.username, action: 'webhook.create', target: record.url, ip: req.ip })
+    res.json({ ok: true, ...record }) // id/url/events/secret
+  } catch (err) {
+    // assertSafeUrl 抛的都是给用户看的文案，400 而不是 500
+    res.status(400).json({ error: err.message })
+  }
+})
+
+// 列表：不含 secret（接收方自己持有），只看地址、订阅事件、状态
+app.get('/api/webhooks', requireAuth, (req, res) => {
+  if (req.user.authType !== 'session') {
+    return res.status(403).json({ error: 'API Key 不能管理 Webhook，请在网页登录后操作' })
+  }
+  res.json({ ok: true, data: listWebhooks(req.user.userId), events: WEBHOOK_EVENTS })
+})
+
+// 删除
+app.post('/api/webhooks/:id/delete', requireAuth, (req, res) => {
+  if (req.user.authType !== 'session') {
+    return res.status(403).json({ error: 'API Key 不能管理 Webhook，请在网页登录后操作' })
+  }
+  try {
+    const ok = deleteWebhook(req.user.userId, req.params.id)
+    if (!ok) return res.status(404).json({ error: 'Webhook 不存在' })
+    recordAudit({ userId: req.user.userId, actor: req.user.username, action: 'webhook.delete', target: req.params.id, ip: req.ip })
+    res.json({ ok: true })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
   }
 })
 
