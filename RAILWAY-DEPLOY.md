@@ -114,7 +114,7 @@
 |---|---|---|
 | `Undeployed service` / `There is no active deployment for this service` | 只 Apply 了变更，从没触发过构建 | 点页面中间的 **`Make a deployment to get started.`**。注意 staged change 应用后顶部 `Deploy` 横幅会消失，别再找它；也可 Cmd/Ctrl+K → `Deploy latest commit` |
 | `❌ .env 缺少 DEEPSEEK_API_KEY` | `index.js:203` 是硬检查，缺了直接 `exit(1)` | Variables 补 `DEEPSEEK_API_KEY` |
-| `[security] 生产配置自检未通过：ADMIN_PASSWORD 是弱口令` | `security.js` 的 `WEAK_PASSWORDS` 会拦本地默认口令 `123456` / `admin` 等 | 换 ≥12 位随机串：`openssl rand -hex 16` |
+| `[security] 生产配置自检未通过：ADMIN_PASSWORD 是弱口令` | `security.js` 的 `WEAK_PASSWORDS` 会拦 `admin`、纯数字短口令等常见弱口令（含本机 `.env` 里的演示口令） | 换 ≥12 位随机串：`openssl rand -hex 16` |
 | `生产配置自检未通过：数据目录不可写` | Volume 没挂、或挂载路径不是 `/app/data` | 按第三节挂卷后重新部署 |
 | Build Logs 里 `npm ci` / `COPY` 失败 | Dockerfile 构建阶段问题 | 复制完整 Build Logs 再对着改 |
 | 部署列表为空，且 Source 仍显示 `Connect Repo` | 只授权了 GitHub App，**没在 Railway 里选仓库** | 回 Settings → Source 选 `AI-Server` / `main` |
@@ -122,7 +122,35 @@
 | Connect Repo 点开后仓库下拉是空的 | GitHub App 只授权了别的仓库，或安装事件没同步 | GitHub → Settings → Applications → Railway → Configure 勾上 `AI-Server`；回 Railway 刷新，必要时把 All ↔ Only 切换保存一次 |
 
 > 最容易踩的两个组合：① 以为 GitHub 授权完仓库就自动连上了，其实还要在 Railway 选一次；
-> ② 把本机的 `ADMIN_PASSWORD=123456` 照抄到云上，被生产自检拦下，表现为容器反复重启、服务一直 offline。
+> ② 把本机 `.env` 里的短口令照抄到云上，被生产自检拦下，表现为容器反复重启、服务一直 offline。
+
+### 2.3 连上仓库后冒出随机服务名 / Root Directory 被填成仓库名
+
+新版控制台的 `Connect Repo` 有时会变成「**用这个仓库新建一个服务**」，于是画布上出现
+一个随机名服务（如 `charming-flow`，带 `NEW` 标），同时把原来那个空服务标成
+`Service will be deleted`，顶部变成 `Apply N changes`。这是正常行为：旧服务从没部署过、
+没有域名也没有卷，删掉没有数据损失；服务名只是显示名，之后可在 Settings 里改回去。
+
+**但有两件事必须处理，否则第一次构建必失败：**
+
+| 现象 | 问题 | 怎么做 |
+|---|---|---|
+| Root Directory 被自动填成 `baoyu-zhang/AI-Server` | 这是**仓库内的子目录**路径，不是仓库名。根 Dockerfile 里有 `COPY server/...` 和 `COPY web/...`，构建上下文必须是仓库根 | 清空或填 **`/`**，改完再 Apply；保持 `/` 也是 `railway.json` 能被读到的前提 |
+| 旧服务上填过的 Variables / 挂过的卷 | 变量与卷是**服务级**配置，换服务不会自动迁移 | 在新服务的 Variables 页签重新确认 5 项，重新挂卷 `/app/data` |
+
+推荐顺序（省额度，别一上来就 Deploy）：
+
+1. 先把 Root Directory 改成 `/`。
+2. 点 `Details` 扫一眼 N 条变更，确认只是「新建服务 + 删除旧空服务 + Source 配置」。
+3. 点 **`Apply N changes`** 让服务实体就位（`Deploy` 会同时触发构建，变量没齐就白跑）。
+   若 Apply 自己就开始了构建，别慌：那次大概率因缺 `DEEPSEEK_API_KEY` 快速失败，补齐后再 Redeploy 即可。
+4. 在新服务 **Variables** 补齐 5 项 → 挂卷 `/app/data`（0.5GB）→ 再触发 **Deploy**。
+5. Build Logs 里应看到两阶段：`web` 构建 `npm ci && npm run build`，`app` 构建 `npm ci --omit=dev`；
+   Deploy Logs 出现 health 200 后 Networking → Generate Domain。
+
+> `Wait for CI` 保持**关闭**：仓库里没有 GitHub Actions，打开会一直等不到 CI 结果而不部署。
+> `Source Repo` 显示 `baoyu-zhang/AI-Server`、`Branch connected to production` 显示 `main`，
+> 这两项对了就说明代码来源已经通了。
 
 ---
 
