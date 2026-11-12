@@ -217,6 +217,7 @@ const docDrawerVisible = ref(false)
 const authed = ref(isLoggedIn())
 setUnauthorizedHandler(() => {
   authed.value = false
+  resetChatState()
   MessagePlugin.warning('登录已失效，请重新登录')
 })
 function onAuthenticated() {
@@ -224,13 +225,30 @@ function onAuthenticated() {
 }
 async function onLogout() {
   await apiLogout()
-  // 清掉本地持久化的消息与共享状态：换账号登录时不能看到上一个人的会话
+  resetChatState()
+  authed.value = false
+}
+
+// 退出/换账号时把"对话状态"全部归零。
+// 注意 messages 有引擎和 pinia 两份真相源：只清 pinia 的话，下一个账号进来会先渲染上一个人的对话，
+// 要等刷新（引擎按空快照重建）才消失
+function resetChatState() {
   chatStore.clearMessages()
   chatStore.agentState = {}
-  // 线程 id 一起作废：下一账号第一次进来自动回到新会话
+  ;(chatEngine.value as unknown as { setMessages: (items: unknown[], mode?: string) => void } | undefined)
+    ?.setMessages([], 'replace')
+  clearSidecars()
+  pendingInterrupts = []
+  approvalByToolCallId.clear()
+  activeToolIds.clear()
+  toolCallNames.clear()
+  toolRounds = 0
+  abortRequested = false
+  activeAiId = ''
+  // 线程 id 作废：沿用旧 id 会被服务端归属校验拒绝写入，等于新账号的对话全丢
   chatStore.threadId = ''
+  threadId.value = createThreadId()
   threadsList.value = []
-  authed.value = false
 }
 
 // 全局聊天仓库实例
@@ -1410,15 +1428,27 @@ function aguiToEngineMessages(list: Array<Record<string, any>>): EngineMessage[]
   return out
 }
 
-// 引擎在 onMounted 里异步 init（new ChatEngine + await init），
-// watch immediate 在 setup 阶段触发时 chatEngine 还是 null，setMessages 会被 optional
-// chaining 静默吞掉——恢复就"看起来没执行"。这里轮询等它就绪再动
-async function waitForEngine(timeoutMs = 3000): Promise<boolean> {
+// 引擎在 onMounted 里异步 init（new ChatEngine + await init），chatEngine 在 new 出来时就非空，
+// 但 messageStore 要等 init() 里的 initialize(defaultMessages) 才就绪。
+// 只判非空会让 setMessages 先写、init 随后用本地旧快照覆盖——恢复出来的对话是旧的，
+// 再发消息还会和旧消息叠成两条一样的用户气泡。
+// init() 的末尾才创建 streamHandler，公开 getter engine.agui 此时才非空，用它当就绪信号
+async function waitForEngine(timeoutMs = 5000): Promise<boolean> {
+  const ready = () => {
+    const engine = chatEngine.value as unknown as { agui?: unknown; config?: unknown } | null
+    return Boolean(engine && (engine.agui || engine.config))
+  }
   const deadline = Date.now() + timeoutMs
-  while (!chatEngine.value && Date.now() < deadline) {
+  while (Date.now() < deadline) {
+    if (ready()) return true
     await new Promise(resolve => setTimeout(resolve, 50))
   }
-  return Boolean(chatEngine.value)
+  // 库升级后信号若失效，超时也不能直接判失败：有引擎就尽力恢复，只是可能回到旧行为
+  if (chatEngine.value) {
+    console.warn('[history] 引擎就绪信号超时，按尽力模式继续恢复')
+    return true
+  }
+  return false
 }
 
 // 加载某个历史会话：拉快照 -> 还原引擎消息 -> 接管 threadId
@@ -1431,6 +1461,8 @@ async function loadThread(id: string) {
     MessagePlugin.error('聊天引擎尚未就绪，请稍后重试')
     return
   }
+  // 恢复期间锁住发送：半恢复状态下发消息会把上下文拼错（曾出现两条一样的用户气泡）
+  chatStore.loading = true
   try {
     const body = await fetchJson<{ messages: Array<Record<string, any>> }>(
       `/api/threads/${encodeURIComponent(id)}/messages`
@@ -1462,6 +1494,9 @@ async function loadThread(id: string) {
     MessagePlugin.success('已恢复该会话')
   } catch (err: any) {
     MessagePlugin.error(err?.message || '恢复会话失败')
+  } finally {
+    // 恢复结束（成功/失败/无快照）都要解锁输入，否则聊天框会一直禁用
+    chatStore.loading = false
   }
 }
 
