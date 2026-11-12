@@ -199,19 +199,29 @@ function createTools(sessionId, userId) {
           searchResult = mergeByRank([knowledge, attachments], topK)
         }
         // 空结果也必须是合法返回：让模型明确知道"查了但没有"，而不是让它自由发挥编一个答案
-        if (!searchResult.length) return { text: '知识库和本次会话附件中都没有检索到相关内容', sources: [] }
+        if (!searchResult.length) return { text: '知识库和本次会话附件中都没有检索到相关内容。请直接告诉用户知识库中没有找到相关内容，不要凭记忆猜测。', sources: [] }
+        // 无答案兜底②：弱相关命中的防护。检索永远会返回 topK（哪怕全是噪声），
+        // 模型看到"有片段"就容易硬答。分数低于阈值时在工具结果里追加诚实约束——
+        // 提示写在工具结果里比写在 system 里更有效：模型正在消费这段内容，注意力在这里。
+        // 阈值取 0.2：RRF 归一化后单路命中最高 0.5，低于 0.2 基本只有一路弱命中（噪声）。
+        // 可用 RAG_LOW_SCORE 环境变量覆盖
+        const LOW_SCORE = Number(process.env.RAG_LOW_SCORE) || 0.2
+        const allWeak = searchResult.every(item => item.score < LOW_SCORE)
         // 返回值有两个通道，别混：
         //   text   → 拼成一段话给模型读（模型看不到 sources 结构）
         //   sources → 结构化对象给前端渲染【引用来源】，走 JSON 序列化，不会被转义成字面 \n
+        // ① 给模型读的文本。三个细节都是刻意的：
+        //   【片段N】让模型能说"根据片段2"，人也能对上号；
+        //   写出相关度，低分时模型自己会更谨慎（这是最便宜的"置信度提示"）；
+        //   标出来源文件名，避免模型把附件内容说成知识库内容。
+        //   score 是"融合相关度"（两路/两源都命中才接近 1），不是余弦相似度，所以不能写成"相似度"。
+        //   尾部固定追加"先判断覆盖再回答"的诚实约束；全部弱相关时再加一档强提醒
+        const baseText = searchResult
+          .map((item, i) => `【片段${i + 1}】相关度：${item.score.toFixed(3)}\n来源：${item.fileName}${item.sourceType === 'attachment' ? '（本次会话附件）' : ''}\n${item.content}`)
+          .join('\n\n')
+        const honestyNote = `\n\n回答规则：先判断片段内容是否真正覆盖了用户的问题。只有片段确实包含答案时才依据片段回答；如果片段只是沾边（比如问年假却只检索到简历），或者全部相关度都很低，请明确告诉用户"知识库中没有找到这方面的内容"，不要基于弱相关片段拼凑或编造答案。`
         return {
-          // ① 给模型读的文本。三个细节都是刻意的：
-          //   【片段N】让模型能说"根据片段2"，人也能对上号；
-          //   写出相关度，低分时模型自己会更谨慎（这是最便宜的"置信度提示"）；
-          //   标出来源文件名，避免模型把附件内容说成知识库内容。
-          //   score 是"融合相关度"（两路/两源都命中才接近 1），不是余弦相似度，所以不能写成"相似度"。
-          text: searchResult
-            .map((item, i) => `【片段${i + 1}】相关度：${item.score.toFixed(3)}\n来源：${item.fileName}${item.sourceType === 'attachment' ? '（本次会话附件）' : ''}\n${item.content}`)
-            .join('\n\n'),
+          text: baseText + honestyNote + (allWeak ? '\n\n⚠️ 特别提醒：以上所有片段的相关度都低于 0.2，大概率与问题无关，请直接回答知识库中未找到。' : ''),
           // ② 给前端渲染的结构化数据。score 用 Number 包一层保持数字类型
           //   （toFixed 返回字符串，前端拿去做排序/阈值判断会变成字符串比较，'0.9' < '0.85' 这种坑）
           // chunkIndex/fileId 给"查看原文上下文"用：点击引用取前后段，核实 AI 有没有断章取义
