@@ -134,7 +134,12 @@
                   <span class="source-item__score">相关度 {{ source.score.toFixed(3) }}</span>
                   <ChevronDownIcon class="source-item__arrow" :class="{ 'is-open': isSourceOpen(msg.id, index) }" />
                 </button>
-                <div v-if="isSourceOpen(msg.id, index)" class="source-item__body">{{ source.content }}</div>
+                <div v-if="isSourceOpen(msg.id, index)" class="source-item__body">
+                  {{ source.content }}
+                  <button type="button" class="source-item__locate" @click="openSourceContext(source)">
+                    查看原文上下文
+                  </button>
+                </div>
               </div>
             </div>
           </div>
@@ -182,6 +187,26 @@
       <!-- 上传规则提示：常驻一行，降低无效上传 -->
       <div class="sender-hint">支持点击、拖拽或粘贴上传 · 最多 5 个 · 单个 ≤ 10MB · 附件仅本次对话可用 · 图片可直接提问</div>
     </div>
+
+    <!-- 引用定位弹窗：展示被引片段的前后邻域，被引片段高亮 -->
+    <t-dialog v-model:visible="contextVisible" :header="contextTitle" width="640px" :footer="false">
+      <t-loading :loading="contextLoading" text="正在定位原文…">
+        <div class="ctx-list">
+          <div v-if="!contextChunks.length && !contextLoading" class="ctx-empty">
+            原文已更新或该片段缺少定位信息，无法展示上下文
+          </div>
+          <div
+            v-for="chunk in contextChunks"
+            :key="chunk.chunkIndex"
+            class="ctx-chunk"
+            :class="{ 'is-current': chunk.current }"
+          >
+            <div class="ctx-chunk__index">第 {{ chunk.chunkIndex + 1 }} 段{{ chunk.current ? ' · 引用片段' : '' }}</div>
+            <div class="ctx-chunk__text">{{ chunk.content }}</div>
+          </div>
+        </div>
+      </t-loading>
+    </t-dialog>
     </div>
   </div>
 </template>
@@ -850,6 +875,50 @@ function toggleSource(msgId: string | number, index: number) {
 }
 function isSourceOpen(msgId: string | number, index: number) {
   return openSourceKey.value === `${msgId}-${index}`
+}
+
+// ========== 引用定位：点击引用查看它在原文中的前后段 ==========
+// 只看片段本身（切完块只剩一小段）常常读不通，把邻域段落一起展示出来才能核实
+// "AI 是不是断章取义"。知识库与附件走同一个接口，服务端按 fileId 有无分流。
+interface ContextChunk {
+  chunkIndex: number
+  content: string
+  current: boolean
+}
+const contextVisible = ref(false)
+const contextLoading = ref(false)
+const contextTitle = ref('')
+const contextChunks = ref<ContextChunk[]>([])
+
+async function openSourceContext(source: RagSource) {
+  // 旧语料入库时还没有 chunkIndex，附件也没有 fileId 之外的要求：
+  // 两样都没有就定位不了，提前提示而不是让接口 400 回来
+  if (source.chunkIndex === undefined && !source.fileId) {
+    MessagePlugin.warning('该片段缺少定位信息（旧语料），请重新上传文档后即可定位')
+    return
+  }
+  if (contextLoading.value) return
+  contextVisible.value = true
+  contextLoading.value = true
+  contextTitle.value = source.fileName
+  contextChunks.value = []
+  try {
+    const body = await fetchJson<{ chunks: ContextChunk[] }>('/api/documents/context', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(
+        source.fileId
+          ? { fileId: source.fileId, sessionId: sessionId.value, chunkIndex: source.chunkIndex }
+          : { fileName: source.fileName, chunkIndex: source.chunkIndex }
+      )
+    })
+    contextChunks.value = body.chunks || []
+  } catch (err: any) {
+    contextVisible.value = false
+    MessagePlugin.error(err?.message || '获取原文上下文失败')
+  } finally {
+    contextLoading.value = false
+  }
 }
 
 // ========== 前端工具（在浏览器侧执行） ==========
@@ -2164,6 +2233,69 @@ onUnmounted(() => teardownAgentEvents())
   font-size: var(--td-font-size-body-small);
   line-height: 1.7;
   color: var(--td-text-color-secondary);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* 引用定位入口：做成不起眼的文字链接，不与"片段正文"抢注意力 */
+.source-item__locate {
+  display: inline-block;
+  margin-top: var(--td-comp-margin-xs);
+  padding: 0;
+  border: none;
+  background: none;
+  font-size: var(--td-font-size-body-small);
+  color: var(--td-brand-color);
+  cursor: pointer;
+
+  &:hover {
+    text-decoration: underline;
+  }
+}
+
+/* ===== 引用定位弹窗：段落卡片流，被引片段高亮 ===== */
+.ctx-list {
+  max-height: 60vh;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: var(--td-comp-margin-s);
+}
+
+.ctx-empty {
+  padding: var(--td-comp-paddingTB-l) 0;
+  text-align: center;
+  font-size: var(--td-font-size-body-small);
+  color: var(--td-text-color-placeholder);
+}
+
+.ctx-chunk {
+  padding: var(--td-comp-paddingTB-s) var(--td-comp-paddingLR-m);
+  border-radius: var(--td-radius-medium);
+  background: var(--td-bg-color-secondarycontainer);
+}
+
+/* 被引片段：品牌色描边 + 浅底，一眼对上"点的是哪段" */
+.ctx-chunk.is-current {
+  background: var(--td-brand-color-light);
+  outline: 1px solid var(--td-brand-color);
+}
+
+.ctx-chunk__index {
+  margin-bottom: var(--td-comp-margin-xs);
+  font-size: var(--td-font-size-body-small);
+  color: var(--td-text-color-placeholder);
+}
+
+.ctx-chunk.is-current .ctx-chunk__index {
+  color: var(--td-brand-color);
+  font-weight: 600;
+}
+
+.ctx-chunk__text {
+  font-size: var(--td-font-size-body-medium);
+  line-height: 1.7;
+  color: var(--td-text-color-primary);
   white-space: pre-wrap;
   word-break: break-word;
 }

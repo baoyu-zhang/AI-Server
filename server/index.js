@@ -11,14 +11,15 @@ const { EventEncoder } = require('@ag-ui/encoder') // AG-UI 官方 SSE 事件编
 const fs = require('fs') // 用于清理解析后的临时文件
 const path = require('path') // 用于解析上传文件的后缀名
 const { UPLOAD_DIR, ALLOWED_EXTS, LEGACY_EXTS, IMAGE_EXTS, extractFileText, splitTextIntoChunks } = require('./rag-utils')
-const { initVectorStore, batchInsertEmbedding, searchVector, getDocuments, getCandidates, getJobs, deleteDocument } = require('./rag-vector')
-const { addSessionFile, addSessionImage, deleteSessionFile, getSessionFiles, searchSessionFiles } = require('./session-files')
+const { initVectorStore, batchInsertEmbedding, searchVector, getDocuments, getDocumentContext, getCandidates, getJobs, deleteDocument } = require('./rag-vector')
+const { addSessionFile, addSessionImage, deleteSessionFile, getSessionFiles, searchSessionFiles, getSessionFileContext } = require('./session-files')
 const { prepareChatStream, MAX_CONTEXT_TOKENS } = require('./chat-core') // 聊天主链路（裁剪/附件/选模型/streamText）
 const { scoreResumeAgainstJD } = require('./score-resume') // 招聘场景的领域能力：简历 × JD 匹配度评估
 const { authRouter, requireAuth } = require('./auth') // 注册/登录 + 全局鉴权闸门
 const { recordAudit, listAudit } = require('./audit') // 操作审计：谁批准了什么写操作
 const { startAutoBackup } = require('./backup') // SQLite 定时备份（VACUUM INTO）
 const { saveRun, listThreads, getThreadMessages } = require('./threads-store') // 会话落库
+const { saveUsage, listUsage, sumUsage } = require('./usage-store') // 模型用量落库
 const {
   CANDIDATE_STATUS, // 状态白名单，工具入参的 enum 与写库校验共用一份
   listCandidates: listCandidateRecords,
@@ -213,11 +214,14 @@ function createTools(sessionId, userId) {
             .join('\n\n'),
           // ② 给前端渲染的结构化数据。score 用 Number 包一层保持数字类型
           //   （toFixed 返回字符串，前端拿去做排序/阈值判断会变成字符串比较，'0.9' < '0.85' 这种坑）
+          // chunkIndex/fileId 给"查看原文上下文"用：点击引用取前后段，核实 AI 有没有断章取义
           sources: searchResult.map(item => ({
             fileName: item.fileName,
             score: Number(item.score.toFixed(3)),
             content: item.content,
-            sourceType: item.sourceType
+            sourceType: item.sourceType,
+            chunkIndex: item.chunkIndex,
+            fileId: item.fileId
           }))
         }
       }
@@ -704,6 +708,9 @@ app.post('/agui', async (req, res) => {
     return true
   }
 
+  // 用量记录在 finally 里做（正常/中断/出错都要记），而 result 要到 try 内才有值，
+  // 所以提前声明；try 内赋值，finally 里据此 await usage
+  let chatStream = null
   try {
     // ===== resume：把用户对 interrupt 的决定写回历史，模型才能接着生成 =====
     const resumeEntries = Array.isArray(input.resume) ? input.resume : []
@@ -751,7 +758,8 @@ app.post('/agui', async (req, res) => {
     // AG-UI 结构化历史还原成 AI SDK 消息，再交给 chat-core 统一处理
     const chatMessages = aguiToChatMessages(aguiMessages)
     // 裁剪上下文 + 注入附件清单 + 挂载图片 + 选模型
-    const { result, meta } = prepareChatStream({
+    // 同一个对象赋给 chatStream：finally 里要拿它 await usage 记账
+    const { result, meta } = chatStream = prepareChatStream({
       messages: chatMessages,
       sessionId,
       tools,
@@ -981,6 +989,22 @@ app.post('/agui', async (req, res) => {
       saveRun({ threadId, runId, userId, messages: snapshot, state: finalState })
     } catch (err) {
       log.error('[threads] 会话落库失败', { threadId, runId, err: err.message })
+    }
+    // 用量记账：await result.usage 拿模型服务端回报的真实 token（不是本地估算）。
+    // 中断时 usage 会 resolve 成部分用量——账单不会因为客户端断开就少收，照记。
+    // 失败只记日志：记账挂了不能影响对话主流程
+    if (chatStream) {
+      try {
+        const usage = await chatStream.result.usage
+        saveUsage({
+          threadId, runId, userId,
+          model: chatStream.meta.modelId,
+          usage,
+          steps: chatStream.result.steps?.length
+        })
+      } catch (err) {
+        log.error('[usage] 用量记录失败', { threadId, runId, err: err?.message })
+      }
     }
     if (!res.writableEnded) res.end()
   }
@@ -1219,6 +1243,32 @@ app.post('/api/documents/delete', async (req, res) => {
     res.status(500).json({ error: err.message })
   }
 })
+// 引用定位：取被引片段在原文中的前后邻域，供前端弹窗展示上下文
+// 两个来源分开查：知识库走向量库（可见性过滤），附件走内存会话（归属校验）
+app.post('/api/documents/context', async (req, res) => {
+  try {
+    const { fileName, chunkIndex, fileId, sessionId } = req.body || {}
+    const windowSize = 1 // 前后各 1 段够核实语义；再大会让弹窗长得像全文
+    if (fileId) {
+      // 附件路径：必须校验会话归属，B 用户不能借 sessionId 读 A 的附件内容
+      if (!sessionId || !claimSession(sessionId, req.user.userId)) {
+        return res.status(403).json({ error: '会话归属其他用户，拒绝访问' })
+      }
+      const chunks = getSessionFileContext(sessionId, fileId, chunkIndex, windowSize)
+      if (!chunks) return res.status(404).json({ error: '附件不存在或片段已失效' })
+      return res.json({ ok: true, fileName, chunks })
+    }
+    if (!fileName || !Number.isInteger(chunkIndex)) {
+      return res.status(400).json({ error: '缺少 fileName 或 chunkIndex' })
+    }
+    const chunks = await getDocumentContext(fileName, chunkIndex, windowSize, req.user.userId)
+    // 空数组 = 序号在库里不存在（文档重传后片段数变了），明确告诉前端"无法定位"
+    res.json({ ok: true, fileName, chunks })
+  } catch (err) {
+    console.error('引用定位失败', err)
+    res.status(500).json({ error: err.message })
+  }
+})
 // 审计查询：只返回自己的记录（管理员全局视图要等有了角色体系再做）
 app.get('/api/audit', (req, res) => {
   try {
@@ -1226,6 +1276,19 @@ app.get('/api/audit', (req, res) => {
     res.json({ ok: true, data })
   } catch (err) {
     console.error('读取审计失败', err)
+    res.status(500).json({ error: err.message })
+  }
+})
+// 模型用量：只返回自己的。明细 + 汇总一次给齐，前端用量页签直接渲染
+app.get('/api/usage', (req, res) => {
+  try {
+    res.json({
+      ok: true,
+      detail: listUsage(req.user.userId, req.query.limit),
+      summary: sumUsage(req.user.userId)
+    })
+  } catch (err) {
+    console.error('读取用量失败', err)
     res.status(500).json({ error: err.message })
   }
 })

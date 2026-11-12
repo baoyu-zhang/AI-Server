@@ -408,7 +408,8 @@ async function scoreResumeAgainstJD({ candidateId, jobId, query = '岗位要求 
     fileName: item.fileName,
     score: item.score,
     content: item.content,
-    sourceType: 'knowledge'
+    sourceType: 'knowledge',
+    chunkIndex: item.chunkIndex
   }))
   return result
 }

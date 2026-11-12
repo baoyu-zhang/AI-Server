@@ -6,6 +6,8 @@ export interface RagSource {
   score: number // 融合相关度（向量 + BM25 按名次融合后归一到 0~1，不是余弦相似度）
   content: string // 检索到的原文片段
   sourceType?: 'knowledge' | 'attachment' // 来源类型：知识库 / 本次会话附件
+  chunkIndex?: number // 片段在原文中的序号：点「查看原文上下文」取前后段用（旧语料可能缺失）
+  fileId?: string // 附件来源才有：会话附件 id，上下文接口按它查
 }
 
 // 用户消息附带的文件：上传成功后记录，用于气泡内渲染文件卡片

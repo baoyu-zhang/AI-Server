@@ -12,6 +12,9 @@
       <t-tab-panel value="candidates" label="候选人">
         <CandidatePanel ref="candRef" @ask="forwardAsk" />
       </t-tab-panel>
+      <t-tab-panel value="usage" label="用量">
+        <UsagePanel ref="usageRef" />
+      </t-tab-panel>
     </t-tabs>
   </aside>
 </template>
@@ -20,14 +23,16 @@
 import { ref } from 'vue'
 import DocPanel from './DocPanel.vue'
 import CandidatePanel from './CandidatePanel.vue'
+import UsagePanel from './UsagePanel.vue'
 
 // 候选人面板里的"评估 / 改状态"不自己发请求，而是让上层往对话里发一句话——
 // 这样改状态仍然走 interrupt 审批，不会出现"界面上点一下就把人淘汰了"的旁路。
 const emit = defineEmits<{ ask: [text: string] }>()
 
-const tab = ref<'docs' | 'candidates'>('docs')
+const tab = ref<'docs' | 'candidates' | 'usage'>('docs')
 const docRef = ref<InstanceType<typeof DocPanel> | null>(null)
 const candRef = ref<InstanceType<typeof CandidatePanel> | null>(null)
+const usageRef = ref<InstanceType<typeof UsagePanel> | null>(null)
 
 // 上传/删除文档后候选人会变（简历入库即登记），顺手刷新候选人页
 function onDocsChanged() {
@@ -42,6 +47,8 @@ function forwardAsk(text: string) {
 function onTabChange(value: string | number) {
   // 切到候选人页时重新拉一次：分数与状态是对话里改的，面板不知道自己已经过期
   if (value === 'candidates') void candRef.value?.load()
+  // 用量也是对话期间持续增长的数据，切过来时刷新
+  if (value === 'usage') void usageRef.value?.load()
 }
 
 defineExpose({

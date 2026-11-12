@@ -74,6 +74,19 @@ CREATE TABLE IF NOT EXISTS audit_log (
 );
 CREATE INDEX IF NOT EXISTS idx_audit_user ON audit_log(user_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_audit_action ON audit_log(action, created_at);
+CREATE TABLE IF NOT EXISTS model_usage (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  thread_id     TEXT NOT NULL,           -- 即 AG-UI 的 threadId
+  run_id        TEXT NOT NULL,
+  user_id       TEXT NOT NULL,
+  model         TEXT NOT NULL,           -- 实际使用的模型 id（视觉/推理切换会不同）
+  input_tokens  INTEGER NOT NULL DEFAULT 0,
+  output_tokens INTEGER NOT NULL DEFAULT 0,
+  total_tokens  INTEGER NOT NULL DEFAULT 0,
+  steps         INTEGER NOT NULL DEFAULT 1, -- 本轮 ReAct 走了几步
+  created_at    INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_usage_user ON model_usage(user_id, created_at);
 `)
 
 // ===== 轻量迁移：CREATE TABLE IF NOT EXISTS 对已存在的表不生效，加列只能走 ALTER =====

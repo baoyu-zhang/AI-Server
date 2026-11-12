@@ -134,18 +134,41 @@ async function searchSessionFiles(sessionId, query, topK = 3) {
   const queryVector = await getEmbedding(query)
   const results = []
   for (const file of session.files.values()) {
-    for (const chunk of file.chunks || []) { // 图片附件没有 chunks，跳过即可
+    for (const [index, chunk] of (file.chunks || []).entries()) { // 图片附件没有 chunks，跳过即可
       let score = 0
       for (let i = 0; i < queryVector.length; i++) score += queryVector[i] * chunk.vector[i]
       results.push({
         score,
         content: chunk.content,
         fileName: file.fileName,
-        fileId: file.id
+        fileId: file.id,
+        chunkIndex: index // 数组下标即原文顺序，引用定位取邻域时用它
       })
     }
   }
   return results.sort((a, b) => b.score - a.score).slice(0, topK)
+}
+
+/**
+ * 引用定位：取附件中某片段的前后邻域（数组顺序即原文顺序）
+ * @param {string} sessionId
+ * @param {string} fileId
+ * @param {number} chunkIndex 被引片段序号
+ * @param {number} [windowSize=1] 前后各取几个片段
+ * @returns {Array<{chunkIndex: number, content: string, current: boolean}>|null} 附件不存在返回 null
+ */
+function getSessionFileContext(sessionId, fileId, chunkIndex, windowSize = 1) {
+  const session = sessions.get(sessionId)
+  const file = session?.files.get(fileId)
+  if (!file || !Array.isArray(file.chunks)) return null
+  if (!Number.isInteger(chunkIndex) || chunkIndex < 0 || chunkIndex >= file.chunks.length) return null
+  const from = Math.max(0, chunkIndex - windowSize)
+  const to = Math.min(file.chunks.length - 1, chunkIndex + windowSize)
+  const out = []
+  for (let i = from; i <= to; i++) {
+    out.push({ chunkIndex: i, content: file.chunks[i].content, current: i === chunkIndex })
+  }
+  return out
 }
 
 module.exports = {
@@ -154,5 +177,6 @@ module.exports = {
   deleteSessionFile,
   getSessionFiles,
   getSessionImages,
-  searchSessionFiles
+  searchSessionFiles,
+  getSessionFileContext
 }

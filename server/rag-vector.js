@@ -88,6 +88,9 @@ async function batchInsertEmbedding(chunks, fileName, meta = {}) {
       metadata: {
         fileName,
         content: chunks[i],
+        // 片段在原文中的序号：引用定位（点击引用看前后段）全靠它排序取邻域。
+        // 旧语料没有这个字段，定位接口要按缺失兜底
+        chunkIndex: i,
         createdAt: Date.now(), // 记录入库时间，前端文档列表可按时间排序
         ...biz // 展开在后：业务字段追加进 metadata
       }
@@ -169,6 +172,7 @@ function getBm25Index() {
           id: item.id,
           content,
           fileName: item.metadata?.fileName,
+          chunkIndex: item.metadata?.chunkIndex, // 引用定位用：排序取邻域
           tf,
           len: tokens.length,
           meta: item.metadata || {}, // 过滤要在 BM25 侧也能用，所以整份 metadata 都留下
@@ -250,7 +254,7 @@ function bm25Search(bm25Index, query, topK, filter, userId) {
       const saturated = (tf * (BM25_K1 + 1)) / (tf + BM25_K1 * (1 - BM25_B + BM25_B * doc.len / (avgdl || 1)));
       score += idf * saturated;
     }
-    if (score > 0) scored.push({ id: doc.id, score, content: doc.content, fileName: doc.fileName });
+    if (score > 0) scored.push({ id: doc.id, score, content: doc.content, fileName: doc.fileName, chunkIndex: doc.chunkIndex });
   }
   return scored.sort((a, b) => b.score - a.score).slice(0, topK);
 }
@@ -277,6 +281,7 @@ async function retrieveCandidates(query, pool, filter, userId) {
     score: item.score,
     content: item.item.metadata.content,
     fileName: item.item.metadata.fileName,
+    chunkIndex: item.item.metadata.chunkIndex, // 引用定位用
     meta: item.item.metadata || {} // 带上 metadata 才能做可见性后过滤
   }));
   if (vis) denseHits = denseHits.filter(hit => matchesFilter(hit.meta, vis));
@@ -303,6 +308,7 @@ function fuseRRF(denseHits, keywordHits, topK) {
         id: hit.id,
         content: hit.content,
         fileName: hit.fileName,
+        chunkIndex: hit.chunkIndex,
         score: 0,
         denseRank: 0,
         bm25Rank: 0
@@ -350,7 +356,8 @@ async function searchVector(query, topK = 3, filter, userId) {
   return results.map(item => ({
     score: item.score,
     content: item.content,
-    fileName: item.fileName
+    fileName: item.fileName,
+    chunkIndex: item.chunkIndex // 旧语料为 undefined，前端按缺失兜底（只看片段本身）
   }));
 }
 
@@ -501,6 +508,40 @@ async function deleteDocument(fileName, userId) {
 }
 
 /**
+ * 引用定位：取某片段在原文中的前后邻域
+ *
+ * 点击【引用来源】时前端调它，把被引片段前后的段落一起展示出来——
+ * 只看片段本身（切完块只剩一小段）常常读不通，人需要上下文才能核实"AI 是不是断章取义"。
+ *
+ * 兜底语义：被引片段没有 chunkIndex（旧语料入库时还没这个字段）时只返回片段本身，
+ * 不猜顺序——按插入顺序当作阅读顺序是错的，Vectra 的 listItems 并不保证这个。
+ *
+ * @param {string} fileName 文档名（可见性按 userId 过滤）
+ * @param {number} chunkIndex 被引片段序号
+ * @param {number} [windowSize=1] 前后各取几个片段
+ * @returns {Promise<Array<{chunkIndex: number, content: string, current: boolean}>>}
+ */
+async function getDocumentContext(fileName, chunkIndex, windowSize = 1, userId) {
+  const items = await index.listItems()
+  const vis = visibilityFilter(userId);
+  // 同名文件可能有多个片段；先圈定可见范围内的同名条目再排序
+  const chunks = items
+    .filter(item => item.metadata?.fileName === fileName && Number.isInteger(item.metadata?.chunkIndex))
+    .filter(item => !vis || matchesFilter(item.metadata, vis))
+    .map(item => ({ chunkIndex: item.metadata.chunkIndex, content: item.metadata.content || '' }))
+    .sort((a, b) => a.chunkIndex - b.chunkIndex)
+  // 被引序号在库里不存在（文档重传后片段数变了）：退化成只返回邻域里最近的片段也说不清，
+  // 干脆返回空数组，前端按"原文已更新，无法定位"提示
+  const hit = chunks.find(item => item.chunkIndex === chunkIndex)
+  if (!hit) return []
+  const from = Math.max(0, chunkIndex - windowSize)
+  const to = chunkIndex + windowSize
+  return chunks
+    .filter(item => item.chunkIndex >= from && item.chunkIndex <= to)
+    .map(item => ({ ...item, current: item.chunkIndex === chunkIndex }))
+}
+
+/**
  * 【可选CRUD：清空整个向量库】
  */
 async function clearVectorIndex() {
@@ -521,6 +562,7 @@ module.exports = {
   tokenize, // 导出给单元测试验证分词行为
   getAllItems,
   getDocuments,
+  getDocumentContext, // 引用定位：取片段前后邻域
   getCandidates, // 候选人清单：按 metadata.candidateId 聚合
   getJobs, // 岗位清单：按 metadata.jobId 聚合
   deleteDocument,
