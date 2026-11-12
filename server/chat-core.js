@@ -165,16 +165,29 @@ function buildAttachmentSystemPrompt(sessionId) {
  * 为什么注入而不是给模型一个"查询记忆"工具：
  *   记忆数量有上限（默认 50 条、每条 ≤200 字），全量注入也就几百 token，
  *   一次到位比"模型要先决定查一次再等结果"更可靠——查询式记忆容易漏查。
+ *
+ * ===== 记忆的新旧与冲突 =====
+ * 每条记忆带"记录于日期"注入：偏好会漂移（三年前喜欢花生 → 现在喜欢坚果），
+ * 没有时间的记忆列表里两条矛盾的偏好无法分谁新谁旧，模型只能瞎猜。
+ * 冲突处理规则写在 system 而不是工具 description：工具描述只在模型考虑调工具时
+ * 被重点阅读，"发现矛盾要更新记忆"是每轮都该生效的常驻约束。
  * @param {string} userId 用户 id；没传（老调用方）返回空串，行为与从前一致
  */
 function buildMemorySystemPrompt(userId) {
   if (!userId) return ''
   const memories = listMemories(userId)
   if (!memories.length) return ''
-  const list = memories.map((m, i) => `${i + 1}. ${m.content}`).join('\n')
-  return `以下是系统长期记住的、关于这位用户的稳定事实（跨会话有效）：\n${list}\n\n使用规则：
+  const list = memories
+    .map((m, i) => {
+      // createdAt 是毫秒时间戳，转成模型可读的日期；日期帮助模型判断哪条更新
+      const date = new Date(m.createdAt).toLocaleDateString('zh-CN')
+      return `${i + 1}.（记录于 ${date}）${m.content}`
+    })
+    .join('\n')
+  return `以下是系统长期记住的、关于这位用户的稳定事实（跨会话有效，按时间从早到晚排列）：\n${list}\n\n使用规则：
 1. 回答时自然运用这些事实（比如用用户的称呼），但不要生硬复述"系统记忆里写着"。
-2. 这些事实与对话中的新信息冲突时，以对话中的新信息为准，并可以调用 remember 工具更新记忆。`
+2. 这些事实与对话中的新信息冲突时，以对话中的新信息为准。
+3. 如果对话中出现了与记忆矛盾的新偏好或新事实（例如记忆里"喜欢吃花生"、用户现在说"喜欢吃坚果"），必须更新记忆：先调用 forget 删除旧的那条，再调用 remember 保存新的——只 remember 不 forget 会让两条矛盾记忆长期共存。`
 }
 
 /**
