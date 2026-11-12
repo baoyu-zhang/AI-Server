@@ -94,11 +94,15 @@
 右侧的 `ai-server.railway.internal` 是 Railway 内网 DNS、Region / Replica 是默认配置，
 它们都会自动生成，**不代表服务在跑**。此时别急着 `Generate Domain`，没有后端接着域名只会 502。
 
+**点部署之前先花 30 秒确认两件事**，否则会白跑一次构建、白烧额度：
+① Settings → Source 显示的是 `baoyu-zhang/AI-Server · main`，而不是 `Connect Repo` 按钮；
+② Variables 里 5 个必填项齐全，且 `ADMIN_PASSWORD` 不是本机那个短口令。
+
 点 **Deployments** 页签，按看到的内容对号入座：
 
 | 看到什么 | 原因 | 怎么做 |
 |---|---|---|
-| 一条部署记录都没有 | 只 Apply 了变更，没触发构建 | 点顶部 `Deploy` / `Redeploy` |
+| `Undeployed service` / `There is no active deployment for this service` | 只 Apply 了变更，从没触发过构建 | 点页面中间的 **`Make a deployment to get started.`**。注意 staged change 应用后顶部 `Deploy` 横幅会消失，别再找它；也可 Cmd/Ctrl+K → `Deploy latest commit` |
 | `❌ .env 缺少 DEEPSEEK_API_KEY` | `index.js:203` 是硬检查，缺了直接 `exit(1)` | Variables 补 `DEEPSEEK_API_KEY` |
 | `[security] 生产配置自检未通过：ADMIN_PASSWORD 是弱口令` | `security.js` 的 `WEAK_PASSWORDS` 会拦本地默认口令 `123456` / `admin` 等 | 换 ≥12 位随机串：`openssl rand -hex 16` |
 | `生产配置自检未通过：数据目录不可写` | Volume 没挂、或挂载路径不是 `/app/data` | 按第三节挂卷后重新部署 |
