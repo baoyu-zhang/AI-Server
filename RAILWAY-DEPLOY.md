@@ -113,6 +113,7 @@
 | 看到什么 | 原因 | 怎么做 |
 |---|---|---|
 | `Root directory "baoyu-zhang/AI-Server" was not found in the deployed source` | Root Directory 被自动填成了仓库名，但它是**仓库内子目录**路径 | Settings → Source → Root Directory 改成 `/`（或清空）→ 保存 → Redeploy。详见 2.3 节 |
+| `Failed to build an image` + `/bin/sh: 1: addgroup: not found`（exit 127） | Root Directory 填成了 `server`，Railway 改用历史遗留的 `server/Dockerfile`，里面残留 Alpine 的 `addgroup -S` 语法，Debian slim 不认 | 改成 `/` 用根 Dockerfile；`server/Dockerfile` 本身也已修成 root 运行 + Debian 兼容 |
 | `Undeployed service` / `There is no active deployment for this service` | 只 Apply 了变更，从没触发过构建 | 点页面中间的 **`Make a deployment to get started.`**。注意 staged change 应用后顶部 `Deploy` 横幅会消失，别再找它；也可 Cmd/Ctrl+K → `Deploy latest commit` |
 | `❌ .env 缺少 DEEPSEEK_API_KEY` | `index.js:203` 是硬检查，缺了直接 `exit(1)` | Variables 补 `DEEPSEEK_API_KEY` |
 | `[security] 生产配置自检未通过：ADMIN_PASSWORD 是弱口令` | `security.js` 的 `WEAK_PASSWORDS` 会拦 `admin`、纯数字短口令等常见弱口令（含本机 `.env` 里的演示口令） | 换 ≥12 位随机串：`openssl rand -hex 16` |
@@ -137,7 +138,16 @@
 | 现象 | 问题 | 怎么做 |
 |---|---|---|
 | Root Directory 被自动填成 `baoyu-zhang/AI-Server` | 这是**仓库内的子目录**路径，不是仓库名。根 Dockerfile 里有 `COPY server/...` 和 `COPY web/...`，构建上下文必须是仓库根 | 清空或填 **`/`**，改完再 Apply；保持 `/` 也是 `railway.json` 能被读到的前提 |
+| Root Directory 被填成 `server` | 更隐蔽：Railway 会以 `server/` 为构建上下文，改用**历史遗留的 `server/Dockerfile`**（只有后端、没有前端），而不是根 Dockerfile | 同样改回 **`/`**。填 `server` 时新版会报 `addgroup: not found`（旧镜像残留的 Alpine 语法遇 Debian slim），旧版则构建出一个没有页面的镜像、打开域名 404 |
 | 旧服务上填过的 Variables / 挂过的卷 | 变量与卷是**服务级**配置，换服务不会自动迁移 | 在新服务的 Variables 页签重新确认 5 项，重新挂卷 `/app/data` |
+
+> **唯一正确值是 `/`（或留空）**：`baoyu-zhang/AI-Server`（仓库名）→ 找不到目录；
+> `server`（子目录）→ 拿错 Dockerfile；只有 `/` 才能同时读到根 `Dockerfile`、`railway.json` 和 `web/`。
+
+> ⚠️ **先关自动部署**：Settings → Source 里 `Auto deploys when pushed to GitHub` 默认开启
+> （按钮显示 `Disable` 就是当前已启用）。它开了以后，**每改一次设置、每推一次 commit 都会立刻构建**，
+> 配置没配齐时会连着产生失败部署、白烧试用额度。建议先点 `Disable`，
+> 等 Root Directory / Variables / Volume 全齐、代码也推好，再手动 `Deploy` 一次。
 
 推荐顺序（省额度，别一上来就 Deploy）：
 

@@ -24,12 +24,15 @@ RUN npm ci --omit=dev --no-audit --no-fund
 
 COPY . .
 
-# 容器内不以 root 跑：uploads / data / vector-index 由 compose 挂卷，权限在挂载时处理
-RUN addgroup -S app && adduser -S app -G app && chown -R app:app /app
-USER app
+# 容器内以 root 运行，和仓库根 Dockerfile 保持一致。
+# 原来这行是 `addgroup -S app && adduser -S app -G app`，那是 Alpine/busybox 的语法；
+# 基础镜像换成 Debian slim 后没有 -S 参数，构建会直接报
+# `/bin/sh: 1: addgroup: not found`（exit 127）。另外 Railway 挂载的 Volume 常为 root 所有，
+# 换成非 root 用户会写不进 SQLite（表现为启动即崩）。
+# 本地 compose 若需要非 root，可在 compose 里用 user: 覆盖。
 
 EXPOSE 3000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
-  CMD wget -qO- http://localhost:3000/api/health || exit 1
+  CMD node -e "fetch('http://127.0.0.1:'+(process.env.PORT||3000)+'/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
 
 CMD ["node", "index.js"]
