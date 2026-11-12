@@ -1391,10 +1391,25 @@ function aguiToEngineMessages(list: Array<Record<string, any>>): EngineMessage[]
   return out
 }
 
+// 引擎在 onMounted 里异步 init（new ChatEngine + await init），
+// watch immediate 在 setup 阶段触发时 chatEngine 还是 null，setMessages 会被 optional
+// chaining 静默吞掉——恢复就"看起来没执行"。这里轮询等它就绪再动
+async function waitForEngine(timeoutMs = 3000): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs
+  while (!chatEngine.value && Date.now() < deadline) {
+    await new Promise(resolve => setTimeout(resolve, 50))
+  }
+  return Boolean(chatEngine.value)
+}
+
 // 加载某个历史会话：拉快照 -> 还原引擎消息 -> 接管 threadId
 async function loadThread(id: string) {
   if (chatStore.loading) {
     MessagePlugin.warning('回复生成中，请稍后再切换会话')
+    return
+  }
+  if (!(await waitForEngine())) {
+    MessagePlugin.error('聊天引擎尚未就绪，请稍后重试')
     return
   }
   try {
@@ -1422,18 +1437,22 @@ async function loadThread(id: string) {
     threadId.value = id
     // 附件按 sessionId 绑定，恢复会话不恢复附件，换新 id 避免旧附件被静默检索
     sessionId.value = createSessionId()
-    persistViewSnapshot()
+    // 必须延后一拍：引擎把消息同步到响应式副本走微任务，同步 persist 会拿到
+    // 旧（空）列表、把空快照写进 localStorage——这正是"重登能显示、刷新必空"的根因
+    persistViewSnapshotSoon()
     MessagePlugin.success('已恢复该会话')
   } catch (err: any) {
     MessagePlugin.error(err?.message || '恢复会话失败')
   }
 }
 
-// 登录/刷新后本地为空时，自动恢复最近一个会话；本地有消息则不动
+// 登录/刷新后引擎消息列表为空时，自动恢复最近一个会话。
+// 不再比较 threadId：本地快照可能被写空而 threadId 还留着，
+// 只看"引擎里有没有消息"才可靠；id 相等时重复拉取是幂等的一次请求，代价可忽略
 async function initHistory() {
   await refreshThreads()
   const latest = threadsList.value[0]
-  if (latest && !engineList().length && latest.id !== threadId.value) {
+  if (latest && !requestList().length) {
     await loadThread(latest.id)
   }
 }
