@@ -586,9 +586,12 @@ app.post('/agui', async (req, res) => {
   let hasError = false
   // 本轮出现的审批类工具调用：不在流内执行，收尾时转成 interrupt
   const pendingApprovals = []
-  // 会话落库：正文与工具结果是服务端产出的，客户端历史里没有，必须自己收集
-  let assistantText = '' // 累计正文增量，落库时拼回一条 assistant 消息
-  const runToolResults = [] // 本轮流内执行的工具结果（resume 写回的那部分已进 aguiMessages）
+  // 会话落库：正文与工具结果是服务端产出的，客户端历史里没有，必须自己收集。
+  // 按"真实发生顺序"记成本轮消息数组，而不是事后再拼：
+  // 一轮里可能有多段正文（工具调用前后的两段），合并成一条会出现
+  // "1 + 90 = 91，1 + 90 = 91" 这种重复正文，工具结果也会跑到所有正文后面
+  const runMessages = []
+  let currentTextMsg = null // 正在续写的 assistant 文本消息（落库对象）
 
   const abortController = new AbortController()
   const send = (event) => {
@@ -645,6 +648,10 @@ app.post('/agui', async (req, res) => {
     ensureAssistant()
     textOpen = true
     assistantTextStarted = true
+    // 每段正文独立成一条 assistant 消息：同一轮里工具调用前后各说一段时，
+    // 合并成一条会让恢复出来的历史变成重复文本
+    currentTextMsg = { id: currentAssistantId, role: 'assistant', content: '' }
+    runMessages.push(currentTextMsg)
     return true
   }
 
@@ -737,7 +744,7 @@ app.post('/agui', async (req, res) => {
       } else if (part.type === 'text-delta') {
         if (!part.text) continue
         const opened = openText()
-        assistantText += part.text // 同时收集：落库快照要用
+        if (currentTextMsg) currentTextMsg.content += part.text // 落库：追加到本段正文
         send({
           type: 'TEXT_MESSAGE_CHUNK',
           // 开头的分片带 messageId + role，续写分片省略（省略表示延续当前消息）
@@ -749,6 +756,21 @@ app.post('/agui', async (req, res) => {
         const parentMessageId = ensureAssistant()
         closeText()
         closeReasoning()
+        // 落库：toolCalls 必须挂在对应 assistant 消息上，恢复历史时前端靠它配对工具结果
+        // 优先挂到刚结束的那段正文；模型直接调工具（没说话）时补一条空正文消息
+        const carrier = currentTextMsg
+          ?? [...runMessages].reverse().find(m => m.role === 'assistant')
+        const toolCall = {
+          id: part.toolCallId,
+          type: 'function',
+          function: { name: part.toolName, arguments: JSON.stringify(part.input ?? {}) }
+        }
+        if (carrier) {
+          ;(carrier.toolCalls ||= []).push(toolCall)
+        } else {
+          currentTextMsg = { id: parentMessageId, role: 'assistant', content: '', toolCalls: [toolCall] }
+          runMessages.push(currentTextMsg)
+        }
         // 审批类工具没有 execute，本轮不会产生 tool-result，先记下来留到收尾转成 interrupt
         // 连 toolName 一起记：收尾时既要用它生成确认文案，也要写进 metadata 供前端区分卡片类型
         if (APPROVAL_TOOL_NAMES.has(part.toolName)) {
@@ -765,10 +787,18 @@ app.post('/agui', async (req, res) => {
         send({ type: 'TOOL_CALL_END', toolCallId: part.toolCallId })
       } else if (part.type === 'tool-result') {
         const resultText = toolOutputText(part.output)
-        runToolResults.push({ toolCallId: part.toolCallId, content: resultText }) // 落库收集
+        // 落库与 SSE 事件共用同一个 messageId：恢复出来的历史和当场看到的一致
+        const toolMessageId = `msg_tool_${++toolMessageSeq}`
+        // 落库：工具结果按发生位置插进本轮消息流（前端恢复时按 toolCallId 配对）
+        runMessages.push({
+          id: toolMessageId,
+          role: 'tool',
+          content: resultText,
+          toolCallId: part.toolCallId
+        })
         send({
           type: 'TOOL_CALL_RESULT',
-          messageId: `msg_tool_${++toolMessageSeq}`,
+          messageId: toolMessageId,
           toolCallId: part.toolCallId,
           role: 'tool',
           content: resultText
@@ -784,11 +814,20 @@ app.post('/agui', async (req, res) => {
         // 工具结果之后，模型下一段文本属于新的 assistant 消息
         currentAssistantId = null
         assistantTextStarted = false
+        currentTextMsg = null // 下一段正文/下一个工具调用另起一条，别续到工具前那条上
       } else if (part.type === 'tool-error') {
         const errorMessage = part.error instanceof Error ? part.error.message : String(part.error)
+        const toolMessageId = `msg_tool_${++toolMessageSeq}`
+        // 失败结果同样落库：否则恢复历史后工具步骤卡片只有入参没有结果
+        runMessages.push({
+          id: toolMessageId,
+          role: 'tool',
+          content: `工具执行失败：${errorMessage}`,
+          toolCallId: part.toolCallId
+        })
         send({
           type: 'TOOL_CALL_RESULT',
-          messageId: `msg_tool_${++toolMessageSeq}`,
+          messageId: toolMessageId,
           toolCallId: part.toolCallId,
           role: 'tool',
           content: `工具执行失败：${errorMessage}`
@@ -801,6 +840,7 @@ app.post('/agui', async (req, res) => {
         })
         currentAssistantId = null
         assistantTextStarted = false
+        currentTextMsg = null
       } else if (part.type === 'error') {
         console.error('[agui] 流式错误', part.error)
         hasError = true
@@ -868,22 +908,9 @@ app.post('/agui', async (req, res) => {
     // 会话落库放 finally：正常结束、interrupt、出错、客户端断开都要留痕——
     // 尤其审批中断时，快照里必须已经包含那条带 toolCalls 的 assistant 消息，resume 才有依据可循
     try {
-      const snapshot = [...aguiMessages]
-      if (assistantText.trim()) {
-        snapshot.push({
-          id: currentAssistantId || `msg_asst_${randomUUID()}`,
-          role: 'assistant',
-          content: assistantText
-        })
-      }
-      for (const item of runToolResults) {
-        snapshot.push({
-          id: `msg_tool_${++toolMessageSeq}`,
-          role: 'tool',
-          content: item.content,
-          toolCallId: item.toolCallId
-        })
-      }
+      // 输入历史 + 本轮新增消息。runMessages 已按发生顺序保存了每段正文、
+      // 带 toolCalls 的 assistant 和工具结果，这里只做拼接，不再二次加工
+      const snapshot = [...(aguiMessages || []), ...runMessages]
       saveRun({ threadId, runId, userId, messages: snapshot })
     } catch (err) {
       log.error('[threads] 会话落库失败', { threadId, runId, err: err.message })

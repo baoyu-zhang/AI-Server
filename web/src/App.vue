@@ -5,8 +5,19 @@
   <div v-else class="app-shell">
     <!-- 右上角账号角标：历史会话切换 + 当前用户 + 登出入口 -->
     <div class="account-badge">
-      <t-select class="thread-select" :value="threadSelectValue" :options="threadOptions" :loading="threadsLoading"
-        placeholder="历史会话" size="small" @visible-change="onThreadsVisible" @change="onPickThread" />
+      <!-- 会话下拉：标题 + 最新一句/轮次/时间。会话标题固定取首条消息，
+           不显示后半段的话，聊了很久的同一会话看起来"像是没出现在列表里" -->
+      <t-select class="thread-select" :value="threadSelectValue" :loading="threadsLoading" placeholder="历史会话" size="small"
+        :popup-props="{ overlayInnerStyle: 'min-width: 280px' }"
+        @visible-change="onThreadsVisible" @change="onPickThread">
+        <t-option v-for="option in threadOptions" :key="option.value" :value="option.value" :label="option.label">
+          <div style="display:flex;flex-direction:column;gap:2px;line-height:1.4;min-width:0">
+            <span style="font-size:13px;color:var(--td-text-color-primary)">{{ option.label }}</span>
+            <span v-if="option.meta"
+              style="font-size:11px;color:var(--td-text-color-placeholder);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ option.meta }}</span>
+          </div>
+        </t-option>
+      </t-select>
       <span class="account-badge__name">{{ currentUser?.username }}</span>
       <t-button variant="text" size="small" @click="startNewThread">新会话</t-button>
       <t-button variant="text" size="small" @click="onLogout">退出</t-button>
@@ -1362,7 +1373,9 @@ async function fetchJson<T = Record<string, any>>(url: string): Promise<T> {
   return body as T
 }
 
-type ThreadItem = { id: string; title: string; updated_at: number }
+// preview / turnCount 由服务端附带：标题固定取首条消息，长会话只看标题分不清
+// （同一个线程里聊了十几轮，下拉里还叫第一句），补上"最新一句 + 轮次"才认得出
+type ThreadItem = { id: string; title: string; updated_at: number; preview?: string; turnCount?: number }
 
 const threadsList = ref<ThreadItem[]>([])
 const threadsLoading = ref(false)
@@ -1516,8 +1529,26 @@ watch(authed, value => {
   if (value) void initHistory()
 }, { immediate: true })
 
+// 会话时间：今天只给时分（下拉里空间有限），更早给月-日
+function formatThreadTime(ts?: number) {
+  if (!ts) return ''
+  const d = new Date(ts)
+  const now = new Date()
+  const sameDay = d.toDateString() === now.toDateString()
+  const pad = (n: number) => String(n).padStart(2, '0')
+  return sameDay ? `${pad(d.getHours())}:${pad(d.getMinutes())}` : `${pad(d.getMonth() + 1)}-${pad(d.getDate())}`
+}
+
 const threadOptions = computed(() =>
-  threadsList.value.map(item => ({ label: item.title || '未命名会话', value: item.id }))
+  threadsList.value.map(item => {
+    const title = item.title || '未命名会话'
+    // 最新一句和标题相同时不重复显示（单轮会话标题就是它）
+    const preview = item.preview && item.preview !== title ? item.preview : ''
+    const meta = [preview, item.turnCount && item.turnCount > 1 ? `${item.turnCount} 轮` : '', formatThreadTime(item.updated_at)]
+      .filter(Boolean)
+      .join(' · ')
+    return { label: title, value: item.id, meta }
+  })
 )
 // 当前线程还没落库（新会话没发过消息）时下拉里没有对应项，置空让组件显示 placeholder
 const threadSelectValue = computed(() =>

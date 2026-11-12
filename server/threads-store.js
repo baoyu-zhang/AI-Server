@@ -42,11 +42,40 @@ function saveRun({ threadId, runId, userId, messages }) {
   `).run(runId, threadId, userId, JSON.stringify(messages || []), now)
 }
 
-/** 某用户的会话列表，按最近活跃排序 */
+/**
+ * 某用户的会话列表，按最近活跃排序
+ *
+ * 除标题外多返回 preview（最后一条用户消息）与 turnCount：
+ * 标题在创建时就定死为首条消息，长会话聊了十几轮标题还是第一句，
+ * 下拉里全是「你好」「几点」分不清谁是谁——用户在界面上会以为"最新会话没进列表"。
+ */
 function listThreads(userId) {
-  return db.prepare(
-    'SELECT id, title, updated_at FROM threads WHERE user_id = ? ORDER BY updated_at DESC LIMIT 100'
-  ).all(userId)
+  const rows = db.prepare(`
+    SELECT t.id, t.title, t.updated_at,
+           (SELECT r.messages FROM thread_runs r
+             WHERE r.thread_id = t.id
+             ORDER BY r.created_at DESC LIMIT 1) AS snapshot
+    FROM threads t
+    WHERE t.user_id = ?
+    ORDER BY t.updated_at DESC
+    LIMIT 100
+  `).all(userId)
+
+  return rows.map(row => {
+    let preview = ''
+    let turnCount = 0
+    try {
+      const msgs = JSON.parse(row.snapshot || '[]')
+      if (Array.isArray(msgs)) {
+        turnCount = msgs.filter(m => m?.role === 'user').length
+        const lastUser = [...msgs].reverse().find(m => m?.role === 'user')
+        preview = String(lastUser?.content ?? '').replace(/\s+/g, ' ').trim().slice(0, 40)
+      }
+    } catch {
+      // 快照损坏只影响预览，不影响列表本身
+    }
+    return { id: row.id, title: row.title, updated_at: row.updated_at, preview, turnCount }
+  })
 }
 
 /** 取某个会话最新一轮的消息快照；不存在或不属于该用户返回 null */
