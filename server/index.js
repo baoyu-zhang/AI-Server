@@ -173,7 +173,27 @@ if (fs.existsSync(WEB_DIST)) {
   })
   console.log('[static] 已托管前端构建产物:', WEB_DIST)
 } else {
-  console.log('[static] 未找到 web/dist，跳过静态托管（开发模式请继续用 vite dev server）')
+  // 云上走到这里 = 镜像里没有前端产物。最常见的根因是 Railway 的 Root Directory 填成了
+  // server，于是平台用了只带后端的 server/Dockerfile。以前请求会继续落到 requireAuth，
+  // 返回 {"error":"未登录，请先登录"}，看起来像鉴权坏了，其实是压根没有页面可登录。
+  // 所以这里给一个能自解释的诊断页，把修复方法直接写在浏览器里，不再让人猜。
+  console.warn('[static] 未找到 web/dist：镜像缺少前端产物。云端部署请确认 Root Directory=/ 且使用仓库根 Dockerfile')
+  app.use((req, res, next) => {
+    // 只拦页面类 GET；API 请求照旧放行到后面的鉴权与路由
+    if (req.method !== 'GET' || req.path.startsWith('/api')) return next()
+    res.status(503).type('html').send(`<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><title>前端产物缺失</title></head>
+<body style="font:14px/1.8 system-ui,-apple-system,sans-serif;max-width:720px;margin:60px auto;padding:0 24px">
+<h1>服务已启动，但镜像里没有前端页面</h1>
+<p>后端是活的，只是找不到 <code>web/dist</code>，所以没有登录页。云端部署请依次检查：</p>
+<ol>
+<li>Railway → Settings → Source → <b>Root Directory 必须是 <code>/</code></b>（不是 <code>server</code>，也不是仓库名）；</li>
+<li>Build Logs 里应当出现 <code>vue-tsc -b &amp;&amp; vite build</code>，说明用的是仓库根 Dockerfile 的两阶段构建；</li>
+<li>改完重新部署，本页会变成正常的登录页。</li>
+</ol>
+<p style="color:#666">本机开发不受影响，可继续用 vite dev server（8082）。</p>
+</body></html>`)
+  })
 }
 
 app.use(requireAuth)

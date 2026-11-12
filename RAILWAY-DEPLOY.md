@@ -240,8 +240,8 @@ curl -s -X POST https://xxxx.up.railway.app/api/auth/login \
 | 容器反复重启、日志有「缺少 DEEPSEEK_API_KEY」 | 变量没填或填了示例值 | Variables 核对，重新 Deploy |
 | 日志有「生产配置自检未通过」 | 弱口令 / 数据目录不可写 | 按日志里的中文提示改；目录不可写通常是卷没挂 |
 | 健康检查一直 `Starting Container` 直到超时 | healthcheckPath 不是 `/api/health`，或应用没起来看日志 | 先用 Deploy Logs 看启动报错；timeout 保持 300s |
-| 打开域名是 404 / 只有 JSON | 用了旧的 `server/Dockerfile`（只有后端） | 确认根 Dockerfile 生效；`web/dist` 由构建阶段生成 |
-| 打开域名是 401 JSON | 静态托管挂到了鉴权之后（老版本代码） | 确认推的是最新 main |
+| 打开域名整页只有 `{"error":"未登录，请先登录"}` | **镜像里没有 `web/dist`** → `index.js` 跳过静态托管 → 请求落到 `requireAuth`。九成是 Root Directory 填成了 `server`，平台用了只带后端的 `server/Dockerfile` | Deploy Logs 找 `[static] 未找到 web/dist`；Build Logs 应有 `vue-tsc -b && vite build`。把 Root Directory 改回 `/` 再部署。新版会返回一张中文诊断页（HTTP 503）直接写明这三步 |
+| 打开域名 404，但日志有 `[static] 已托管前端构建产物: /web/dist` | 静态资源路径不对，或请求实际打到了 API | 核对 `WEB_DIST` 与容器内 `/web/dist`；SPA fallback 对 `/api` 是放行的 |
 | 每次部署后数据全空 | **卷没挂**或 Mount Path 不是 `/app/data` | Volumes 页核对路径 |
 | 首次对话特别慢（1 分钟以上） | embedding 模型首次下载几百 MB | 设 `WARMUP_EMBEDDING=1`；模型缓存已在卷里，第二次部署不再重下 |
 | 历史图片 403 | `IMAGE_SIGN_SECRET` 变了，或开了 `IMAGE_SIGN_TTL_DAYS` 且链接过期 | 固定密钥；关掉 TTL 或重新发图 |
