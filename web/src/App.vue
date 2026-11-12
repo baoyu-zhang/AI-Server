@@ -1546,16 +1546,18 @@ async function loadThread(id: string) {
   // 恢复期间锁住发送：半恢复状态下发消息会把上下文拼错（曾出现两条一样的用户气泡）
   chatStore.loading = true
   try {
-    const body = await fetchJson<{ messages: Array<Record<string, any>>; state?: Record<string, unknown> }>(
-      `/api/threads/${encodeURIComponent(id)}/messages`
-    )
+    const body = await fetchJson<{
+      messages: Array<Record<string, any>>
+      state?: Record<string, unknown>
+      pendingInterrupts?: Array<{ id: string; toolCallId?: string; message?: string }>
+    }>(`/api/threads/${encodeURIComponent(id)}/messages`)
     const snapshot: Array<Record<string, any>> = Array.isArray(body?.messages) ? body.messages : []
     if (!snapshot.length) {
       MessagePlugin.warning('该会话暂无可恢复的消息')
       return
     }
-    // 旧线程的挂起中断与运行时工具状态全部作废
-    pendingInterrupts = []
+    // 旧线程的运行时工具状态全部作废；挂起中断不能清空——服务端在快照里检测出
+    // 未闭环的审批（有 tool-call 无结果）时会返回 pendingInterrupts，下面重建
     activeToolIds.clear()
     toolCallNames.clear()
     toolRounds = 0
@@ -1571,6 +1573,13 @@ async function loadThread(id: string) {
     chatStore.agentState = cloneAgentState(
       body?.state && typeof body.state === 'object' ? body.state : {}
     )
+    // 重建未闭环的审批中断：结构与服务端 RUN_FINISHED 下发的 interrupts 一致，
+    // 填回 approvalByToolCallId 后 toolStepsOf 会把对应步骤标成 waiting，确认卡片重新出现。
+    // 附件类审批此时执行会因附件不在而安全失败，状态类审批可正常走完
+    pendingInterrupts = (body?.pendingInterrupts || []) as Interrupt[]
+    for (const it of pendingInterrupts) {
+      if (it.toolCallId) approvalByToolCallId.set(it.toolCallId, { interruptId: it.id, message: it.message })
+    }
     threadId.value = id
     // 附件按 sessionId 绑定，恢复会话不恢复附件，换新 id 避免旧附件被静默检索
     sessionId.value = createSessionId()

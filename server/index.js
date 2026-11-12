@@ -437,6 +437,40 @@ function approvalMessage({ toolName, input }) {
 }
 
 /**
+ * 从消息快照里找出未闭环的审批中断。
+ *
+ * 闭环判据：审批工具的 tool-call 挂在 assistant 上（function.name 在白名单里），
+ * 用户决定（同意/拒绝）后 resume 会往历史补一条 role:'tool' 且 toolCallId 相同的结果消息。
+ * 有 call 无结果 = 用户还没决定——刷新/切页会丢掉客户端内存里的 interrupt 状态，
+ * 恢复会话时靠这里重建确认卡片，resume 走现有链路，服务端不需要额外存储。
+ * 注意：附件类审批恢复后执行会因附件不在而安全失败（服务端返回明确错误），
+ * 状态类审批（updateCandidateStatus）不受影响。
+ */
+function findPendingInterrupts(messages) {
+  const resolved = new Set(
+    (messages || []).filter(m => m?.role === 'tool' && m.toolCallId).map(m => m.toolCallId)
+  )
+  const out = []
+  for (const message of messages || []) {
+    if (message?.role !== 'assistant') continue
+    for (const call of Array.isArray(message.toolCalls) ? message.toolCalls : []) {
+      const toolName = call?.function?.name
+      if (!toolName || !APPROVAL_TOOL_NAMES.has(toolName)) continue
+      if (resolved.has(call.id)) continue // 已闭环：结果消息存在
+      const input = parseToolArguments(call.function?.arguments)
+      out.push({
+        id: `${INTERRUPT_PREFIX}${call.id}`,
+        toolCallId: call.id,
+        toolName,
+        input,
+        message: approvalMessage({ toolName, input })
+      })
+    }
+  }
+  return out
+}
+
+/**
  * 执行用户已确认的审批工具。
  * 三道校验都不是多余的：resume 的 interruptId 来自客户端，属于不可信输入。
  */
@@ -1415,7 +1449,8 @@ app.get('/api/threads/:threadId/messages', (req, res) => {
   const result = getThreadMessages(req.params.threadId, req.user.userId)
   // 404 同时覆盖"不存在"和"存在但不属于你"：不区分才能不泄露会话 id 的存在性
   if (!result) return res.status(404).json({ error: '会话不存在或无权访问' })
-  res.json({ ok: true, ...result })
+  // 未闭环的审批中断一并返回：前端据此重建确认卡片（见 findPendingInterrupts）
+  res.json({ ok: true, ...result, pendingInterrupts: findPendingInterrupts(result.messages) })
 })
 
 // 清空知识库不走 HTTP：原 /api/vector-clear 没有鉴权，部署到公网后一次 POST 就能清库。
