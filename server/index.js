@@ -20,6 +20,7 @@ const { recordAudit, listAudit } = require('./audit') // 操作审计：谁批�
 const { startAutoBackup } = require('./backup') // SQLite 定时备份（VACUUM INTO）
 const { saveRun, listThreads, getThreadMessages } = require('./threads-store') // 会话落库
 const { saveUsage, listUsage, sumUsage } = require('./usage-store') // 模型用量落库
+const { addMemory, forgetMemory, listMemories } = require('./memory-store') // 跨会话长期记忆
 const { createApiKey, listApiKeys, revokeApiKey } = require('./api-keys') // API Key 签发/校验
 const db = require('./db') // SQLite 数据层（RBAC 引导直接写 users.role）
 const { EVENTS: WEBHOOK_EVENTS, addWebhook, listWebhooks, deleteWebhook, dispatchWebhook } = require('./webhook-store') // Webhook 事件通知
@@ -209,6 +210,50 @@ function createTools(sessionId, userId) {
             return '错误：运算符仅支持 + - * /'
         }
         return `计算结果：${a} ${op} ${b} = ${res}`
+      }
+    }),
+
+    // ---- 长期记忆：写入/删除。跨会话生效，所以两个端点（/agui、/v1）都能用 ----
+    // 为什么做成工具而不是服务端自动提取：让模型自己判断"什么值得记"，规则写在
+    // description 里（记稳定事实、不记闲聊）；自动提取要额外跑一次 LLM，成本翻倍还可能记错。
+    remember: tool({
+      // description 是"记什么"的唯一约束来源，这里刻意做了双向约束：
+      //   正向列场景（称呼/偏好/职责），反向禁止（临时信息、对话内容照搬）。
+      description: `把关于用户的稳定事实保存为长期记忆（跨会话有效）。以下情况调用：
+            1. 用户明确要求"记住……"；
+            2. 用户透露了值得长期记住的信息：怎么称呼他/她、职位与工作职责、长期偏好（如"回答要简洁""用表格"）、团队成员等。
+            不要调用：临时信息（"今天下午开会"）、一句话闲聊、与用户本人无关的知识。`,
+      inputSchema: z.object({
+        fact: z.string().min(2).max(200).describe('一句话事实，如"用户叫小明，希望回答简洁"')
+      }),
+      execute: async ({ fact }) => {
+        // addMemory 内部做了去重（完全相同不重复存）与长度截断；返回 saved=false 也要如实告知，
+        // 模型读到"已存在"就不会反复保存同一条
+        const { saved, content } = addMemory(userId, fact)
+        console.log('[memory] remember:', saved ? '已保存' : '已存在', JSON.stringify(content))
+        return saved
+          ? `已记住：${content}（以后所有会话都有效）`
+          : `这条记忆已经存在，无需重复保存：${content}`
+      }
+    }),
+
+    forget: tool({
+      // 与 remember 成对：用户说"忘掉我叫小明"时，模型要能删掉旧记忆，
+      // 否则注入的 system 记忆会一直和新说法冲突。
+      description: '删除一条长期记忆。当用户明确要求"忘掉……"或更正了此前让你记住的信息时调用',
+      inputSchema: z.object({
+        fact: z.string().min(2).max(200).describe('要删除的记忆原文（需与保存时一致）')
+      }),
+      execute: async ({ fact }) => {
+        // 按内容精确匹配删除；删除失败通常是用户记错了原文——
+        // 返回现有记忆列表让模型能引导用户确认要删哪条
+        const removed = forgetMemory(userId, fact)
+        console.log('[memory] forget:', removed ? '已删除' : '未找到', JSON.stringify(fact))
+        if (removed) return `已忘掉：${fact}`
+        const rest = listMemories(userId).map(m => `- ${m.content}`).join('\n')
+        return rest
+          ? `没有找到这条记忆。当前保存的记忆有：\n${rest}`
+          : '没有找到这条记忆，当前没有保存任何记忆。'
       }
     }),
 
@@ -860,6 +905,7 @@ app.post('/agui', async (req, res) => {
     const { result, meta } = chatStream = prepareChatStream({
       messages: chatMessages,
       sessionId,
+      userId, // 注入跨会话长期记忆（system 层），remember/forget 工具写入也靠它归属
       tools,
       abortSignal: abortController.signal, // 客户端断开时中止模型流
       logTag: 'agui'
@@ -1501,6 +1547,7 @@ app.post('/v1/chat/completions', requireAuth, async (req, res) => {
       messages,
       systemPrompt: systemText || undefined, // OpenAI 的 system 消息 → AI SDK 的 instructions
       sessionId,
+      userId, // API Key 绑定了 userId：记忆注入与 remember 工具同样生效
       tools,
       abortSignal: abortController.signal,
       logTag: 'openai'

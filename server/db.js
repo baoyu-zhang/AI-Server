@@ -87,6 +87,19 @@ CREATE TABLE IF NOT EXISTS model_usage (
   created_at    INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_usage_user ON model_usage(user_id, created_at);
+
+-- ===== 跨会话长期记忆 =====
+-- 存"关于某个用户的稳定事实"（称呼、偏好、职责等），由模型在对话中通过 remember
+-- 工具主动写入，每轮对话注入 system 上下文——这样换会话/换设备模型仍然"记得"。
+-- 为什么不存对话摘要：摘要体积大、噪声多，注入会挤占上下文；只存离散事实，
+-- 一条一句话，几十条也才几百 token。
+CREATE TABLE IF NOT EXISTS user_memory (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id    TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, -- 记忆归属于人，不归属于会话
+  content    TEXT NOT NULL,             -- 一句话事实，如"用户叫小明，偏好简洁回答"
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_memory_user ON user_memory(user_id, created_at);
 `)
 
 // ===== 轻量迁移：CREATE TABLE IF NOT EXISTS 对已存在的表不生效，加列只能走 ALTER =====

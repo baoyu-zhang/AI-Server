@@ -18,6 +18,7 @@ const { streamText, stepCountIs } = require('ai') // 流式生成 + 工具步数
 const { createDeepSeek } = require('@ai-sdk/deepseek') // DeepSeek 模型提供方
 const { getEncoding } = require('js-tiktoken') // BPE 分词器，用于近似统计 token
 const { getSessionFiles, getSessionImages } = require('./session-files') // 会话级临时附件
+const { listMemories } = require('./memory-store') // 跨会话长期记忆（按用户维度）
 
 // ===== 1. 可调参数：全部支持环境变量覆盖，避免硬编码 =====
 // 单独抽出来的意义：改模型 / 改预算不用碰逻辑代码，出问题也能用环境变量快速回滚。
@@ -159,6 +160,24 @@ function buildAttachmentSystemPrompt(sessionId) {
 }
 
 /**
+ * 生成长期记忆系统提示。
+ * 与附件清单同理走 instructions：不污染对话历史、每轮自动同步、优先级高。
+ * 为什么注入而不是给模型一个"查询记忆"工具：
+ *   记忆数量有上限（默认 50 条、每条 ≤200 字），全量注入也就几百 token，
+ *   一次到位比"模型要先决定查一次再等结果"更可靠——查询式记忆容易漏查。
+ * @param {string} userId 用户 id；没传（老调用方）返回空串，行为与从前一致
+ */
+function buildMemorySystemPrompt(userId) {
+  if (!userId) return ''
+  const memories = listMemories(userId)
+  if (!memories.length) return ''
+  const list = memories.map((m, i) => `${i + 1}. ${m.content}`).join('\n')
+  return `以下是系统长期记住的、关于这位用户的稳定事实（跨会话有效）：\n${list}\n\n使用规则：
+1. 回答时自然运用这些事实（比如用用户的称呼），但不要生硬复述"系统记忆里写着"。
+2. 这些事实与对话中的新信息冲突时，以对话中的新信息为准，并可以调用 remember 工具更新记忆。`
+}
+
+/**
  * 把文本 / 结构化 content 统一成 parts 数组。
  *
  * 存在的意义：content 有两种合法形态（字符串、parts 数组），直接 String() 会毁掉数组形态。
@@ -267,6 +286,7 @@ function defaultStepLogger(tag) {
  * @param {string} [params.systemPrompt] 调用方自带的系统提示（如 OpenAI 兼容端点收到的 system 消息），
  *        与附件清单 instructions 拼接后走 streamText 的 instructions 选项
  * @param {string} [params.sessionId] 会话 id，用于取本次会话的附件
+ * @param {string} [params.userId] 用户 id，用于注入跨会话长期记忆（OpenAI 端点与 /agui 都要传）
  * @param {object} params.tools 工具集合（含 execute）
  * @param {AbortSignal} [params.abortSignal] 客户端断开时中止模型流
  * @param {Function} [params.onFinish] 生成结束回调（协议层写自己的结束事件）
@@ -278,6 +298,7 @@ function prepareChatStream({
   messages,
   systemPrompt,
   sessionId,
+  userId,
   tools,
   abortSignal,
   onFinish,
@@ -285,10 +306,15 @@ function prepareChatStream({
   logTag = 'chat'
 }) {
   const { trimmedMessages, isTrimmed, droppedCount } = trimMessages(messages) // 控制上下文长度
-  // 系统提示分两路来源拼成一份：调用方自带（OpenAI 兼容端点转发的 system 消息）+ 附件清单。
+  // 系统提示三路来源拼成一份：调用方自带（OpenAI 兼容端点转发的 system 消息）
+  // + 附件清单（本次会话）+ 长期记忆（跨会话，按用户）。
   // filter(Boolean) 去掉空段再 join，避免出现连续空行；都为空时 instructions 为 ''，
   // 调用处 `|| undefined` 会把它转成不传。
-  const instructions = [systemPrompt, buildAttachmentSystemPrompt(sessionId)].filter(Boolean).join('\n\n')
+  const instructions = [
+    systemPrompt,
+    buildMemorySystemPrompt(userId), // 记忆放附件清单前面：身份类信息比"上传了什么"更靠前
+    buildAttachmentSystemPrompt(sessionId)
+  ].filter(Boolean).join('\n\n')
   const images = getSessionImages(sessionId) // 图片附件（多模态）
   const modelMessages = attachImagesToLastUserMessage(trimmedMessages, images) // 图片挂到最后一条 user 消息
   const modelId = images.length ? MODEL_VISION : MODEL_REASONING // 有图走视觉模型
@@ -331,6 +357,7 @@ module.exports = {
   toContentParts, // 导出供单测：数组/字符串两种形态都要覆盖
   attachImagesToLastUserMessage, // 导出供单测
   buildAttachmentSystemPrompt,
+  buildMemorySystemPrompt,
   MODEL_REASONING,
   MODEL_VISION,
   MAX_AGENT_STEPS,
