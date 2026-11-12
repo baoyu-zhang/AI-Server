@@ -56,6 +56,16 @@
 
 ### 2.1 新版控制台（Staged Changes）该怎么点
 
+> ⚠️ **硬前提：Source 必须先连上仓库。** 只要 Settings → Source 里还摆着
+> `Connect Repo` / `Connect Image` 两个按钮，这个服务就**没有任何代码来源**，
+> 下面这些入口全都不会产生构建：`Deploy` 横幅、`Make a deployment to get started.`、
+> `Deploy Latest Commit`、`Redeploy`、右侧 AI 助手的 `Deploy Latest Commit`、命令面板。
+> 此时 Railway 的 AI 助手会直接回：
+> *"This service has never deployed, so there's no latest commit to redeploy. `/app` also isn't a git repository"*。
+> 那句话的意思不是「代码坏了」，而是**服务里压根没有 git 仓库可以拿 commit**。
+> 注意：**在 GitHub 装了 Railway App ≠ 在 Railway 里选了仓库**，这两步是分开的。
+> 另外 Root Directory 输入框那个 `/` 只是 CLI 部署的子目录，不是仓库路径，别把它当仓库已连上的证据。
+
 新界面把「新建服务」变成一条**待应用变更**，画布上显示 `Service will be created`、
 顶部出现 `Apply 1 change` / `Details` / `Deploy`。这不是部署失败，是服务还没真正创建。
 按这个顺序点，别一进来就 Deploy：
@@ -108,6 +118,8 @@
 | `生产配置自检未通过：数据目录不可写` | Volume 没挂、或挂载路径不是 `/app/data` | 按第三节挂卷后重新部署 |
 | Build Logs 里 `npm ci` / `COPY` 失败 | Dockerfile 构建阶段问题 | 复制完整 Build Logs 再对着改 |
 | 部署列表为空，且 Source 仍显示 `Connect Repo` | 只授权了 GitHub App，**没在 Railway 里选仓库** | 回 Settings → Source 选 `AI-Server` / `main` |
+| 点 `Deploy Latest Commit` / `Redeploy` 没反应，或 AI 助手回 `no latest commit to redeploy` · `/app isn't a git repository` | 服务没有 Source，`Redeploy` 只能重跑**已经成功过**的部署 | 先 Connect Repo 选 `baoyu-zhang/AI-Server` / `main`，再回 Deployments 触发首次部署；AI 助手也一样绕不开 Source |
+| Connect Repo 点开后仓库下拉是空的 | GitHub App 只授权了别的仓库，或安装事件没同步 | GitHub → Settings → Applications → Railway → Configure 勾上 `AI-Server`；回 Railway 刷新，必要时把 All ↔ Only 切换保存一次 |
 
 > 最容易踩的两个组合：① 以为 GitHub 授权完仓库就自动连上了，其实还要在 Railway 选一次；
 > ② 把本机的 `ADMIN_PASSWORD=123456` 照抄到云上，被生产自检拦下，表现为容器反复重启、服务一直 offline。
