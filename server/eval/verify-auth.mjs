@@ -2,12 +2,14 @@
 /**
  * M1 验收：鉴权 + 数据隔离 + 会话落库 + 服务重启不丢数据
  *
- * 分四段，全程不调模型：
+ * 分五段，全程不调模型：
  *   A. 鉴权本身：未登录 401 / 注册 / 登录 / 错误密码 401 / 登出后 token 失效
  *   B. 数据隔离：A 上传文档 B 看不见；B 删 A 的文档 404；B 检索不到 A 的内容；
  *      候选人表同 id 不同账号互不干扰
  *   C. 会话落库：跑一轮 /agui 后，GET /api/threads 有记录，快照可读，别人的读不到
  *   D. 重启不丢：候选人状态写库 → （提示手工重启验证，脚本内重启不可靠）
+ *   E. 限流与审计：连续错误密码触发 429 且锁定期内正确密码也拒绝；审计表能查到
+ *      注册/登录失败/锁定，以及删除失败这类越权尝试
  *
  * 用法：node eval/verify-auth.mjs   （服务需已启动）
  */
@@ -215,6 +217,63 @@ async function testThreads({ a, b }) {
   return { aToken: a.token }
 }
 
+// ========== E. 限流与审计 ==========
+async function testLimitsAndAudit() {
+  section('E. 限流与审计')
+  // 每次用随机用户名：锁定是按 IP+用户名计的，复用名字会让下一轮一进来就被锁
+  const username = `auth_rl_${randomUUID().slice(0, 6)}`
+  const password = 'correct-pass-123'
+  const jsonHeaders = { 'Content-Type': 'application/json' }
+
+  const reg = await raw('/api/auth/register', {
+    method: 'POST', headers: jsonHeaders, body: JSON.stringify({ username, password })
+  })
+  // token 要先拿到：账号马上就会被自己的错误密码锁住，登不进去
+  check('注册成功并拿到 token', reg.status === 200 && Boolean(reg.body.token), reg)
+
+  let fifth
+  for (let i = 0; i < 5; i++) {
+    fifth = await raw('/api/auth/login', {
+      method: 'POST', headers: jsonHeaders, body: JSON.stringify({ username, password: 'wrong-pass' })
+    })
+  }
+  check('前 5 次错误密码返回 401', fifth.status === 401, fifth)
+
+  // 第 6 次需要看响应头，raw() 只保留了 body，这里直接 fetch
+  const sixth = await fetch(`${BASE_URL}/api/auth/login`, {
+    method: 'POST',
+    headers: jsonHeaders,
+    body: JSON.stringify({ username, password: 'wrong-pass' }),
+    signal: AbortSignal.timeout(TIMEOUT_MS)
+  })
+  check('第 6 次错误密码被限流 429', sixth.status === 429, sixth.status)
+  const retryAfter = Number(sixth.headers.get('retry-after') || 0)
+  check('429 带 Retry-After（秒）', retryAfter > 0, retryAfter)
+
+  const lockedRight = await raw('/api/auth/login', {
+    method: 'POST', headers: jsonHeaders, body: JSON.stringify({ username, password })
+  })
+  // 关键断言：锁定期内正确密码也必须拒绝，否则锁定就成了免费的密码校验器
+  check('锁定期间正确密码同样 429', lockedRight.status === 429, lockedRight)
+
+  const auth = { Authorization: `Bearer ${reg.body.token}` }
+  const audit = await raw('/api/audit?limit=30', { headers: auth })
+  const actions = (audit.body.data || []).map(item => item.action)
+  check('审计含注册记录', actions.includes('auth.register'), actions)
+  check('审计含登录失败记录', actions.filter(a => a === 'auth.login_failed').length >= 4, actions)
+  check('审计含锁定记录', actions.includes('auth.login_locked'), actions)
+
+  // 失败/越权的写操作最该留痕：这里用不存在的文件名等价于"删不动别人的文档"
+  await raw('/api/documents/delete', {
+    method: 'POST', headers: { ...jsonHeaders, ...auth },
+    body: JSON.stringify({ fileName: `missing-${username}.md` })
+  })
+  const afterDelete = await raw('/api/audit?limit=5', { headers: auth })
+  const newest = afterDelete.body.data?.[0]
+  check('删除失败也写入审计', newest?.action === 'doc.delete', newest)
+  check('审计记录了失败结果', /"ok":false/.test(String(newest?.detail || '')), newest?.detail)
+}
+
 // ========== 清理 ==========
 async function cleanup({ aToken }) {
   section('清理')
@@ -231,6 +290,7 @@ try {
   await testAuthBasics()
   Object.assign(ctx, await testIsolation())
   Object.assign(ctx, await testThreads(ctx))
+  await testLimitsAndAudit()
   await cleanup(ctx)
   console.log(`\n${bold(`通过 ${passed} 项，失败 ${failed} 项`)}`)
   process.exit(failed ? 1 : 0)

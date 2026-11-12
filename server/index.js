@@ -16,6 +16,8 @@ const { addSessionFile, addSessionImage, deleteSessionFile, getSessionFiles, sea
 const { prepareChatStream, MAX_CONTEXT_TOKENS } = require('./chat-core') // 聊天主链路（裁剪/附件/选模型/streamText）
 const { scoreResumeAgainstJD } = require('./score-resume') // 招聘场景的领域能力：简历 × JD 匹配度评估
 const { authRouter, requireAuth } = require('./auth') // 注册/登录 + 全局鉴权闸门
+const { recordAudit, listAudit } = require('./audit') // 操作审计：谁批准了什么写操作
+const { startAutoBackup } = require('./backup') // SQLite 定时备份（VACUUM INTO）
 const { saveRun, listThreads, getThreadMessages } = require('./threads-store') // 会话落库
 const {
   CANDIDATE_STATUS, // 状态白名单，工具入参的 enum 与写库校验共用一份
@@ -424,27 +426,55 @@ function approvalMessage({ toolName, input }) {
  * 执行用户已确认的审批工具。
  * 三道校验都不是多余的：resume 的 interruptId 来自客户端，属于不可信输入。
  */
-async function executeApprovalTool(toolName, input, sessionId, userId) {
+async function executeApprovalTool(toolName, input, sessionId, userId, ctx = {}) {
   if (!APPROVAL_TOOL_NAMES.has(toolName)) return `操作失败：未知的审批工具 ${toolName}` // 白名单：防止伪造中断去调别的工具
+
+  // 审计要在"执行之后"记：只有真正跑完才知道结果（成功还是"本次会话没有这个附件"）。
+  // 目标对象按工具取不同字段，失败也必须留痕——失败的删除尝试同样是安全事件。
+  const audit = (target, ok, output) => recordAudit({
+    userId,
+    ip: ctx.ip,
+    action: `tool.${toolName}`,
+    target,
+    detail: { ok, output: String(output).slice(0, 300) }
+  })
 
   if (toolName === 'deleteSessionFile') {
     const fileName = String(input?.fileName || '').trim()
-    if (!fileName) return '删除失败：缺少文件名'
+    if (!fileName) {
+      audit('', false, '缺少文件名')
+      return '删除失败：缺少文件名'
+    }
     // 只在本会话附件里找：防止构造一个别的会话的文件名来越权删除
     const file = getSessionFiles(sessionId).find(item => item.fileName === fileName)
-    if (!file) return `删除失败：本次会话中没有名为「${fileName}」的附件`
-    return deleteSessionFile(sessionId, file.fileId)
-      ? `已删除附件：${fileName}`
-      : `删除失败：${fileName}`
+    if (!file) {
+      const msg = `删除失败：本次会话中没有名为「${fileName}」的附件`
+      audit(fileName, false, msg)
+      return msg
+    }
+    const ok = deleteSessionFile(sessionId, file.fileId)
+    const msg = ok ? `已删除附件：${fileName}` : `删除失败：${fileName}`
+    audit(fileName, ok, msg)
+    return msg
   }
 
   // updateCandidateStatus：真正的写库动作在 candidates-store.js，这里只负责把结果翻译成一句人话
   // userId 必须透传：审批链路也不能改到别人名下的候选人
   const candidateId = String(input?.candidateId || '').trim()
   const result = await updateCandidateStatus(candidateId, input?.status, userId)
-  if (!result.ok) return `状态修改失败：${result.error}`
-  if (result.unchanged) return `候选人「${candidateId}」的状态已经是「${result.record.status}」，未做修改`
-  return `已将候选人「${candidateId}」的状态从「${result.from}」改为「${result.record.status}」`
+  if (!result.ok) {
+    const msg = `状态修改失败：${result.error}`
+    audit(candidateId, false, msg)
+    return msg
+  }
+  if (result.unchanged) {
+    const msg = `候选人「${candidateId}」的状态已经是「${result.record.status}」，未做修改`
+    audit(candidateId, true, msg)
+    return msg
+  }
+  const msg = `已将候选人「${candidateId}」的状态从「${result.from}」改为「${result.record.status}」`
+  audit(candidateId, true, msg)
+  return msg
 }
 
 // ========== AG-UI 协议适配层 ==========
@@ -674,9 +704,20 @@ app.post('/agui', async (req, res) => {
       const approved = entry.status === 'resolved' && entry.payload?.approved !== false
       // executeApprovalTool 现在是 async（改状态要写 JSON 文件），必须 await，
       // 否则下面写回历史的 content 会是一个 Promise，序列化出来是 {}
-      const output = approved
-        ? await executeApprovalTool(call.name, call.input, sessionId, userId)
-        : '用户拒绝了该操作，未执行'
+      let output
+      if (approved) {
+        output = await executeApprovalTool(call.name, call.input, sessionId, userId, { ip: req.ip })
+      } else {
+        // 拒绝也要留痕：审计要能回答"用户看过并拒绝了哪次删除"
+        recordAudit({
+          userId,
+          ip: req.ip,
+          action: `tool.${call.name}.rejected`,
+          target: String(call.input?.fileName || call.input?.candidateId || ''),
+          detail: { approved: false }
+        })
+        output = '用户拒绝了该操作，未执行'
+      }
       // 结果写回历史：快照、模型上下文、前端卡片都靠这条消息对齐
       const messageId = `msg_tool_${++toolMessageSeq}`
       aguiMessages.push({ id: messageId, role: 'tool', content: output, toolCallId })
@@ -1102,6 +1143,15 @@ app.post('/api/upload-doc', upload.single('file'), async (req, res) => {
       candidateId,
       msg: `成功入库${chunks.length}个文本块${removed ? `，已覆盖旧片段${removed}个` : ''}${renamed ? `，同名文件已另存为「${fileName}」` : ''}`
     })
+    // 入库是写操作，审计要能回答"这份简历是谁什么时候传的"（覆盖上传也算一次）
+    recordAudit({
+      userId: req.user.userId,
+      actor: req.user.username,
+      ip: req.ip,
+      action: 'doc.upload',
+      target: fileName,
+      detail: { docType, jobId, candidateId, chunks: chunks.length, removed, renamed }
+    })
   } catch (err) {
     console.error('文档上传解析失败：', err)
     // 解析阶段抛错（加密文档 / 损坏 docx / 扫描版 PDF）也要清掉已落盘的文件，
@@ -1129,10 +1179,29 @@ app.post('/api/documents/delete', async (req, res) => {
     const { fileName } = req.body
     if (!fileName) return res.status(400).json({ error: '缺少fileName' })
     const removed = await deleteDocument(fileName, req.user.userId)
+    // 删除失败（别人的文件 / 不存在）同样记一条：越权尝试是最该留痕的动作
+    recordAudit({
+      userId: req.user.userId,
+      actor: req.user.username,
+      ip: req.ip,
+      action: 'doc.delete',
+      target: String(fileName),
+      detail: { ok: removed > 0, removedChunks: removed }
+    })
     if (!removed) return res.status(404).json({ error: '文档不存在或无权删除' })
     res.json({ ok: true, fileName, removed })
   } catch (err) {
     console.error('删除文档失败', err)
+    res.status(500).json({ error: err.message })
+  }
+})
+// 审计查询：只返回自己的记录（管理员全局视图要等有了角色体系再做）
+app.get('/api/audit', (req, res) => {
+  try {
+    const data = listAudit(req.user.userId, req.user.username, req.query.limit)
+    res.json({ ok: true, data })
+  } catch (err) {
+    console.error('读取审计失败', err)
     res.status(500).json({ error: err.message })
   }
 })
@@ -1274,4 +1343,6 @@ app.use((err, req, res, next) => {
 
 app.listen(PORT, () => { // 启动 HTTP 服务并监听端口
   log.info(`服务启动 http://localhost:${PORT}`, { port: PORT, node: process.version })
+  // 备份在 listen 之后再起：先让服务能接请求，再去做可能耗时的 IO
+  startAutoBackup()
 })

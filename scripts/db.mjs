@@ -101,6 +101,19 @@ try {
       break
     }
 
+    case 'audit': {
+      const n = Number(args[1] || 30)
+      show(
+        `SELECT a.id, u.username, a.action, a.target,
+                substr(COALESCE(a.detail, ''), 1, 60) AS detail,
+                a.ip, ${ts('a.created_at')} AS at
+           FROM audit_log a LEFT JOIN users u ON u.id = a.user_id
+          ORDER BY a.created_at DESC, a.id DESC LIMIT ?`,
+        [n]
+      )
+      break
+    }
+
     case 'path':
       console.log(DB_PATH)
       console.log(`${(fs.statSync(DB_PATH).size / 1024).toFixed(0)} KB`)
@@ -141,7 +154,7 @@ try {
     }
 
     default:
-      console.log('命令：users | threads [n] | messages <threadId> | sql "<SQL>" [--write] | clean [--write] | path')
+      console.log('命令：users | threads [n] | messages <threadId> | audit [n] | sql "<SQL>" [--write] | clean [--write] | path')
   }
 } finally {
   db.close()
