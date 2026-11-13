@@ -125,8 +125,11 @@ if (FILE_ENABLED) {
     openForDay(dayStamp())
     prune()
     teeStdio()
-    // 启动时打一行，终端和文件里都能看到"到底写哪去了"
-    console.log(`[logger] 文件日志: ${logFile()}（保留 ${KEEP_DAYS} 天，单文件 ${Math.round(MAX_BYTES / 1024 / 1024)}MB 轮转）`)
+    // 启动时打一行，终端和文件里都能看到"到底写哪去了"。
+    // 必须走 stderr 而不是 stdout：restore.js --list、backup 相关 CLI 的 stdout 常被
+    // 脚本用管道取备份文件名（如 `ARCHIVE=$(node ...)`），混进这一行会让下游拿到
+    // 两行文本，白名单校验直接报「文件名非法」。结构化日志本身仍走 stdout 供平台收集。
+    console.error(`[logger] 文件日志: ${logFile()}（保留 ${KEEP_DAYS} 天，单文件 ${Math.round(MAX_BYTES / 1024 / 1024)}MB 轮转）`)
   } catch (err) {
     broken = true
     console.error(`[logger] 文件日志初始化失败，仅输出到 stdout：${err.message}`)

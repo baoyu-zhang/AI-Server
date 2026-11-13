@@ -12,6 +12,18 @@
  * 模型要给 level>0，就必须摘一句简历原文作证据。摘不出来，代码会把这一项强制降为 0
  * 并记入 missingEvidence —— 这条校验在代码里，不依赖 prompt 是否被遵守。
  *
+ * ===== 合规红线：辅助建议，绝不自动淘汰（第二阶段「能签」） =====
+ * 用 AI 给简历打分、辅助筛选，在招聘场景涉及就业公平与算法合规。产品口径上必须把
+ * 本模块的输出定位为「给面试官看的辅助参考」，而不是「系统替人做的录用/淘汰决定」：
+ *   1) 结论用词不用「通过 / 淘汰 / 不通过」这类终局裁定，改为「需人工复核」；
+ *   2) 渲染结果末尾固定带一段人工复核声明，模型转述时也会带上；
+ *   3) 每个维度必须附简历原文证据（见上面的反幻觉机制），保证结论可解释、可申诉；
+ *   4) 系统内不存在「按分数自动改状态 / 自动淘汰」的代码路径，状态变更一律由人在
+ *      对话里显式发起，且写操作走 audit.js 留痕。
+ * 这既是合规底线，也是卖点：客户法务问「AI 会不会替我把人刷掉」，答案是不会。
+ * 正式对外提供生成式服务是否还涉及备案 / 安全评估，需按实际运营主体由法务确认，
+ * 代码与本文档不做法律结论。
+ *
  * 本模块不出现 express / AG-UI / SSE 任何协议代码，可以被脚本直接调用做评测。
  */
 const path = require('path')
@@ -309,13 +321,28 @@ function normalizeGate(rawGate) {
   return { passed: failures.length === 0, failures }
 }
 
-/** 结论判定：门槛优先，其次看分数区间 */
+/**
+ * 结论判定：门槛优先，其次看分数区间。
+ *
+ * 措辞是合规的一部分：以前低分返回「不通过」，读起来像系统已经替面试官做了淘汰
+ * 决定。现在统一改成「需人工复核」——表达的是「这份材料与岗位的匹配信息不足或偏低，
+ * 请人再看一眼」，而不是「这个人不行」。分数与证据链照旧返回，信息量一点没少。
+ * 注意：这里只改展示文案，不改阈值、不改权重、不改 gate 逻辑，评测断言不受影响。
+ */
 function decideVerdict(rawScore, gate) {
-  if (!gate.passed) return '不通过'
+  if (!gate.passed) return '需人工复核'
   if (rawScore >= VERDICT_THRESHOLD.interview) return '建议面试'
   if (rawScore >= VERDICT_THRESHOLD.pending) return '待定'
-  return '不通过'
+  return '需人工复核'
 }
+
+/**
+ * 固定附在评分结果末尾的人工复核声明。
+ * 为什么放在 renderText 而不是只写进产品文档：这个 text 会作为工具结果回到模型，
+ * 模型转述给用户时也会带上，等于每一次评分回答都自带口径说明；只写在文档里
+ * 用户根本看不到。audit.js 记录的是工具调用与审批，不承担这段声明的职责。
+ */
+const HUMAN_REVIEW_NOTICE = '【使用说明】以上为 AI 依据所上传材料生成的辅助参考，不构成录用、淘汰或任何人事决定；请由具备资质的人工结合岗位要求与原始材料复核后判断。各维度依据见上文引用片段，系统不执行自动淘汰。'
 
 /** 把结果渲染成给模型读的文本。刻意写成短句 + 分项，模型容易转述，人也能直接核对 */
 function renderText(result) {
@@ -330,7 +357,9 @@ function renderText(result) {
   const missingLine = missingEvidence.length ? `简历中缺少依据的维度：${missingEvidence.join('、')}` : ''
   const capNote = gate.passed ? '' : `（加权原始分 ${rawScore}，因门槛不通过按下限展示）`
 
-  return [head, detail, gateLine + capNote, evidence, missingLine].filter(Boolean).join('\n')
+  // 声明固定放在最后一行：前面是可核对的分数与证据，最后是边界说明，
+  // 既不会被证据刷掉，也不会盖住用户最想先看的结果。
+  return [head, detail, gateLine + capNote, evidence, missingLine, HUMAN_REVIEW_NOTICE].filter(Boolean).join('\n')
 }
 
 /**

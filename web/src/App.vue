@@ -48,7 +48,7 @@
         <t-button variant="text" shape="square" title="知识库文档" @click="docDrawerVisible = true">
           <MenuIcon />
         </t-button>
-        <span class="chat-header__title">知识库助手</span>
+        <span class="chat-header__title">{{ branding.shortName || branding.productName }}</span>
       </div>
     <!-- 消息列表容器：内部用 t-chat-message 渲染每条消息 -->
     <t-chat-list ref="chatListRef" class="chat-list" @clear="handleClear">
@@ -263,6 +263,8 @@
 // 引入 Vue 响应式 API：ref 定义响应式变量，watch 监听数据变化，nextTick 等待 DOM 更新
 import { ref, computed, reactive, watch, nextTick, onMounted, onUnmounted } from 'vue'
 import { useMediaQuery } from '@vueuse/core'
+// 第二阶段：品牌单例。窄屏顶栏不再写死「知识库助手」，改由数据卷里的 branding.json 决定
+import { branding } from './config/branding'
 // 引入聊天 store（管理消息列表、loading 状态等）
 import { useChatStore, USER_META, ASSISTANT_META } from './store/chat'
 // AG-UI 事件里的消息 / 中断类型（真正的请求由 chatEngine 发出）

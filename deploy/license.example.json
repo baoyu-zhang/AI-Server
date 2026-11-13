@@ -1,0 +1,14 @@
+{
+  "_说明": "许可文件字段模板，**不要用手工编辑这份文件当作正式许可**；请用 scripts/gen-license.mjs 生成带签名的 license.json，放进数据卷后重启。字段名必须与服务端 license.js 的 PAYLOAD_FIELDS 一致，改动任何字段都要重新签名。",
+  "_放置位置": "APP_DATA_DIR/license.json（默认 /app/data/license.json），或设置 LICENSE_FILE 指向别处。该文件不在镜像内，升级镜像不会覆盖。",
+  "_启用阻断": "默认只提示、不阻断。只有 deploy/.env 里设 LICENSE_ENFORCE=1 且 LICENSE_SIGN_SECRET 与生成时一致，到期/超额/签名错误才会拒绝新登录。是否启用由合同口径决定。",
+  "_诚实说明": "HMAC 签名用于防误改与交付留痕，不是防破解 DRM：私有化交付下客户能接触镜像与源码。商业控制依赖合同与交付关系。",
+
+  "licenseId": "由 gen-license.mjs 自动生成 UUID",
+  "customer": "{{客户公司名称}}",
+  "edition": "standard",
+  "seats": 30,
+  "issuedAt": "2026-11-13",
+  "expiresAt": "2027-11-13",
+  "signature": "由 gen-license.mjs 用 LICENSE_SIGN_SECRET 计算，请勿手填"
+}

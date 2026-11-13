@@ -1,0 +1,44 @@
+{
+  "_说明": "品牌配置模板。复制成 branding.json 放进数据卷（APP_DATA_DIR，默认 /app/data），重启容器即生效，无需重建镜像。只需写要覆盖的字段，其余继承默认值。本文件不进镜像，随交付文档交给客户。",
+  "_字段说明": {
+    "productName": "浏览器标签页标题与产品全名",
+    "shortName": "窄屏顶栏显示的短名",
+    "companyName": "客户公司名，显示在页脚（留空则不显示）",
+    "tagline": "meta description 与登录页底部的一句话简介",
+    "loginTitle": "登录卡片主标题",
+    "loginSubtitle": "登录态副标题",
+    "registerSubtitle": "注册态副标题",
+    "footer": "页脚版权/联系信息，留空则隐藏",
+    "logoUrl": "登录页 Logo，允许 http(s) 或站内路径，例如 /logo.svg；留空则用内置图标",
+    "faviconUrl": "浏览器图标，允许 http(s) 或站内路径；留空则用 /favicon.svg",
+    "supportUrl": "「需要帮助」链接，留空则隐藏",
+    "termsUrl": "用户协议链接，留空则隐藏；协议模板见随包 docs/legal/",
+    "privacyUrl": "隐私政策链接，留空则隐藏",
+    "terminology": "行业术语字典：主链是行业中立的，这里只改界面显示文字，不改后端数据模型。非 HR 场景可改成「项目 / 制度文档 / 适用部门」等",
+    "panels.candidates": "是否显示「候选人」页签；非招聘场景设为 false 即可隐藏整个 HR 面板"
+  },
+  "_安全约束": "所有 URL 只允许 http(s)、站内绝对路径或相对路径，javascript:/data: 等伪协议会被服务端忽略；所有文本字段有长度上限。公开接口 /api/branding 只返回白名单字段，请勿在此文件里写任何密钥或内部信息。",
+
+  "productName": "智能工作助手",
+  "shortName": "工作助手",
+  "companyName": "{{客户公司名称}}",
+  "tagline": "支持多轮对话、知识库检索与工具协同的 AI 工作平台",
+  "loginTitle": "知识库助手",
+  "loginSubtitle": "登录后进入你的私有知识库",
+  "registerSubtitle": "创建账号后即可使用",
+  "footer": "",
+  "logoUrl": "",
+  "faviconUrl": "",
+  "supportUrl": "",
+  "termsUrl": "",
+  "privacyUrl": "",
+  "terminology": {
+    "candidate": "候选人",
+    "resume": "简历",
+    "job": "岗位 JD",
+    "knowledge": "知识库文档"
+  },
+  "panels": {
+    "candidates": true
+  }
+}

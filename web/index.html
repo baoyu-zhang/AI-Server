@@ -1,10 +1,28 @@
 <!doctype html>
-<html lang="en">
+<!--
+  客户品牌定制入口（第二阶段「换标题」）。
+
+  这里是用户打开浏览器第一眼看到的东西，原来是 Vite 脚手架默认的英文语言标记、
+  占位标题和紫色闪电图标——交付给客户时非常扎眼。
+
+  换成客户品牌要改两处：
+    1) 下面的 <title> 与 meta description；
+    2) web/public/favicon.svg（改成客户 Logo，保持同名即可，无需改这里）。
+  改完必须重新构建前端产物（npm --prefix web run build，或重新打离线镜像），
+  因为浏览器读的是 web/dist/index.html，不是这份源码。
+
+  为什么先写死、不急着做环境变量：标题只是品牌皮肤的一小部分，客户名、Logo、
+  登录页文案、HR 术语会在「品牌与皮肤」工作包里统一设计成一套配置（可能走运行时
+  配置接口而不是构建期变量，这样同一份镜像能交付多家客户）。现在为一个 title
+  引入构建参数，反而会把 Dockerfile.offline 和 compose 一起拖复杂。
+-->
+<html lang="zh-CN">
   <head>
     <meta charset="UTF-8" />
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>web</title>
+    <meta name="description" content="智能工作助手：支持多轮对话、知识库检索与工具协同的 AI 工作平台" />
+    <title>智能工作助手</title>
   </head>
   <body>
     <div id="app"></div>

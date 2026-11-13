@@ -12,6 +12,8 @@
  *   threads     对话线程（服务端历史的第一级：列表页用）
  *   thread_runs 每轮 run 的完整消息快照（读历史时取 thread 最新一轮的快照还原整段对话）
  *   audit_log   操作审计（谁在什么时候批准了什么写操作、登录失败多少次）
+ *   chat_images 聊天图片元数据（图片本体在 data/images，见 image-store.js）
+ *   session_files 会话文档附件元数据（切块文本与向量在 uploads/session-files/*.json）
  *
  * ===== 审计为什么单独一张表 =====
  * 会话快照里也能看到"批了什么"，但那是对话数据：用户看不到别人的、删线程就没了、
@@ -20,12 +22,21 @@
  *
  * 路径可用 APP_DB_FILE 覆盖：测试脚本指到 /tmp，不碰正式库。
  *
- * ===== 幂等迁移序号（统一走 PRAGMA table_info 探测 + ALTER TABLE） =====
- *   第 1 次：thread_runs.state      —— 恢复历史会话时一并还原共享状态
- *   第 2 次：users.role             —— RBAC 管理员
- *   第 3 次：users.quota_daily      —— 用户级每日 Token 配额
- *   第 4 次：users.disabled         —— P2「产品化」账号停用开关（见文件末尾）
- * 每次都只在列不存在时才 ALTER，因此重启任意次都安全、不会重复加列。
+ * ===== 版本化迁移（PRAGMA user_version + 有序 MIGRATIONS） =====
+ * 早期是四个散落的「PRAGMA table_info 探测 → 缺列才 ALTER」块，虽然幂等，但存在两个问题：
+ *   ① 看不出「当前库跑到第几版」，出事故时无法回答「这个客户是不是漏了某次迁移」；
+ *   ② 以后每加一次改动就多一个平铺的块，二十个之后没人敢动。
+ * 现在统一收进文件末尾的 MIGRATIONS 数组，每项带 version / name / up()，
+ * 启动时读 PRAGMA user_version，只跑比当前版本新的那些，跑完把版本号写回。
+ * 每个 up() 内部仍保留列探测（双保险）：老库版本是 0，会重跑 1~5 次，但探测到列已存在就跳过，
+ * 所以从任何历史版本升级到 SCHEMA_VERSION 都是安全的、可重复执行的。
+ *
+ * 版本台账：
+ *   1  thread_runs.state      —— 恢复历史会话时一并还原共享状态
+ *   2  users.role             —— RBAC 管理员
+ *   3  users.quota_daily      —— 用户级每日 Token 配额
+ *   4  users.disabled         —— P2「产品化」账号停用开关
+ *   5  session_files 表       —— 第一阶段「能装」：会话附件不再只活在内存里
  */
 const { DatabaseSync } = require('node:sqlite')
 const path = require('node:path')
@@ -126,49 +137,140 @@ CREATE TABLE IF NOT EXISTS chat_images (
 CREATE INDEX IF NOT EXISTS idx_chat_images_user ON chat_images(user_id, created_at);
 `)
 
-// ===== 轻量迁移：CREATE TABLE IF NOT EXISTS 对已存在的表不生效，加列只能走 ALTER =====
-// 用 pragma table_info 探测列是否存在，保证重启任意次都幂等。
-// state 存本轮结束时 AG-UI 共享状态的 JSON（sources/phase 等）：恢复历史会话时
-// 服务端把它一起还给前端，引用来源等跨轮信息不再丢。
-{
-  const runCols = db.prepare("PRAGMA table_info(thread_runs)").all().map(c => c.name)
-  if (!runCols.includes('state')) {
-    db.exec('ALTER TABLE thread_runs ADD COLUMN state TEXT;')
-    console.log('[db] thread_runs 已迁移：新增 state 列')
-  }
+// ===========================================================================
+// 版本化迁移（第一阶段「能装」补强）
+// ===========================================================================
+// 为什么要有 user_version：散落的幂等 ALTER 虽然不会写坏库，但运维时无法回答
+//「眼前这个客户的库跑到哪一版了」。有了版本号，升级脚本、启动日志、故障复盘
+// 都有唯一的事实来源；以后加迁移只要往 MIGRATIONS 追加一项并抬高 SCHEMA_VERSION。
+//
+// 为什么要保留 up() 内部的列探测：线上已有库是从「没有版本号」的旧代码建出来的，
+// PRAGMA user_version 还是 0，启动时会把 1~5 全部重跑一遍。若 up() 直接 ALTER，
+// 遇到已经存在的列就会报 duplicate column。探测一次即可兼容所有历史库，
+// 这是「版本化」与「幂等」两道保险叠加，不是冗余。
+// ===========================================================================
+const SCHEMA_VERSION = 5
+
+/**
+ * 列不存在才执行 DDL。
+ * @param {string} table 表名（只由本文件的常量传入，不接收外部输入，拼进 SQL 是安全的）
+ * @param {string} column 要检查的列名
+ * @param {string} ddl 缺列时执行的 ALTER TABLE 语句
+ * @returns {boolean} 是否真的执行了 DDL
+ */
+function addColumnIfMissing(table, column, ddl) {
+  // PRAGMA table_info 返回一行一列的信息，取 name 就是已有列名清单
+  const cols = db.prepare(`PRAGMA table_info(${table})`).all().map(c => c.name)
+  if (cols.includes(column)) return false
+  db.exec(ddl)
+  return true
 }
 
-// ===== RBAC：users.role 列（'user' 默认 / 'admin' 管理员） =====
-// 同样是幂等迁移：pragma 探测列不存在才 ALTER，重启任意次安全。
-// 谁是 admin 由 ADMIN_USERNAME 环境变量指定（见下方启动逻辑），
-// 数据库里只存结果——不存"配置来源"，环境变量丢了也不会出现无主的管理员。
-{
-  const userCols = db.prepare("PRAGMA table_info(users)").all().map(c => c.name)
-  if (!userCols.includes('role')) {
-    db.exec("ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'user';")
-    console.log('[db] users 已迁移：新增 role 列')
+/**
+ * 迁移台账：按 version 升序执行，每项只跑一次（跑完写回 user_version）。
+ * 新增迁移的正确姿势：往数组末尾追加 { version: SCHEMA_VERSION + 1, ... }，
+ * 同时把 SCHEMA_VERSION 加一；**不要修改已有项的 version 或删掉已有项**，
+ * 否则老库会跳过本该执行的迁移。
+ */
+const MIGRATIONS = [
+  {
+    version: 1,
+    name: 'thread_runs.state（历史会话还原共享状态）',
+    up() {
+      // state 存本轮结束时 AG-UI 共享状态的 JSON（sources/phase 等），
+      // 恢复历史会话时一起还给前端，引用来源等跨轮信息不再丢。
+      if (addColumnIfMissing('thread_runs', 'state', 'ALTER TABLE thread_runs ADD COLUMN state TEXT;')) {
+        console.log('[db] v1 thread_runs 已新增 state 列')
+      }
+    }
+  },
+  {
+    version: 2,
+    name: 'users.role（RBAC 管理员）',
+    up() {
+      // 谁是 admin 由 ADMIN_USERNAME 环境变量在启动时引导（见 index.js），
+      // 库里只存结果——环境变量丢了也不会出现「无主的管理员」。
+      if (addColumnIfMissing('users', 'role', "ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'user';")) {
+        console.log('[db] v2 users 已新增 role 列')
+      }
+    }
+  },
+  {
+    version: 3,
+    name: 'users.quota_daily（用户级每日 Token 配额）',
+    up() {
+      // NULL = 跟全局默认走（见 quota.js）。一个用户最多一条配置，
+      // 加列比建一张配置表少一次 JOIN，所以当初就选了加列。
+      if (addColumnIfMissing('users', 'quota_daily', 'ALTER TABLE users ADD COLUMN quota_daily INTEGER;')) {
+        console.log('[db] v3 users 已新增 quota_daily 列')
+      }
+    }
+  },
+  {
+    version: 4,
+    name: 'users.disabled（账号停用开关）',
+    up() {
+      // 停用状态必须持久化在用户行上：进程重启、多实例都要一致，
+      // 且 requireAuth 每次查用户行时顺手就能读到，不用多一次查询。
+      // DEFAULT 0 保证历史账号与旧 INSERT 代码升级后仍是「正常」，不会一升级把全库锁死。
+      if (addColumnIfMissing('users', 'disabled', 'ALTER TABLE users ADD COLUMN disabled INTEGER NOT NULL DEFAULT 0;')) {
+        console.log('[db] v4 users 已新增 disabled 列')
+      }
+    }
+  },
+  {
+    version: 5,
+    name: 'session_files（会话文档附件持久化）',
+    up() {
+      // ===== 为什么需要这张表 =====
+      // 改造前，用户上传的 PDF/Word 被解析成「文本块 + 512 维向量」后只存在
+      // session-files.js 的内存 Map 里，进程一重启（Railway 每次 Redeploy 也算）
+      // 就全没了：聊天记录还在，但追问「我刚传的简历里写了什么」模型答不上来。
+      // 图片附件早已由 image-store.js 落盘 + hydrateSessionImages 回填，
+      // 文档附件是最后一块没落地的会话数据，这张表就是补上它。
+      //
+      // ===== 为什么元数据入表、内容落磁盘 JSON =====
+      // 一个 PDF 的切块文本 + 向量 JSON 动辄几百 KB 到几 MB，若整份塞进 app.db，
+      // 库文件会迅速膨胀，拖慢每次 VACUUM INTO 备份。所以沿用 chat_images 的既有范式：
+      // 表存可检索的元数据，大块内容放 uploads/session-files/<file_id>.json，
+      // 文件名由 file_id 推导，不需要额外存路径列（卷整体搬家也不会失效）。
+      //
+      // ===== 为什么不加外键 REFERENCES users(id) =====
+      // 老调用点可能传空 userId（例如内部脚本），加了外键会直接插入失败；
+      // 而且本表的数据清理由 session-files-store.js 的 deleteByUser 显式负责，
+      // 与「删用户」事务配合，比依赖级联更可控（也便于只清附件不清账号）。
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS session_files (
+          file_id    TEXT PRIMARY KEY,                  -- 与磁盘 JSON 同名，也是前端拿到的 id
+          session_id TEXT NOT NULL,                    -- 属于哪个会话；重启后按它整组回填内存
+          user_id    TEXT NOT NULL DEFAULT '',         -- 归属用户，供合规删除/按人清理
+          file_name  TEXT NOT NULL,
+          size       INTEGER NOT NULL DEFAULT 0,
+          created_at INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_session_files_session ON session_files(session_id, created_at);
+        CREATE INDEX IF NOT EXISTS idx_session_files_user ON session_files(user_id);
+      `)
+      console.log('[db] v5 已创建 session_files 表与索引')
+    }
   }
-  // 每日 Token 配额的用户级覆盖（NULL = 跟全局默认走，见 quota.js）。
-  // 为什么不用单独一张表：一个用户最多一条配置，加列比建表少一次 JOIN。
-  if (!userCols.includes('quota_daily')) {
-    db.exec('ALTER TABLE users ADD COLUMN quota_daily INTEGER;')
-    console.log('[db] users 已迁移：新增 quota_daily 列')
-  }
-}
+]
 
-// ===== 第 4 次迁移：users.disabled（P2「产品化」账号停用开关） =====
-// 为什么加这一列：管理员要能停用/启用账号，停用后 requireAuth 必须立刻拦住该用户的
-// 所有凭证（session 与 API Key）。停用状态要持久化在用户行上，不能只放内存——
-// 进程重启、多实例都得一致，且每次鉴权查用户行时顺手就能读到，不用多一次查询。
-// 沿用前 3 次的范式：PRAGMA table_info 探测列是否存在，不存在才 ALTER，重启任意次幂等。
-// INTEGER NOT NULL DEFAULT 0：0 = 正常，1 = 停用。默认值让所有历史账号、
-// 以及 INSERT 时没显式带该列的旧代码（注册、RBAC 引导建管理员）自动落在「正常」，
-// 不会一升级就把整库用户锁死；NOT NULL 也避免下游判断时出现 undefined 的歧义。
 {
-  const userCols = db.prepare("PRAGMA table_info(users)").all().map(c => c.name)
-  if (!userCols.includes('disabled')) {
-    db.exec('ALTER TABLE users ADD COLUMN disabled INTEGER NOT NULL DEFAULT 0;')
-    console.log('[db] users 已迁移：新增 disabled 列（第 4 次迁移）')
+  // PRAGMA user_version 是 SQLite 内置的用户版本号，存在数据库文件头里，随备份一起走。
+  // 新库读到 0，逐个执行所有迁移；已是最新版本的库一个都不跑，启动零开销。
+  const row = db.prepare('PRAGMA user_version').get()
+  const current = Number(row?.user_version || 0)
+  for (const migration of MIGRATIONS) {
+    if (current >= migration.version) continue
+    migration.up()
+    // 每跑完一项就立刻写回版本：万一中途崩在第 3 项，下次启动从第 3 项续跑，
+    // 不会把已成功的 1、2 再执行一遍（虽然探测能兜住，但少做无用功）。
+    db.exec(`PRAGMA user_version = ${migration.version}`)
+    console.log(`[db] 迁移完成 v${migration.version}：${migration.name}`)
+  }
+  if (current < SCHEMA_VERSION) {
+    console.log(`[db] schema 版本：${current} → ${SCHEMA_VERSION}（共 ${MIGRATIONS.length} 项迁移）`)
   }
 }
 

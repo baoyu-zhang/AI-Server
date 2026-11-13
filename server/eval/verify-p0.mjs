@@ -240,10 +240,16 @@ function testBackupAndWal() {
   }
 
   const backupDir = process.env.BACKUP_DIR || path.join(SERVER_DIR, 'data', 'backups')
+  // 第一阶段「能装」之后，备份是成对的：.db（仅数据库，兼容旧流程）与 .tar.gz（整卷快照）。
+  // 正则必须两种都认；同时单独统计整卷数量并放进结果里，让验收者一眼看出
+  //「有备份」到底是只有库、还是连图片/附件/向量索引一起备了——后者才是可交付的备份。
   const backups = fs.existsSync(backupDir)
-    ? fs.readdirSync(backupDir).filter(n => /^app-\d{8}-\d{6}.*\.db$/.test(n))
+    ? fs.readdirSync(backupDir).filter(n => /^app-\d{8}-\d{6}.*\.(db|tar\.gz)$/.test(n))
     : []
-  check('备份可产出（现场执行成功，或已有历史备份可回滚）', liveOk || backups.length > 0, { liveMsg, backups: backups.length })
+  const fullBackups = backups.filter(n => n.endsWith('.tar.gz'))
+  check('备份可产出（现场执行成功，或已有历史备份可回滚）', liveOk || backups.length > 0, {
+    liveMsg, backups: backups.length, fullSnapshots: fullBackups.length
+  })
   if (!liveOk) {
     console.log(`  ${dim('– 注：当前环境现场备份被拦截（磁盘写入限制），已用历史备份文件代验；请在普通终端执行 cd server && npm run backup 复核')}`)
   }

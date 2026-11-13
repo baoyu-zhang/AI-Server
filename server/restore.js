@@ -1,15 +1,31 @@
 /**
- * restore.js —— 数据库备份恢复（P1 运维闭环）
+ * restore.js —— 备份恢复（P1 运维闭环 + 第一阶段「能装」整卷恢复）
  *
- * ===== 为什么需要「恢复」而不只是「备份」 =====
- * backup.js 已经能定时把 WAL 模式的库导成一致的单文件快照（VACUUM INTO），但备份
- * 只有在「真能还原回去」时才有意义。此前恢复靠命令清单 §5.1 里的人工四步
- * （停服务 → cp 覆盖 → 删 -wal/-shm → 重启），全靠人记；其中「删 WAL」漏了就等于
- * 没恢复——旧 -wal 里比备份更新的事务会被 SQLite 重放进新库。本模块把这套步骤
- * 固化成一条命令，并补上两道保险：动库前先留底、动库后先验尸。
+ * ===========================================================================
+ * 为什么需要「恢复」而不只是「备份」
+ * ===========================================================================
+ * 备份只有在「真能还原回去」时才有意义。早期恢复靠人工四步（停服务 → cp 覆盖 →
+ * 删 -wal/-shm → 重启），全靠人记；其中「删 WAL」漏了就等于没恢复——旧 -wal 里
+ * 比备份更新的事务会被 SQLite 重放进新库。本模块把这套步骤固化成一条命令，
+ * 并补上两道保险：动库前先留底、动库后先验尸。
  *
- * ===== 三条安全底线 =====
- * 1. 文件名白名单：只认 backup.js 产出的 app-YYYYMMDD-HHMMSS[-tag][-序号].db。
+ * ===========================================================================
+ * 整卷恢复（本次新增）
+ * ===========================================================================
+ * backup.js 现在每次产出成对的 .db 与 .tar.gz。**恢复请用 .tar.gz**：
+ * 它除了数据库快照，还带 images/、uploads/、vector-index/ 三个目录。
+ * 只恢复 .db 会留下「聊天记录回来了、图片全裂、知识库全空」的残局。
+ *
+ * 传 .tar.gz 时的额外动作（仅在 --force 覆盖正式库时执行）：
+ *   解包 → 校验归档内路径无穿越 → 用其中的 .db 走原有恢复流程 →
+ *   把三个目录拷回 APP_DATA_DIR（现有目录先改名留底，不直接删除）。
+ * 演练（不带 --force）只恢复数据库到临时文件，**绝不碰现有数据目录**，
+ * 否则「演练」反而把线上图片换成了旧版本。
+ *
+ * ===========================================================================
+ * 三条安全底线
+ * ===========================================================================
+ * 1. 文件名白名单：只认 backup.js 产出的 app-YYYYMMDD-HHMMSS[-tag][-序号].db / .tar.gz。
  *    恢复接口会把文件名拼进备份目录去读文件，若放任 ../../ 之类就能读（甚至覆盖）
  *    任意文件——典型路径穿越，必须用正则 + 显式拒绝 .. / 分隔符双保险。
  * 2. 目标闸门：默认绝不覆盖正式库。想覆盖正式库必须显式 force:true；不带 force 时
@@ -24,10 +40,10 @@
  * 校验都先 fs.existsSync + size>0 挡一道，再用 readOnly:true 打开，绝不写目标文件。
  *
  * ===== 使用方式（CLI） =====
- *   node restore.js --list                       列出可恢复备份
- *   node restore.js --verify <file>              只读体检一个备份（恢复演练）
- *   node restore.js --restore <file>             恢复到临时库（演练，不动正式库）
- *   node restore.js --restore <file> --force     覆盖正式库（用完必须重启服务）
+ *   node restore.js --list                              列出可恢复备份（带类型）
+ *   node restore.js --verify <file>                     只读体检（.db 或 .tar.gz 均可）
+ *   node restore.js --restore <file>                    恢复到临时库（演练，不动正式库）
+ *   node restore.js --restore <file.tar.gz> --force     覆盖正式库 + 还原数据目录
  * 也可经 scripts/db.mjs 的 restore / verify-backup 子命令间接调用本模块。
  *
  * ===== 运行前提（重要，给接线的人看）=====
@@ -38,6 +54,7 @@
 const fs = require('node:fs')                 // 文件存在性、大小、复制/删除/改名，全部同步做：恢复是离线运维动作，串行最清楚
 const path = require('node:path')             // 拼路径 + path.resolve 比较「目标是不是正式库」
 const os = require('node:os')                 // 演练用的临时库放系统临时目录，避免落到项目数据卷里
+const { execFileSync } = require('node:child_process') // 解包 .tar.gz：用参数数组调用系统 tar，不拼 shell
 const { DatabaseSync } = require('node:sqlite') // Node 22 内置 SQLite：只读打开备份/目标做 integrity_check
 const { PATHS } = require('./paths')          // 备份目录与正式库路径的唯一来源，绝不自己拼字符串
 const backup = require('./backup')            // 复用 backupNow（留底）与 listBackups（列可恢复备份）
@@ -46,11 +63,23 @@ const { log } = require('./logger')           // 结构化日志：留底、恢�
 
 const BACKUP_DIR = PATHS.BACKUP_DIR           // 备份文件所在目录；白名单保证 fileName 永远是纯文件名，拼进去不会逃逸
 const DB_FILE = PATHS.DB_FILE                 // 正式库（WAL 模式单文件），覆盖它必须 force:true
-// 白名单：app-8位日期-6位时间(-字母数字下划线 tag)(-数字序号).db
-// 头尾 ^$ 锚定，整体只允许字母/数字/下划线/连字符和一个 .db 后缀；
+// 白名单：app-8位日期-6位时间(-字母数字下划线 tag)(-数字序号).db 或 .tar.gz
+// 头尾 ^$ 锚定，整体只允许字母/数字/下划线/连字符和这两种后缀；
 // 因此 ..、/、\、空格、绝对路径都不可能通过，天然挡住任意文件读/写。
-const SAFE_NAME = /^app-\d{8}-\d{6}(-\w+)?(-\d+)?\.db$/
+const SAFE_NAME = /^app-\d{8}-\d{6}(-\w+)?(-\d+)?\.(db|tar\.gz)$/
 const KEY_TABLES = ['users', 'threads']       // 判定「这确实是我们的业务库」的最小集合：没这两张表就是拿错文件了
+const FULL_DIRS = backup.INCLUDE_DIRS         // 整卷快照里的数据目录，与 backup.js 用同一份配置，避免两边漂移
+
+/** 是否为整卷快照（.tar.gz） */
+const isFullArchive = name => typeof name === 'string' && name.endsWith('.tar.gz')
+
+/**
+ * 归档解包缓存：fileName -> { dir, dbFile, dirs }。
+ * 为什么缓存：verifyBackup 与 restoreBackup 都会用到解包结果，一次 CLI 里不该解两遍。
+ * 本模块只被短命的 CLI 进程 require（见文件头「运行前提」），进程退出时缓存自然消失；
+ * 底部的 process.on('exit') 会把临时目录一并删掉，不留垃圾。
+ */
+const unpackCache = new Map()
 
 /**
  * 严格校验备份文件名，返回原文件名；不合法直接抛错（由调用方转成 {ok:false} 或 CLI 输出）。
@@ -64,7 +93,7 @@ function assertSafeName(fileName) {
     throw new Error('备份文件名非法：不允许 .. 或路径分隔符')
   }
   if (!SAFE_NAME.test(fileName)) {
-    throw new Error('备份文件名不符合白名单 app-YYYYMMDD-HHMMSS[-tag][-n].db')
+    throw new Error('备份文件名不符合白名单 app-YYYYMMDD-HHMMSS[-tag][-n].db 或 .tar.gz')
   }
   return fileName
 }
@@ -73,6 +102,81 @@ function assertSafeName(fileName) {
 function backupPath(fileName) {
   return path.join(BACKUP_DIR, fileName)
 }
+
+/**
+ * 只读检查归档条目里有没有路径穿越。
+ * 归档由我们自己的 backup.js 生成，理论上不会有 ../../，但恢复是「拿外部文件往
+ * 生产目录写」的高危动作，多一道白名单检查成本极低。tar -tzf 只列清单不落盘。
+ * @param {string} archiveFull
+ */
+function assertArchiveSafe(archiveFull) {
+  const listing = execFileSync('tar', ['-tzf', archiveFull], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })
+  for (const raw of listing.split('\n')) {
+    const entry = raw.trim().replace(/\/$/, '') // 目录条目带尾随 /，去掉便于按段判断
+    if (!entry) continue
+    if (entry.startsWith('/')) throw new Error(`归档含绝对路径条目：${entry}`)
+    if (entry.split('/').includes('..')) throw new Error(`归档含路径穿越条目：${entry}`)
+  }
+}
+
+/**
+ * 解包整卷快照（带缓存），返回其中的数据库快照路径与目录清单。
+ * @param {string} fileName 白名单校验过的 .tar.gz 文件名
+ * @returns {{dir:string, dbFile:string, dirs:string[]}}
+ */
+function getUnpacked(fileName) {
+  if (unpackCache.has(fileName)) return unpackCache.get(fileName)
+  const archiveFull = backupPath(fileName)
+  if (!fs.existsSync(archiveFull)) throw new Error('备份文件不存在')
+  assertArchiveSafe(archiveFull)
+
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'aisrv-restore-'))
+  execFileSync('tar', ['-xzf', archiveFull, '-C', dir], { stdio: 'pipe' })
+
+  // 归档根目录下有且应有一个 app-*.db（backup.js 放进去时的名字保留了时间戳）
+  const dbName = fs.readdirSync(dir).find(n => /^app-.*\.db$/.test(n))
+  if (!dbName) throw new Error('整卷快照里找不到数据库快照 .db')
+  const dirs = FULL_DIRS.filter(name => fs.existsSync(path.join(dir, name)))
+  const result = { dir, dbFile: path.join(dir, dbName), dirs }
+  unpackCache.set(fileName, result)
+  return result
+}
+
+/**
+ * 把解包出来的数据目录还原回 APP_DATA_DIR。
+ *
+ * 为什么不直接删旧目录再拷：删掉就没有退路了。数据库有 pre-restore 快照可回滚，
+ * 文件目录没有。所以先把现有目录**改名**成 <name>.pre-restore-<时间戳> 留底，
+ * 再复制快照里的版本；万一发现恢复错了，人工把带后缀的目录改回来即可。
+ * 单个目录失败不影响其它目录，失败项随返回值交给调用方告警。
+ * @returns {{restored:string[], failed:string[]}}
+ */
+function restoreDirectories(unpacked) {
+  const restored = []
+  const failed = []
+  const suffix = `pre-restore-${Date.now()}`
+  for (const name of unpacked.dirs) {
+    try {
+      const src = path.join(unpacked.dir, name)
+      const dest = path.join(PATHS.DATA_DIR, name)
+      if (fs.existsSync(dest)) fs.renameSync(dest, `${dest}.${suffix}`)
+      fs.cpSync(src, dest, { recursive: true })
+      restored.push(name)
+      log.warn('[restore] 数据目录已还原', { dir: name, backupDir: `${dest}.${suffix}` })
+    } catch (err) {
+      failed.push(`${name}: ${err?.message}`)
+      log.error('[restore] 数据目录还原失败', { dir: name, error: err?.message })
+    }
+  }
+  return { restored, failed }
+}
+
+/** 进程退出时清掉所有解包临时目录；exit 回调只能用同步 API，fs.rmSync 正好 */
+process.on('exit', () => {
+  for (const { dir } of unpackCache.values()) {
+    try { fs.rmSync(dir, { recursive: true, force: true }) } catch { /* 退出阶段清理失败已无处可报，忽略 */ }
+  }
+})
 
 /**
  * 只读体检一个 .db 文件：能打开 + integrity_check=ok + 关键表齐全。
@@ -114,9 +218,10 @@ function inspectDb(fullPath) {
 }
 
 /**
- * 只读校验某个备份是否「可用于恢复」，不写任何文件，供恢复演练用。
+ * 只读校验某个备份是否「可用于恢复」，不写任何生产文件，供恢复演练用。
+ * .db     → 直接体检
+ * .tar.gz → 解包到系统临时目录（exit 时清理）后体检其中的 .db，并报告带了哪些数据目录
  * @param {string} fileName 备份文件名（不含目录）
- * @returns {{ok:boolean, integrity?:string, tables?:string[], missing?:string[], size?:number, error?:string}}
  */
 function verifyBackup(fileName) {
   let safe
@@ -125,14 +230,28 @@ function verifyBackup(fileName) {
   } catch (err) {
     return { ok: false, error: err.message }
   }
-  return inspectDb(backupPath(safe))         // 纯只读：打开 → integrity_check → 查表 → 关闭
+  if (!isFullArchive(safe)) return inspectDb(backupPath(safe)) // 纯只读：打开 → integrity_check → 查表 → 关闭
+
+  try {
+    if (!fs.existsSync(backupPath(safe))) return { ok: false, error: '整卷快照文件不存在' }
+    const unpacked = getUnpacked(safe)
+    const result = inspectDb(unpacked.dbFile)
+    if (!result.ok) return result
+    return {
+      ...result,
+      archive: true,
+      archiveSize: fs.statSync(backupPath(safe)).size,
+      dirs: unpacked.dirs                    // 让运维一眼看出这份备份到底带了哪些目录
+    }
+  } catch (err) {
+    return { ok: false, error: `整卷快照不可用：${err?.message || String(err)}` }
+  }
 }
 
 /**
  * 列出可恢复的备份。
  * 复用 backup.listBackups()（它按文件名倒序、已过滤成备份命名），再滤掉 size<=0 的
  * 半成品：backup.js 失败时会清理半成品，但防御性过滤能挡住「手工拷了一半」的文件。
- * @returns {Array<{name:string, size:number, mtime:number}>}
  */
 function listRestorable() {
   return backup.listBackups().filter(item => item.size > 0)
@@ -159,12 +278,11 @@ function replaceWith(targetFull, srcFull) {
 }
 
 /**
- * 从备份恢复数据库。
- * @param {string} fileName 备份文件名（不含目录，必须符合白名单）
+ * 从备份恢复。
+ * @param {string} fileName 备份文件名（不含目录，必须符合白名单）；推荐传 .tar.gz
  * @param {object} [options]
  * @param {string} [options.target] 目标库路径；不给 = 正式库。给临时/测试库路径 = 恢复演练
  * @param {boolean} [options.force] 是否允许覆盖正式库（默认 false）
- * @returns {{ok:boolean, error?:string, target?:string, official?:boolean, preRestoreFile?:string, rolledBack?:boolean, rollbackOk?:boolean}}
  */
 function restoreBackup(fileName, options = {}) {
   const { target, force = false } = options
@@ -176,7 +294,19 @@ function restoreBackup(fileName, options = {}) {
   } catch (err) {
     return { ok: false, error: err.message }
   }
-  const backupFull = backupPath(safe)
+  const full = isFullArchive(safe)
+
+  // 整卷快照：先解包（含路径穿越检查），后续流程统一拿解包出来的 .db 当「备份源」。
+  // 解包失败立即返回，绝不带着半个结果往下走。
+  let unpacked = null
+  if (full) {
+    try {
+      unpacked = getUnpacked(safe)
+    } catch (err) {
+      return { ok: false, error: `整卷快照解包失败：${err?.message || String(err)}` }
+    }
+  }
+  const backupFull = unpacked ? unpacked.dbFile : backupPath(safe)
 
   // ② 目标闸门：path.resolve 统一成绝对路径再比，避免 ./、软链写法绕过判断
   const resolvedTarget = path.resolve(target || DB_FILE)
@@ -189,7 +319,8 @@ function restoreBackup(fileName, options = {}) {
     return { ok: false, error: '临时/测试库 target 必须是 .db 文件路径' }
   }
 
-  // ③ 先只读体检备份本身：坏备份绝不往任何目标上覆盖，避免「把坏库换上去再回滚」的折腾
+  // ③ 先只读体检备份本身：坏备份绝不往任何目标上覆盖，避免「把坏库换上去再回滚」的折腾。
+  //    .tar.gz 走 verifyBackup 会命中解包缓存，不会重复解包。
   const pre = verifyBackup(safe)
   if (!pre.ok) return { ok: false, error: `备份不可用：${pre.error}` }
 
@@ -198,7 +329,7 @@ function restoreBackup(fileName, options = {}) {
   //    这就是万一覆盖失败要还原回去的那一份。留底失败就没有回滚点，必须中止。
   const snap = backup.backupNow('pre-restore')
   if (!snap.ok) return { ok: false, error: `恢复前自动备份失败，已中止：${snap.error}` }
-  const preRestoreFile = snap.file                       // backupNow 返回的是绝对路径，回滚时直接用，不再走白名单查找
+  const preRestoreFile = snap.file                       // backupNow 返回的是 .db 绝对路径，回滚时直接用
   log.warn('[restore] 恢复前已留底', { file: path.basename(preRestoreFile), target: resolvedTarget })
 
   // ⑤ 覆盖目标库
@@ -212,14 +343,27 @@ function restoreBackup(fileName, options = {}) {
   // ⑥ 覆盖后验尸：用独立只读连接确认新目标库 integrity ok 且关键表在
   const after = inspectDb(resolvedTarget)
   if (after.ok) {
+    // ===== 整卷恢复的最后一步：还原数据目录 =====
+    // 只在「覆盖正式库」时做。演练的目标是 /tmp 里的临时库，正式数据从头到尾没动，
+    // 这时候若去替换 images/ 等目录，等于演练把线上文件换成旧版本，属于帮倒忙。
+    let restoredDirs = []
+    let dirFailures = []
+    if (unpacked && isOfficial) {
+      const r = restoreDirectories(unpacked)
+      restoredDirs = r.restored
+      dirFailures = r.failed
+    }
     log.warn('[restore] 恢复完成并通过完整性校验', {
-      file: safe, target: resolvedTarget, official: isOfficial, tables: KEY_TABLES.join('/')
+      file: safe, target: resolvedTarget, official: isOfficial,
+      tables: KEY_TABLES.join('/'), dirs: restoredDirs.join('/') || '（无）'
     })
     return {
       ok: true,
       target: resolvedTarget,
       official: isOfficial,       // true 表示动的是正式库，调用方据此提示「请重启服务」
-      preRestoreFile              // 把留底路径交出去，人工想再回滚也有据可查
+      preRestoreFile,
+      restoredDirs,
+      dirFailures                 // 非空 = 数据库好了但部分目录没还原，必须人工看一眼
     }
   }
 
@@ -268,7 +412,8 @@ if (require.main === module) {
     } else {
       for (const item of list) {
         const time = new Date(item.mtime).toLocaleString('zh-CN')      // 毫秒时间戳转本地可读时间
-        console.log(`${item.name}\t${(item.size / 1024).toFixed(0)} KB\t${time}`)
+        const label = item.type === 'full' ? '整卷（推荐）' : '仅数据库'
+        console.log(`${item.name}\t${label}\t${(item.size / 1024).toFixed(0)} KB\t${time}`)
       }
     }
   } else if (sub === '--verify') {
@@ -278,7 +423,8 @@ if (require.main === module) {
     } else {
       const res = verifyBackup(file)
       if (res.ok) {
-        console.log(`校验通过：${file}（integrity_check=${res.integrity}，关键表 ${KEY_TABLES.join('/')} 齐全，${(res.size / 1024).toFixed(0)} KB）`)
+        const extra = res.archive ? `，数据目录：${res.dirs.join('/') || '（无）'}` : ''
+        console.log(`校验通过：${file}（integrity_check=${res.integrity}，关键表 ${KEY_TABLES.join('/')} 齐全，${(res.size / 1024).toFixed(0)} KB${extra}）`)
       } else {
         console.error(`校验失败：${file} —— ${res.error}`)
         code = 1
@@ -295,6 +441,11 @@ if (require.main === module) {
       const res = restoreBackup(file, { target, force })
       if (res.ok) {
         console.log(`恢复成功：${file} → ${res.target}${res.official ? '（正式库，请重启服务）' : '（临时库演练，正式库未改动）'}`)
+        if (res.restoredDirs?.length) console.log(`已还原数据目录：${res.restoredDirs.join('、')}（原目录已改名留底）`)
+        if (res.dirFailures?.length) {
+          console.error(`警告：以下数据目录还原失败，需人工处理：${res.dirFailures.join('；')}`)
+          code = 1
+        }
         console.log(`恢复前留底：${path.basename(res.preRestoreFile)}`)
         if (!res.official) console.log(`演练临时库保留在：${res.target}（可手动删除）`)
       } else {
@@ -310,4 +461,4 @@ if (require.main === module) {
   process.exit(code)                 // 显式退出：把 0/1 交给上层脚本（verify-all.sh / db.mjs）
 }
 
-module.exports = { listRestorable, restoreBackup, verifyBackup }
+module.exports = { listRestorable, restoreBackup, verifyBackup, isFullArchive }

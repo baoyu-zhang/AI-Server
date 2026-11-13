@@ -1,0 +1,155 @@
+# 验证门禁：只跑「不需要启动服务、不需要真实 API Key」的检查，保证每次 push / PR 都能稳定跑完。
+# 为什么这样设计、以及哪些验收刻意不放进 CI，见文件末尾的「人工验收说明」。
+name: 验证门禁
+
+# 触发：main 是对外交付分支，push 必须过门禁；PR 合入前也必须过。
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  verify:
+    # 用 ubuntu-latest：与离线镜像 --platform linux/amd64 的目标架构一致（同为 linux/amd64）。
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1) 取代码。后面的依赖安装、语法检查与静态检查都基于工作区里的真实文件，
+      #    不 checkout 就没有文件可查。
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      # 2) 装 Node 22：与根 package.json 的 engines（>=22）和生产镜像保持一致。
+      #    为什么显式写 cache-dependency-path：仓库根目录【没有】package-lock.json，
+      #    依赖锁分别位于 server/ 与 web/；setup-node 的 cache 默认去根目录找锁文件，
+      #    不指过去会直接报错。这里两处锁文件均已确认存在，故可以安全开启 npm 缓存。
+      - name: 安装 Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            server/package-lock.json
+            web/package-lock.json
+
+      # 3) 后端依赖：用 ci 而不是 install —— 严格按 server/package-lock.json 复现版本，
+      #    保证 CI 与交付镜像的依赖一致，且不会偷偷改写锁文件。
+      - name: 安装后端依赖
+        run: npm --prefix server ci
+
+      # 4) 前端依赖：同上，按 web/package-lock.json 复现；web 的 devDependencies
+      #    （typescript / vite / vue-tsc）是下一步构建必需的。
+      - name: 安装前端依赖
+        run: npm --prefix web ci
+
+      # 5) 前端构建：web/package.json 的 build = vue-tsc -b && vite build，
+      #    一次跑完能同时暴露 TypeScript 类型错误与打包错误，是前端最有效的静态门禁。
+      #    前面的 NODE_OPTIONS= 用于清空外部注入的 NODE_OPTIONS 环境变量，
+      #    避免托管/本地环境里的内存参数等干扰构建结果。
+      - name: 构建前端
+        run: NODE_OPTIONS= npm --prefix web run build
+
+      # 6) 后端关键文件语法检查：node --check 只做语法解析，不 require、不连数据库、
+      #    不加载 embedding 模型、不调用任何外部 API，因此不需要运行中的服务与密钥。
+      #    用循环覆盖 server/ 顶层全部 .js，比逐个列举更不容易漏掉新增文件。
+      - name: 后端关键文件语法检查（node --check）
+        run: |
+          for f in server/*.js; do
+            echo "node --check $f"
+            node --check "$f"
+          done
+
+      # 7) 静态检查：只用 Node 内置 fs 读文件，不启动服务、不联网、不需要任何密钥。
+      #    校验的是「第二阶段：去 demo 痕迹」与离线交付物完整性这类容易回退的事实，
+      #    放进 CI 是为了防止 demo 配置或交付文件被误删 / 误改回来。
+      - name: 静态检查（不依赖运行中的服务）
+        run: |
+          node <<'NODE'
+          const fs = require('node:fs');
+          const errors = [];
+
+          // 这些路径都经过核对真实存在：离线交付物、备份恢复、CI 依赖锁文件。
+          const mustExist = [
+            'server/package-lock.json',
+            'web/package-lock.json',
+            'server/backup.js',
+            'server/restore.js',
+            'scripts/setup.mjs',
+            'scripts/prefetch-model.mjs',
+            'scripts/build-offline-bundle.sh',
+            'Dockerfile.offline',
+            'deploy/docker-compose.yml',
+            'deploy/.env.example',
+            'deploy/mcp.example.json',
+            'deploy/branding.example.json',
+            'deploy/license.example.json',
+            'server/eval/fixtures/mcp-demo.json',
+            'server/branding.js',
+            'server/license.js',
+            'scripts/gen-license.mjs',
+            'docs/操作手册.md',
+            'docs/legal/README.md',
+            'docs/legal/用户协议.md',
+            'docs/legal/隐私政策.md',
+            'docs/legal/数据处理协议-DPA.md',
+            'docs/legal/软件许可协议-License.md',
+            'LICENSE',
+            'CHANGELOG.md',
+          ];
+          for (const f of mustExist) {
+            if (!fs.existsSync(f)) errors.push(`缺少交付物/关键文件: ${f}`);
+          }
+
+          // 第二阶段已把 server/mcp.json 清空为 []；测试配置迁到了 fixtures/mcp-demo.json。
+          // 这里断言它是空数组，防止内置 demo 配置被误提交回来。
+          const mcp = JSON.parse(fs.readFileSync('server/mcp.json', 'utf8'));
+          if (!Array.isArray(mcp) || mcp.length !== 0) {
+            errors.push('server/mcp.json 应为空数组 []，内置 demo 配置疑似回归');
+          }
+
+          // .dockerignore 必须继续排除验收脚本、样例与内部文档，交付镜像才不含 demo 痕迹。
+          const di = fs.readFileSync('.dockerignore', 'utf8');
+          for (const rule of ['server/eval', 'server/samples', 'server/*.md']) {
+            if (!di.includes(rule)) errors.push(`.dockerignore 缺少排除规则: ${rule}`);
+          }
+
+          // 交付模板必须是合法 JSON（客户会照着改，写坏一个逗号就现场翻车）。
+          for (const f of ['deploy/branding.example.json', 'deploy/license.example.json', 'deploy/mcp.example.json']) {
+            try { JSON.parse(fs.readFileSync(f, 'utf8')); }
+            catch (e) { errors.push(`${f} 不是合法 JSON: ${e.message}`); }
+          }
+
+          // 三处版本号必须同步，且许可字段不能退回 ISC/MIT 等开源许可：
+          // 这是商业私有化交付，根 LICENSE 才是权属声明。
+          const rootPkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+          const serverPkg = JSON.parse(fs.readFileSync('server/package.json', 'utf8'));
+          const webPkg = JSON.parse(fs.readFileSync('web/package.json', 'utf8'));
+          if (new Set([rootPkg.version, serverPkg.version, webPkg.version]).size !== 1) {
+            errors.push(`三处 package.json 版本不一致: ${rootPkg.version}/${serverPkg.version}/${webPkg.version}`);
+          }
+          if (rootPkg.license !== 'UNLICENSED' || serverPkg.license !== 'UNLICENSED') {
+            errors.push('许可字段应为 UNLICENSED（商业私有化交付，不采用开源许可）');
+          }
+
+          if (errors.length) {
+            console.error('静态检查失败：');
+            for (const e of errors) console.error('  - ' + e);
+            process.exit(1);
+          }
+          console.log('静态检查通过：交付物齐全、mcp.json 为空、.dockerignore 排除规则完整');
+          NODE
+
+      # 8) 【人工验收说明】下面这些验收刻意不放进 CI，因为放进来必然失败：
+      #
+      #    · scripts/verify-all.sh 会先探 $BASE_URL/api/health，服务未启动就直接退出；
+      #      它串联的 verify:auth / verify:p0 / verify:models / verify:mcp /
+      #      verify:hr / test:agui 都依赖【已启动的 Express 服务】、真实数据库
+      #      与可用的管理员账号。
+      #    · verify:models 的 C 段、verify:mcp 的 E 段、verify:hr 的 C/D 段还会
+      #      真调第三方模型生成回答，需要【真实 API Key】并产生 API 费用。
+      #
+      #    正确做法：由人工在预发 / 客户同款服务器上先启动服务并配好密钥，再执行
+      #      SKIP_MODEL=1 bash scripts/verify-all.sh    # 省钱模式，整套跳过会真调模型的套件
+      #      bash scripts/verify-all.sh                 # 全量验收（会产生 API 费用）
+      #    本 CI 只保留上面 1~7 步「不需要服务、不需要密钥」的检查，
+      #    因此每次 push / PR 都能在干净环境里稳定跑完，不会因缺服务或缺密钥而红。

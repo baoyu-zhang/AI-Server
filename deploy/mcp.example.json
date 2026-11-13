@@ -1,0 +1,21 @@
+[
+  {
+    "name": "our-oa",
+    "transport": "http",
+    "url": "https://oa.example.com/mcp",
+    "headers": { "Authorization": "Bearer <换成你们的服务令牌>" },
+    "enabled": false,
+    "requireApproval": true,
+    "allowTools": ["queryEmployee", "listOpenTickets"],
+    "_说明": "HTTP 型 MCP Server 模板：把 url / headers 换成你们系统的真实地址与令牌，再把 enabled 改成 true。requireApproval:true 表示每次调用前都弹人工确认；allowTools 是白名单，生产环境务必填，别把整个工具集放开。JSON 不支持注释，说明放在这个字段里；mcp-client.js 只读取白名单字段，它会被安全忽略。"
+  },
+  {
+    "name": "local-tool",
+    "transport": "stdio",
+    "command": "node",
+    "args": ["/path/to/your-mcp-server.js"],
+    "enabled": false,
+    "requireApproval": "auto",
+    "_说明": "stdio 型模板：适用于把工具脚本放进镜像、由本服务拉起子进程的场景。args 建议写绝对路径，或确保服务从能解析相对路径的目录启动。stderr 会被忽略（日志写 stderr 会堵住 MCP 握手）。"
+  }
+]

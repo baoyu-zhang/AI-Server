@@ -1,0 +1,96 @@
+# ============================================================================
+# Dockerfile.offline —— 对外「私有化 / 内网离线」交付专用镜像
+# ============================================================================
+# ===== 为什么单独一份、绝不改动根 Dockerfile =====
+# 根 Dockerfile 是 Railway 线上正在跑的两阶段构建，已经过验证；任何改动都会直接影响
+# 已上线服务（尤其是它刻意「不预设 PORT」，靠 Railway 注入）。私有化交付的需求恰好相反：
+# 客户现场通常不能出网，而根镜像启动时才去 Hugging Face 拉几百 MB 的 embedding 模型，
+# 离线环境必然失败。两者诉求冲突，所以另起一份文件，互不干扰、各自独立演进。
+#
+# 本文件完整复制根 Dockerfile 的两阶段构建思路（阶段一：Vue → web/dist；
+# 阶段二：Express 单端口托管静态文件 + API），只在运行阶段多做两件事：
+# 把预下载好的模型缓存拷进镜像、把环境变量固定成离线交付所需的取值。
+#
+# ===== 构建前必须先跑 prefetch（硬性前置条件）=====
+#   npm run model:prefetch        # 或 node scripts/prefetch-model.mjs
+# 它会在【联网机器】上把 Xenova/bge-small-zh-v1.5 下载到仓库根 model-cache/。
+# 下面的 `COPY model-cache/ /app/model-cache/` 依赖这个目录存在且完整：
+#   · 目录不存在 → docker build 直接报 not found；
+#   · 目录不完整 → 镜像能构建出来，但客户现场离线启动时会去联网补文件、随后失败，
+#     而且这种故障要等到运行时才暴露，现场极难定位。
+# 另外注意：仓库根的 .dockerignore 已核查过，没有排除 model-cache/，
+# 所以这份缓存能正常进入构建上下文；将来若往 .dockerignore 里加了 model-cache，
+# 请务必同步回来检查，否则离线能力会被悄悄破坏。
+#
+# ===== 模型为什么放镜像里、而不是放进 /app/data 数据卷 =====
+# /app/data 是单卷，专门放「运行时会变的状态」（app.db、images、uploads、
+# vector-index、backups、logs）。模型是随镜像分发的「只读构建产物」，不会变；
+# 放卷里反而危险：全新卷是空的，会盖住镜像层里的模型，导致首次启动又去联网下载。
+# 所以模型单独放 /app/model-cache（镜像层、只读），并用 TRANSFORMERS_CACHE 指过去；
+# server/rag-vector.js 会读这个变量作为 env.cacheDir，文件齐全时全程不联网。
+#
+# ===== 为什么可以（且应该）在这里预设 PORT=3000 =====
+# 根 Dockerfile 刻意不设 PORT 是为了让 Railway 注入；离线交付用 compose 固定映射
+# 3000:3000，没有平台注入这一层，写死反而能保证「容器活着 = 端口就在」。
+# ============================================================================
+
+# ---------- 阶段 1：构建前端（与根 Dockerfile 一致）----------
+FROM node:22-bookworm-slim AS web
+WORKDIR /web
+# 先只拷依赖清单：代码变了但依赖没变时命中层缓存，重复构建能快很多
+COPY web/package.json web/package-lock.json ./
+RUN npm ci --no-audit --no-fund
+COPY web/ ./
+# 产物落到 /web/dist；vite 配置 emptyOutDir:false 只覆盖不删，受限环境也能构建
+RUN npm run build
+
+# ---------- 阶段 2：运行镜像（与根 Dockerfile 一致，追加离线配置）----------
+FROM node:22-bookworm-slim AS app
+WORKDIR /app
+# 必须补 libgomp1：@xenova/transformers → onnxruntime-node 的 Linux 预编译二进制
+# 链接了 libgomp.so.1，bookworm-slim 为体积把它裁掉了。index.js 是【顶层】require
+# rag-vector → 顶层 require transformers，缺这个库不是「用到知识库才崩」，而是容器
+# 一启动就 dlopen 失败直接退出。macOS 用 dylib 不会暴露，属典型「本地能跑云上崩」。
+RUN apt-get update && apt-get install -y --no-install-recommends libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+
+# 离线交付的固定环境变量：
+#   TRANSFORMERS_CACHE 指向镜像内置的预下载缓存（关键：让运行时命中本地、零联网）
+#   PORT=3000          离线 compose 固定 3000:3000，无平台注入，写死最稳
+#   APP_DATA_DIR       启用单卷布局，所有可写状态收敛到 /app/data（见 server/paths.js）
+#   NODE_ENV           生产模式，开启 security.js 的弱口令 / 密钥自检
+#   LOG_TO_FILE=0      日志只走 stdout 交给 docker 收集，不在卷里再叠一层文件 IO
+# 刻意【不设 HF_ENDPOINT】：模型已内置，不需要也不应该再指向任何下载源，
+# 留着反而会让人误以为离线镜像仍依赖外网。
+ENV TRANSFORMERS_CACHE=/app/model-cache \
+    PORT=3000 \
+    APP_DATA_DIR=/app/data \
+    NODE_ENV=production \
+    LOG_TO_FILE=0
+
+# 后端依赖：同样先拷清单再 npm ci，利用层缓存
+COPY server/package.json server/package-lock.json ./
+RUN npm ci --omit=dev --no-audit --no-fund
+COPY server/ ./
+
+# 把预下载好的模型缓存整目录拷进镜像。这一步是「离线」能力的来源，
+# 目录结构必须与 prefetch 脚本产出的 model-cache/ 完全一致（不要改名、不要只拷单个文件），
+# 否则 transformers.js 按 models--Xenova--bge-small-zh-v1.5/... 的路径找不到文件，
+# 就会回退去联网下载，离线交付随即失败。
+COPY model-cache/ /app/model-cache/
+
+# 前端产物放到 index.js 默认查找的位置：__dirname=/app → ../web/dist = /web/dist
+COPY --from=web /web/dist /web/dist
+
+# 以 root 运行是明确的取舍：私有化交付的持久化卷常常是 root 所有，
+# 换成非 root 会写不进 SQLite（启动即崩）；容器隔离已提供边界。
+# 不声明 VOLUME：卷由 deploy/docker-compose.yml 显式挂载，匿名卷反而会挡住它。
+
+EXPOSE 3000
+# 健康检查与根 Dockerfile 保持一致：用 node 内置 fetch 打 /api/health，
+# 不引入 curl/wget（slim 镜像里没装）。start-period 给足 120s，
+# 覆盖首次初始化向量库 + onnxruntime 加载模型的时间。
+HEALTHCHECK --interval=30s --timeout=5s --start-period=120s --retries=3 \
+  CMD node -e "fetch('http://127.0.0.1:'+ (process.env.PORT||3000) +'/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+
+CMD ["node", "index.js"]

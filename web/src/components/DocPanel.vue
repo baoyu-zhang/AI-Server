@@ -24,7 +24,7 @@
           filterable
           creatable
           clearable
-          placeholder="候选人标识（必填，可新建）"
+          :placeholder="`${term('candidate')}标识（必填，可新建）`"
           :popup-props="{ attach: 'body' }"
         />
         <!-- JD 必须落到某个岗位上；简历也允许标岗位，表示"投的是这个岗" -->
@@ -36,7 +36,7 @@
           filterable
           creatable
           clearable
-          :placeholder="docType === 'jd' ? '岗位标识（必填，可新建）' : '应聘岗位（选填）'"
+          :placeholder="docType === 'jd' ? `${term('job')}标识（必填，可新建）` : '应聘岗位（选填）'"
           :popup-props="{ attach: 'body' }"
         />
       </div>
@@ -95,6 +95,8 @@ import { computed, onMounted, ref } from 'vue'
 import { MessagePlugin } from 'tdesign-vue-next'
 import { DeleteIcon, FileIcon, RefreshIcon, UploadIcon } from 'tdesign-icons-vue-next'
 import { authHeaders, clearAuth } from '../api/auth'
+// 第二阶段：上传区的业务标签用术语字典渲染；value 枚举保持原样，见下方 computed 的说明
+import { term } from '../config/branding'
 
 // 文档条目：后端按 fileName 聚合后的结果，业务标签可能为空（历史语料没有）
 interface DocItem {
@@ -126,14 +128,21 @@ const jobId = ref('')
 const candidateOptions = ref<{ label: string; value: string }[]>([])
 const jobOptions = ref<{ label: string; value: string }[]>([])
 
-const DOC_TYPE_LABELS: Record<string, string> = { resume: '简历', jd: '岗位JD', policy: '制度', other: '其他' }
-const docTypeOptions = [
-  { label: '简历', value: 'resume' },
-  { label: '岗位 JD', value: 'jd' },
+// 第二阶段：业务类型的**显示名**改成从术语字典取，且必须是 computed ——
+// 品牌配置是启动后异步到达的响应式对象，写成模块级常量就永远停在默认值了。
+// 注意 value（'resume' / 'jd' / 'policy'）是后端数据模型的枚举，绝不能跟着改：
+// 改了会让上传的 metadata 与检索 filter 全部对不上，属于真 bug 而不是皮肤问题。
+const docTypeOptions = computed(() => [
+  { label: term('resume'), value: 'resume' },
+  { label: term('job'), value: 'jd' },
   { label: '公司制度 / 规范', value: 'policy' },
   { label: '其他文档', value: 'other' }
-]
-const docTypeLabel = (type?: string) => (type ? DOC_TYPE_LABELS[type] || type : '')
+])
+const docTypeLabel = (type?: string) => {
+  if (!type) return ''
+  const hit = docTypeOptions.value.find(o => o.value === type)
+  return hit ? hit.label : type
+}
 
 const totalChunks = computed(() => documents.value.reduce((sum, doc) => sum + doc.chunkCount, 0))
 

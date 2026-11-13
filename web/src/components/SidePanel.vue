@@ -9,7 +9,10 @@
       <t-tab-panel value="docs" label="文档">
         <DocPanel ref="docRef" @changed="onDocsChanged" />
       </t-tab-panel>
-      <t-tab-panel value="candidates" label="候选人">
+      <!-- 第二阶段：候选人页签是「行业皮肤」，不是必备功能。非 HR 场景（制度检索、
+           客服知识库等）在 branding.json 里设 panels.candidates=false 即可整块隐藏；
+           页签文字同样来自术语字典，后端 resume/jd 枚举与 /api/candidates 一律不动。 -->
+      <t-tab-panel v-if="branding.panels.candidates" value="candidates" :label="term('candidate')">
         <CandidatePanel ref="candRef" @ask="forwardAsk" />
       </t-tab-panel>
       <t-tab-panel value="usage" label="用量">
@@ -52,6 +55,8 @@ import AccountPanel from './AccountPanel.vue'
 import AdminPanel from './AdminPanel.vue'
 import { computed } from 'vue'
 import { currentUser } from '../api/auth'
+// 第二阶段：品牌单例与术语字典（页面文案取自数据卷 branding.json，非硬编码）
+import { branding, term } from '../config/branding'
 
 // 候选人面板里的"评估 / 改状态"不自己发请求，而是让上层往对话里发一句话——
 // 这样改状态仍然走 interrupt 审批，不会出现"界面上点一下就把人淘汰了"的旁路。

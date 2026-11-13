@@ -35,6 +35,8 @@ const { attachRequestContext, attachGraceful, markReady, isReady, isShuttingDown
 const { attachOpsAlert } = require('./ops-alert') // P1：错误阈值运维告警（挂在统一错误出口之前）
 const { accountRouter } = require('./account-routes') // P2：账号自助 / 记忆 / 会话删除 / 用户停用
 const { deleteDocumentByFileId } = require('./rag-vector') // P2：按文档唯一 id 清理向量片段
+const { getBranding } = require('./branding') // 第二阶段：运行时品牌配置（公开端点，登录页要用）
+const { licenseGate } = require('./license') // 第二阶段：许可状态与可选的到期停用闸门
 
 // ===== RBAC 引导：启动时按环境变量准备管理员账号 =====
 // 为什么启动时做而不是注册时：注册时判断"是不是第一个用户"很脆弱（重装库、
@@ -121,6 +123,21 @@ const compatRateLimit = COMPAT_RATE_MAX > 0
 //   ① /api/auth 必须先挂（登录接口本身不能要求已登录）；
 //   ② requireAuth 紧随其后，成为其后所有端点的总闸门——
 //      以后新加路由只要写在这行之后，就自动受保护，"忘了加鉴权"这类事故在结构上不可能发生。
+// ===== 品牌配置（公开端点，必须在 requireAuth 之前）=====
+// 登录页是用户「还没登录」时看到的第一屏：客户名、产品名、Logo、协议链接都在
+// 这个接口里。若要求 token，就会变成「没登录 → 拿不到品牌 → 登录页显示成默认品牌」
+// 的鸡生蛋问题。安全性靠字段白名单（branding.js 的 normalize），不靠鉴权。
+// no-store 是刻意的：客户改了卷里的 branding.json 后刷新浏览器应立即看到新品牌，
+// 不能被 CDN / 浏览器缓存成旧的那份；这个响应体只有几百字节，没有缓存收益。
+app.get('/api/branding', (req, res) => {
+  res.setHeader('Cache-Control', 'no-store')
+  res.json(getBranding())
+})
+
+// ===== 许可闸门：只拦「新登录 / 新注册」，且仅在 LICENSE_ENFORCE=1 时生效 =====
+// 挂在 authRouter 之前，登录逻辑本身保持干净；默认未配置许可时直接 next()，
+// 对现有本机 / Railway / 离线包部署零影响。详见 license.js 顶部的设计取舍。
+app.use('/api/auth', licenseGate)
 app.use('/api/auth', authRouter)
 // 健康检查必须在 requireAuth 之前：容器编排（HEALTHCHECK/探针）不带 token，
 // 它只关心"进程活着没"，不关心你是谁
@@ -2196,17 +2213,22 @@ app.post('/api/session-files/upload', uploadSessionFile, async (req, res) => {
     }
 
     const rawText = await extractFileText(req.file.path, ext)
+    // 第三个参数传 req.user.userId（而不是 body 里的任何字段）：附件归属要跟鉴权结果走，
+    // 落盘后合规「删除用户全部数据」才能按人清干净。session-files-store 会把它写进
+    // session_files.user_id，重启后按 sessionId 回填时不影响任何对外返回结构。
     const file = await addSessionFile(sessionId, {
       fileName,
       text: rawText,
       size: req.file.size
-    })
+    }, req.user.userId)
     res.json({ ok: true, file: { ...file, kind: 'doc' } })
   } catch (err) {
     console.error('会话附件处理失败：', err)
     res.status(500).json({ error: err.message })
   } finally {
-    // 处理完成后删除落盘文件，内容已转成内存向量或 base64
+    // 删除 multer 的临时上传原件：解析出的文本块与向量已由 session-files-store 落到
+    // uploads/session-files/<fileId>.json，图片本体已由 image-store 落到 data/images，
+    // 这份临时文件不再有用（改造前它是唯一副本，删掉就等于把内存之外的数据全清了）。
     if (req.file?.path) fs.promises.unlink(req.file.path).catch(() => {})
   }
 })

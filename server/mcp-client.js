@@ -35,9 +35,19 @@ let initPromise = null
  * 读取配置。三种来源按优先级：
  *   1. MCP_SERVERS  环境变量（JSON 数组）—— 部署时用，不依赖文件
  *   2. MCP_CONFIG_FILE 指定的文件
- *   3. server/mcp.json —— 本地开发默认位置（不存在就当没配置）
+ *   3. server/mcp.json —— 默认位置（不存在就当没配置）
  * 支持三种写法，都是为了"从别的工具抄来的配置能直接用"：
  *   数组 [{name,command,args}] / {servers:[...]} / {name: {...}}
+ *
+ * ===== 第二阶段「去 demo 痕迹」后的约定（重要）=====
+ * 交付镜像里的 server/mcp.json 是空数组 []：客户开箱即用时看不到任何玩具工具，
+ * 也不会有一个指向 example.com 的假地址。JSON 不允许写注释，所以说明放在这里。
+ *   · 客户怎么接自己的工具　：推荐用 MCP_SERVERS 环境变量（容器 env_file 可直接注入），
+ *     或把 deploy/mcp.example.json 改好、用 MCP_CONFIG_FILE 指过去；模板见 deploy/ 目录。
+ *   · 本地回归怎么挂 demo　：MCP_CONFIG_FILE=eval/fixtures/mcp-demo.json，
+ *     测试专用配置在 server/eval/fixtures/，该目录已被 .dockerignore 排除。
+ *   · 为什么用环境变量而不是改文件：镜像层是只读的，客户在容器里改 /app/mcp.json
+ *     既不持久也难审计；环境变量随 compose 的 .env 走，升级镜像不丢。
  */
 function loadConfig() {
   if (process.env.MCP_ENABLED === '0') return []

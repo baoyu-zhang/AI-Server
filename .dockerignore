@@ -25,3 +25,23 @@ output
 **/*.log
 **/.DS_Store
 server/eval/results
+
+# ===== 第二阶段「去 demo 痕迹」：交付镜像只保留运行时代码 =====
+# 原因：Dockerfile.offline 用 `COPY server/ ./` 整个目录拷进镜像。只排除运行时数据
+# 是不够的——验收脚本、样例简历、内部设计文档、玩具 MCP server 都会跟着镜像
+# 送到客户手上。HR-SCENARIO-PLAN.md 里甚至写着「我做了个 RAG demo」，
+# 客户一翻文件就露馅；样例 JD / 样例简历还会让人误以为是内置业务数据。
+# 原则：镜像里只放「跑起来必须的代码」，其余留在仓库供开发/测试使用。
+server/eval
+server/samples
+server/mcp-demo-server.js
+server/test-agui-protocol.mjs
+server/*.md
+server/.env.example
+# 下面三个是早期「只打后端 / 本机 pm2」时代的遗留，容器里用不到：
+# 根目录的 Dockerfile.offline 与 deploy/docker-compose.yml 才是交付用的那一份。
+server/Dockerfile
+server/docker-compose.yml
+server/ecosystem.config.cjs
+# 注意：deploy/mcp.example.json 在 deploy/ 目录，本来就不在 COPY 范围内，
+# 无需排除；它是随文档交给客户的配置模板，不是镜像内容。

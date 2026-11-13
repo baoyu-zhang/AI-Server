@@ -29,7 +29,7 @@
   },
   "keywords": [],
   "author": "",
-  "license": "ISC",
+  "license": "UNLICENSED",
   "dependencies": {
     "@ag-ui/encoder": "^1.0.3",
     "@ai-sdk/deepseek": "^3.0.67",

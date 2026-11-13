@@ -1,0 +1,11 @@
+[
+  {
+    "name": "demo",
+    "transport": "stdio",
+    "command": "node",
+    "args": ["mcp-demo-server.js"],
+    "enabled": true,
+    "requireApproval": "auto",
+    "_说明": "仅供本地回归验收，绝不进交付镜像：.dockerignore 已排除 server/eval 整个目录。JSON 不能写注释，故用这个字段承载说明；mcp-client.js 的 loadConfig 只取白名单字段，未知字段会被忽略，不会影响连接。使用时必须从 server/ 目录启动服务——stdio 子进程继承父进程 cwd，相对路径 mcp-demo-server.js 才找得到。启动命令见 verify-mcp.mjs 文件头。"
+  }
+]

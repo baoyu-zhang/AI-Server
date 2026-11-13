@@ -14,7 +14,19 @@
  *
  * A-D 不调模型，跑一遍十几秒；E 会真调一次模型（interrupt 由模型发出 tool-call 才产生，
  * 手工拼历史测的是假链路，因此这里必须真跑）。
- * 用法：node eval/verify-mcp.mjs   （服务需已启动）
+ *
+ * ===== 运行前提：服务必须用「验收配置」启动 =====
+ * 第二阶段把交付用的 server/mcp.json 清成了空数组（客户不该看到 demo 工具）。
+ * 本脚本的 A 段会自己写一份临时 MCP_CONFIG_FILE，不受影响；但 B 段查 /api/mcp、
+ * E 段触发 mcp__demo__add 审批链路，都依赖【服务进程】里挂着 demo server。
+ * 因此跑验收前请从 server/ 目录这样启动（相对路径靠 cwd 解析）：
+ *
+ *   cd server
+ *   MCP_CONFIG_FILE=eval/fixtures/mcp-demo.json npm start
+ *   node eval/verify-mcp.mjs
+ *
+ * 千万别把 demo 配置写回 mcp.json——那会让它重新混进交付镜像。
+ * 服务需已启动；BASE_URL 由 http-auth.mjs 决定，默认 http://127.0.0.1:3000。
  */
 import { execFileSync } from 'node:child_process'
 import fs from 'node:fs'

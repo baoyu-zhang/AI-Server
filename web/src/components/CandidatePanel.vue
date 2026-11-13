@@ -4,7 +4,8 @@
     <div class="cand-panel__head">
       <div class="cand-panel__title">
         <UserIcon class="cand-panel__title-icon" />
-        <span>候选人</span>
+        <!-- 第二阶段：标题走术语字典，换行业时这里自动跟着变 -->
+        <span>{{ term('candidate') }}</span>
         <span class="cand-panel__count">{{ candidates.length }}</span>
       </div>
       <t-button variant="text" shape="square" size="small" :loading="loading" title="刷新列表" @click="load">
@@ -101,6 +102,9 @@ import { computed, onMounted, ref } from 'vue'
 import { MessagePlugin } from 'tdesign-vue-next'
 import { RefreshIcon, UserIcon } from 'tdesign-icons-vue-next'
 import { authHeaders } from '../api/auth'
+// 第二阶段：面板标题走术语字典；其余提示语仍用默认 HR 措辞，
+// 因为 ask() 拼给模型的是自然语言指令，术语要与后端工具描述一致才不会让模型困惑。
+import { term } from '../config/branding'
 
 // 候选人记录：来自 GET /api/candidates（向量库"谁有简历" + JSON 表"状态与分数"合并）
 interface CandidateItem {

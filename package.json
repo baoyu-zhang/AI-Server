@@ -3,6 +3,7 @@
   "version": "1.0.0",
   "private": true,
   "description": "AI-Server：单端口同时提供 Vue 前端与 Express/AG-UI 后端",
+  "license": "UNLICENSED",
   "engines": {
     "node": ">=22"
   },
@@ -10,6 +11,10 @@
     "build": "npm --prefix web ci && npm --prefix web run build",
     "start": "npm --prefix server start",
     "install:all": "npm --prefix server ci && npm --prefix web ci",
-    "verify:all": "bash scripts/verify-all.sh"
+    "verify:all": "bash scripts/verify-all.sh",
+    "setup": "node scripts/setup.mjs",
+    "model:prefetch": "node scripts/prefetch-model.mjs",
+    "bundle:offline": "bash scripts/build-offline-bundle.sh",
+    "license:generate": "node scripts/gen-license.mjs"
   }
 }
