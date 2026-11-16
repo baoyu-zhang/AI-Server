@@ -8,7 +8,15 @@
 
 ## [Unreleased]
 
-暂无。
+### 变更
+
+- **AG-UI 正文改为标准三连**：`TEXT_MESSAGE_CHUNK` → `TEXT_MESSAGE_START` + `TEXT_MESSAGE_CONTENT` × N + `TEXT_MESSAGE_END`。
+  原因：CHUNK 是官方简写事件，但需要客户端实现展开逻辑；且「CHUNK + 显式 END」经官方
+  `@ag-ui/client` 的 `transformChunks` 展开会产出**两个** `TEXT_MESSAGE_END`，严格的第三方客户端
+  会当成重复收尾。改成三连后，服务端发出的流与客户端展开结果完全一致（实测事件序列零差异），
+  协议层不再依赖任何前端库的展开实现，换框架 / 接第三方客户端 / 作为开放接口对外都直接可用。
+  同步更新 `server/test-agui-protocol.mjs` 断言（新增「不再下发 CHUNK」「START/END 数量配对」
+  「分片可归属到已 START 的消息」三项）与 `PROJECT-MAP.md` 用例说明。
 
 ## [1.0.0] - 2026-11-13
 

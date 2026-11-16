@@ -40,21 +40,21 @@
  */
 const { DatabaseSync } = require('node:sqlite')
 const path = require('node:path')
-const fs = require('node:fs')
+const fs = require('node:fs')//文件系统模块的惯用变量名
 
 // 路径统一由 paths.js 决定：本机仍是 server/data，云上则指向挂载卷（见 paths.js 顶部说明）。
 // 仍支持旧的 APP_DB_FILE 覆盖，测试脚本可以指到 /tmp 而不碰正式库。
 const DB_FILE = require('./paths').PATHS.DB_FILE
-fs.mkdirSync(path.dirname(DB_FILE), { recursive: true })
+fs.mkdirSync(path.dirname(DB_FILE), { recursive: true }) //在打开数据库文件之前确保目录已经存在
 
-const db = new DatabaseSync(DB_FILE)
+const db = new DatabaseSync(DB_FILE) //创建数据库实例，如果文件不存在会自动创建一个新的
 
 // WAL：写不阻塞读，掉电也不容易丢半个事务。单机服务的标准配置。
-db.exec('PRAGMA journal_mode = WAL;')
-db.exec('PRAGMA foreign_keys = ON;')
+db.exec('PRAGMA journal_mode = WAL;')//切到 WAL 日志模式 → 读写并发 + 崩溃不丢半事务
+db.exec('PRAGMA foreign_keys = ON;')//打开外键检查 → 保证引用完整性（且每次连接都要开）
 
 db.exec(`
-CREATE TABLE IF NOT EXISTS users (
+CREATE TABLE IF NOT EXISTS users (  
   id            TEXT PRIMARY KEY,
   username      TEXT UNIQUE NOT NULL,
   password_hash TEXT NOT NULL,           -- 格式 scrypt$<saltHex>$<hashHex>

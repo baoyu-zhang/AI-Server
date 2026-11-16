@@ -1069,15 +1069,18 @@ app.post('/agui', aguiRateLimit, async (req, res) => {
     reasoningOpen = true
   }
 
-  // 正文改用 TEXT_MESSAGE_CHUNK：客户端会自动合成 START / CONTENT，
-  // 结束统一由 closeText 显式发 TEXT_MESSAGE_END，避免依赖客户端自行推断
+  // 正文采用标准三连：TEXT_MESSAGE_START（openText 发）→ TEXT_MESSAGE_CONTENT（每片 delta）
+  // → TEXT_MESSAGE_END（这里发）。不用官方简写 TEXT_MESSAGE_CHUNK 的原因：
+  // CHUNK 依赖客户端做展开，而"CHUNK + 显式 END"会让官方 transformChunks 产出两个
+  // TEXT_MESSAGE_END（实测），严格实现会当成重复收尾；三连是任何 AG-UI 客户端都直接支持的基础形态，
+  // 不需要客户端额外实现展开逻辑，协议层不再绑定具体前端库。
   const closeText = () => {
     if (!textOpen) return
     if (currentAssistantId) send({ type: 'TEXT_MESSAGE_END', messageId: currentAssistantId })
     textOpen = false
   }
 
-  // 返回 true 表示新开了一段文本流（chunk 需要带 role）
+  // 返回 true 表示新开了一段文本流
   const openText = () => {
     closeReasoning()
     if (textOpen) return false
@@ -1089,6 +1092,9 @@ app.post('/agui', aguiRateLimit, async (req, res) => {
     ensureAssistant()
     textOpen = true
     assistantTextStarted = true
+    // 标准三连的第一发：先声明"一条 assistant 消息开始了"，客户端据此建气泡、挂 loading。
+    // 显式发 START 的好处是语义自足 —— 客户端不需要靠"收到第一片正文"去反推消息边界。
+    send({ type: 'TEXT_MESSAGE_START', messageId: currentAssistantId, role: 'assistant' })
     // 每段正文独立成一条 assistant 消息：同一轮里工具调用前后各说一段时，
     // 合并成一条会让恢复出来的历史变成重复文本
     currentTextMsg = { id: currentAssistantId, role: 'assistant', content: '' }
@@ -1216,7 +1222,8 @@ app.post('/agui', aguiRateLimit, async (req, res) => {
         activeStep = `step-${stepIndex}`
         send({ type: 'STEP_STARTED', stepName: activeStep })
       } else if (part.type === 'finish-step') {
-        // STEP_FINISHED 是非 chunk 事件，客户端会自动给文本流补 TEXT_MESSAGE_END
+        // 一步结束：先给本段正文补 TEXT_MESSAGE_END（标准三连的第三发），再报步骤结束。
+        // 顺序不能反 —— 客户端收到 STEP_FINISHED 时不应该还有"未结束的正文消息"。
         closeText()
         if (activeStep) {
           send({ type: 'STEP_FINISHED', stepName: activeStep })
@@ -1228,14 +1235,10 @@ app.post('/agui', aguiRateLimit, async (req, res) => {
         send({ type: 'REASONING_MESSAGE_CONTENT', messageId: currentReasoningId, delta: part.text })
       } else if (part.type === 'text-delta') {
         if (!part.text) continue
-        const opened = openText()
+        openText() // 首片会发 TEXT_MESSAGE_START，之后是续写
         if (currentTextMsg) currentTextMsg.content += part.text // 落库：追加到本段正文
-        send({
-          type: 'TEXT_MESSAGE_CHUNK',
-          // 开头的分片带 messageId + role，续写分片省略（省略表示延续当前消息）
-          ...(opened ? { messageId: currentAssistantId, role: 'assistant' } : {}),
-          delta: part.text
-        })
+        // 标准三连的第二发：CONTENT 每片都必须带 messageId（协议要求每条正文能归属到具体消息）
+        send({ type: 'TEXT_MESSAGE_CONTENT', messageId: currentAssistantId, delta: part.text })
       } else if (part.type === 'tool-call') {
         // 工具调用挂到当前 assistant 消息上，先结束文本流
         const parentMessageId = ensureAssistant()

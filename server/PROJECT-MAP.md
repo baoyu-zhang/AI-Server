@@ -3,36 +3,83 @@
 > 这份文档回答三个问题：哪些文件真正跑在线上链路里、每个文件解决什么问题、背后对应哪些知识点。
 >
 > 判断标准：**"是否进入前端实际调用的请求链路"**。只被脚本引用、或没有任何调用方的文件，单独归类。
-> 行数以当前代码为准（`wc -l` 实测）。
+> 行数以当前代码为准（`wc -l` 实测，2026-11-13）。
+>
+> 配套阅读：`PRODUCT-GUIDE.md` 第 2 章（技术选型与替代方案对比）、第 3 章（全部端点与接入示例）、`docs/操作手册.md`（运维视角）。
 
 ---
 
-## 一、总览
+## 一、总览（按层分组，共 34 个模块、9346 行）
 
-| 文件 | 行数 | 分类 | 是否进入线上链路 | 一句话职责 |
-|---|---|---|---|---|
-| `index.js` | 855 | 运行时 | 是（入口） | HTTP 服务、工具定义、AG-UI 协议适配 |
-| `chat-core.js` | 332 | 运行时 | 是 | 聊天主链路：裁剪/附件/选模型/发起流 |
-| `rag-vector.js` | 403 | 运行时 | 是 | 向量 + BM25 双路检索与 RRF 融合 |
-| `rag-utils.js` | 197 | 运行时 | 是 | 文档解析、清洗、三级分块 |
-| `session-files.js` | 158 | 运行时 | 是 | 会话级临时附件（内存，不进知识库） |
-| `test-agui-protocol.mjs` | 880 | 测试 | 否（需服务在跑） | AG-UI 事件序列的契约测试，9 个用例 |
-| `eval/ingest-corpus.js` | 110 | 评测 | 否 | 从固定语料重建向量库 |
-| `eval/run-eval.js` | 166 | 评测 | 否 | 跑 20 题评测，输出 hit@k / MRR |
-| `eval/compare.js` | 84 | 评测 | 否 | 两次评测逐题对比，区分"救回"和"弄坏" |
-| `eval/inspect.js` | 123 | 评测 | 否 | 检索透视：看两路各自的排名与贡献 |
-| `eval/eval-dataset.json` | — | 评测 | 否 | 20 条带标注的评测题 |
-| `eval/results/*.json` | — | 数据 | 否 | 历次评测快照（baseline / cleaned / rrf） |
-| `uploads/` | — | 数据 | 是（读写） | 上传文件落盘目录，已 gitignore |
-| `vector-index/` | — | 数据 | 是（读写） | Vectra 本地向量库（单个 JSON），已 gitignore |
+> 阅读策略：**先纵向（跟着一次请求走），再横向（按层读）**。下面四层从上到下，正好是请求穿过服务的顺序。
 
-**读代码建议顺序**：`index.js` 的 `/agui` 路由 → `chat-core.js` 的 `prepareChatStream` → `index.js` 的 `createTools` → `rag-vector.js`。这四段串起来就是一次完整问答。
+### 第 1 层：入口与横切（每个请求都过这里）
+
+| 文件 | 行数 | 一句话职责 |
+|---|---|---|
+| `index.js` | 2325 | 唯一入口：Express 挂载顺序、全部路由、AG-UI 协议适配、工具定义 |
+| `security.js` | 136 | 生产配置硬校验、CORS、安全响应头、请求体限制（最先挂） |
+| `auth.js` | 272 | session + API Key 双凭证、登录/注册/登出、登录失败限流 |
+| `rate-limit.js` | 63 | 内存滑动窗口限流（按 IP） |
+| `quota.js` | 100 | 按用户每日 Token 配额（DB 计数，不是内存） |
+| `prompt-guard.js` | 99 | 提示注入防护：拦截试图改写 system 指令的输入 |
+| `runtime.js` | 128 | `/api/health` 探针、`markReady()`、优雅退出（`attachGraceful`） |
+| `ops-alert.js` | 207 | 运行时告警（配额超限、模型持续失败等推给管理员） |
+| `branding.js` | 176 | 品牌配置（卷内 branding.json，公开 `/api/branding`） |
+| `license.js` | 239 | 轻量许可校验（HMAC 签名、到期/坐席，默认只提示不阻断） |
+
+### 第 2 层：聊天主链（业务核心，跟着一次提问走）
+
+| 文件 | 行数 | 一句话职责 |
+|---|---|---|
+| `chat-core.js` | 411 | 聊天主链路：裁剪/附件/选模型/发起流（协议细节零依赖） |
+| `models.js` | 148 | 模型注册表与降级链（快速/思考/视觉三档） |
+| `model-fallback.js` | 91 | 单供应商多模型降级（主模型挂了自动切） |
+| `mcp-client.js` | 412 | MCP 工具客户端：stdio/http/sse 三种传输、审批标记 |
+| `mcp-demo-server.js` | 65 | 测试用玩具 MCP server（已从交付配置摘除，仅验收用） |
+
+### 第 3 层：检索与业务工具（Agent 的"手"）
+
+| 文件 | 行数 | 一句话职责 |
+|---|---|---|
+| `rag-vector.js` | 621 | 向量 + BM25 双路检索与 RRF 融合、文档入库 |
+| `rag-utils.js` | 324 | 文档解析、清洗、三级分块 |
+| `session-files.js` | 301 | 会话附件入口（磁盘为准 + 内存缓存） |
+| `session-files-store.js` | 210 | 附件持久化（session_files 表 + uploads/session-files/） |
+| `score-resume.js` | 450 | 简历×JD 评分（维度+门槛+证据链，独立于协议层可直调） |
+| `candidates-store.js` | 254 | 候选人池（cand 字段级增删改查） |
+
+### 第 4 层：数据与状态（落在哪里）
+
+| 文件 | 行数 | 一句话职责 |
+|---|---|---|
+| `db.js` | 277 | node:sqlite 单库 + WAL + 外键 + `PRAGMA user_version` v5 版本化迁移 |
+| `threads-store.js` | 224 | 会话线程与运行快照（threads / thread_runs） |
+| `image-store.js` | 154 | 聊天图片落库 + HMAC 签名 URL（chat_images 表） |
+| `usage-store.js` | 59 | 模型用量记账（model_usage 表） |
+| `memory-store.js` | 75 | 用户长期记忆（user_memory 表，前端记忆面板） |
+| `audit.js` | 75 | 操作审计（audit_log 表，只追加） |
+| `account-routes.js` | 214 | 账号自助/记忆/会话删除/用户停用路由 |
+| `api-keys.js` | 101 | API Key 签发与吊销（外部系统调用用） |
+| `webhook-store.js` | 169 | 事件回推（HMAC-SHA256 签名 + SSRF 防护） |
+| `candidates-store.js` | — | （见第 3 层） |
+
+### 第 5 层：运维与交付（不碰业务，出事时兜底）
+
+| 文件 | 行数 | 一句话职责 |
+|---|---|---|
+| `backup.js` | 247 | 整卷备份（VACUUM INTO 的 .db + tar.gz 打包三类文件目录） |
+| `restore.js` | 464 | 备份校验/列表/恢复（路径穿越防护、--force 留底） |
+| `logger.js` | 185 | 文件日志（轮转、保留天数） |
+| `paths.js` | 70 | 路径单卷布局（APP_DATA_DIR 开关，云上 /app/data） |
+
+**读代码建议顺序**（一天能走完前四步）：`index.js` 的启动段（挂载顺序）→ `/agui` 路由 → `chat-core.js` 的 `prepareChatStream` → `index.js` 的 `createTools` → `rag-vector.js`。这五段串起来就是一次完整问答；其余 29 个文件都是这根主轴上的"挂件"，按层再读。
 
 ---
 
 ## 二、运行时文件详解
 
-### 1. `index.js`（855 行）— 入口与协议层
+### 1. `index.js`（855 → 现 2325 行）— 入口与协议层
 
 **职责**：Express 服务、工具定义、AG-UI 协议事件编码、RAG 管理端点。
 
@@ -58,7 +105,7 @@
 
 ---
 
-### 2. `chat-core.js`（332 行）— 聊天主链路
+### 2. `chat-core.js`（332 → 现 411 行）— 聊天主链路
 
 **职责**：`/agui` 的实现主体——把 AG-UI 还原出的消息变成一次模型调用。协议（事件编码、SSE 帧）留在 `index.js` 的适配层，这里一行都不出现，所以以后换协议不用动这个文件。
 
@@ -85,7 +132,7 @@ streamText            发起流式请求
 
 ---
 
-### 3. `rag-vector.js`（403 行）— 检索引擎
+### 3. `rag-vector.js`（403 → 现 621 行）— 检索引擎
 
 **职责**：文本向量化、向量库读写、双路召回与融合。
 
@@ -111,7 +158,7 @@ streamText            发起流式请求
 
 ---
 
-### 4. `rag-utils.js`（197 行）— 文档解析与切块
+### 4. `rag-utils.js`（197 → 现 324 行）— 文档解析与切块
 
 **职责**：把 PDF / Markdown 变成干净的文本块。
 
@@ -128,7 +175,7 @@ streamText            发起流式请求
 
 ---
 
-### 5. `session-files.js`（158 行）— 会话级临时附件
+### 5. `session-files.js`（158 → 现 301 行，另拆出 session-files-store.js 210 行）— 会话级临时附件
 
 **职责**：用户本次对话临时上传的文件，存内存，向量也算在内存里，**不进长期知识库**。
 
@@ -163,7 +210,7 @@ node test-agui-protocol.mjs --case=text,rag
 
 | 用例 | 断言什么 |
 |---|---|
-| `text` | 基础文本流：RUN_STARTED / STATE_SNAPSHOT / TEXT_MESSAGE_CHUNK / RUN_FINISHED；断言**不**下发 MESSAGES_SNAPSHOT（服务端无状态） |
+| `text` | 基础文本流：RUN_STARTED / STATE_SNAPSHOT / 正文标准三连（TEXT_MESSAGE_START → CONTENT → END）/ RUN_FINISHED；断言**不**下发 MESSAGES_SNAPSHOT（服务端无状态） |
 | `server_tool` | 服务端工具：START → ARGS → END → RESULT 闭环 |
 | `frontend_tool` | 前端工具只下发调用不给结果（挂起语义） |
 | `interrupt` | 审批中断：`outcome=interrupt` 与字段契约 |
@@ -207,6 +254,8 @@ node test-agui-protocol.mjs --case=text,rag
 
 ## 五、端点清单
 
+> 当前端点已扩到 25+ 个（P0–P2 与产品化阶段陆续新增：API Key、Webhook、账号管理、`/v1` OpenAI 兼容层、`/api/branding` 等）。完整清单与每个端点的请求/响应示例见 **`PRODUCT-GUIDE.md` 第 3.6 节速查表**。这里只保留主链路六端点与历史决策。
+
 单协议：**只有 `/agui` 一个聊天入口**，其余 5 个都是资源管理端点，全部有前端调用方。
 
 | 端点 | 前端是否调用 | 说明 |
@@ -232,14 +281,27 @@ node test-agui-protocol.mjs --case=text,rag
 
 ---
 
-## 六、一次请求的完整链路
+## 六、一次请求的完整链路（2026-11-13 更新：含中间件链）
 
 ```
 浏览器 ChatEngine
    │  POST /agui  { messages, threadId, forwardedProps.sessionId, state }
    ▼
-index.js  /agui
+index.js  启动段（挂载顺序 = 安全边界，顺序错了就是 3.10 那个事故）
+   ├─ assertProductionConfig()   security.js  生产缺配直接拒启
+   ├─ attachSecurity()           CORS / 安全头 / 请求体上限
+   ├─ attachRequestContext()     请求 id、计时
+   ├─ express.static(web/dist)   静态托管【必须在 requireAuth 之前】
+   ├─ /api/health、/api/branding 公开端点（探针不带 token / 登录页要品牌）
+   ├─ app.use(requireAuth)       总闸门：session 或 API Key 二选一
+   ├─ /api/auth、/api/admin、accountRouter、/v1/chat/completions
+   └─ licenseGate()              只拦登录/注册（默认不阻断）
+   ▼
+index.js  /agui 路由
+   ├─ 限流（rate-limit）→ 配额检查（quota）→ prompt 注入防护（prompt-guard）
+   ├─ 会话归属校验 claimSession（sessionOwners，防止用别人的 sessionId）
    ├─ aguiToChatMessages()      扁平事件 → AI SDK 消息结构
+   ├─ 历史回填（threads-store：threadId → 历史消息 + state）
    ├─ prepareChatStream()       chat-core.js
    │     ├─ trimMessages()                超长则裁剪
    │     ├─ buildAttachmentSystemPrompt() 注入附件清单
@@ -250,16 +312,23 @@ index.js  /agui
    │           ▼
    │        createTools().searchKnowledgeBase
    │           ├─ searchVector()        rag-vector.js  向量 + BM25 → RRF
-   │           └─ searchSessionFiles()  session-files.js  内存点积
-   │           └─ mergeByRank()         两源按名次融合
-   │           └─ 返回 { text, sources }
-   │           ▼
-   │        工具结果回填，模型继续生成（最多 5 步）
+   │           ├─ searchSessionFiles()  session-files 附件（磁盘惰性回填）
+   │           └─ mergeByRank()         两源按名次融合 → { text, sources }
+   │           ├─（模型也可能调 MCP 工具 → mcp-client 转发 → 需审批则发
+   │           │   interrupt 事件，前端弹卡，恢复后继续）
+   │           └─ 工具结果回填，模型继续生成（最多 5 步）
+   ▼
+落库与记账（RUN_FINISHED 前后）
+   ├─ threads-store 保存完整消息快照（刷新后能恢复的依据）
+   ├─ usage-store 记 token 用量 → quota 计数
+   ├─ audit 写敏感操作（工具审批、配额超限）
    ▼
 SSE 事件流：RUN_STARTED → 文本增量 → TOOL_CALL_* → STATE_DELTA(sources) → RUN_FINISHED
    ▼
 前端渲染：正文 / 思考过程 / 工具卡片 / 引用来源
 ```
+
+> 想亲手追一遍：`node index.js` 启动后，开两个终端——一个 `tail -f logs/`（文件日志，logger.js 轮转），一个浏览器 Network 面板看 `/agui` 的 EventStream。日志里的每个函数名都在上面这张图里。
 
 ---
 

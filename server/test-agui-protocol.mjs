@@ -293,7 +293,7 @@ function assertRunBasics(res, { threadId, runId } = {}) {
 const cases = [
   {
     name: 'text',
-    title: '基础文本流：RUN_STARTED / STATE_SNAPSHOT / TEXT_MESSAGE_CHUNK / RUN_FINISHED',
+    title: '基础文本流：RUN_STARTED / STATE_SNAPSHOT / 正文标准三连 / RUN_FINISHED',
     async run() {
       const threadId = newSessionId('t_text')
       const runId = `r_${randomUUID()}`
@@ -323,16 +323,33 @@ const cases = [
         stateSnapshot?.snapshot
       )
 
-      const chunks = res.events.filter(event => event.type === 'TEXT_MESSAGE_CHUNK')
-      check('存在 TEXT_MESSAGE_CHUNK 正文分片', chunks.length > 0, brief(res.events))
-      if (!chunks.length) return
+      // 正文走标准三连（START → CONTENT* → END），不再用简写 TEXT_MESSAGE_CHUNK：
+      // CHUNK 需要客户端做展开，且"CHUNK + 显式 END"会被官方 transform 展开成两个 END，
+      // 严格实现会当成重复收尾。三连是任何 AG-UI 客户端都原生支持的基础形态。
+      const starts = res.events.filter(event => event.type === 'TEXT_MESSAGE_START')
+      const contents = res.events.filter(event => event.type === 'TEXT_MESSAGE_CONTENT')
+      const ends = res.events.filter(event => event.type === 'TEXT_MESSAGE_END')
+      check('存在 TEXT_MESSAGE_START 正文起始', starts.length > 0, brief(res.events))
+      check('存在 TEXT_MESSAGE_CONTENT 正文分片', contents.length > 0, brief(res.events))
+      check('不再下发 TEXT_MESSAGE_CHUNK', !res.events.some(event => event.type === 'TEXT_MESSAGE_CHUNK'), brief(res.events))
+      // 每段正文一对 START/END：只 START 不 END 会让前端消息永远停在“生成中”
       check(
-        '首个正文分片带 messageId',
-        typeof chunks[0].messageId === 'string' && chunks[0].messageId.length > 0,
-        chunks[0]
+        '正文 START / END 数量配对',
+        starts.length === ends.length,
+        `start=${starts.length} end=${ends.length} ${brief(res.events)}`
       )
-      check('首个正文分片 role = assistant', chunks[0].role === 'assistant', chunks[0])
-      const text = chunks.map(chunk => chunk.delta || '').join('')
+      if (!contents.length) return
+      check(
+        '正文分片均带 messageId',
+        contents.every(event => typeof event.messageId === 'string' && event.messageId.length > 0),
+        contents[0]
+      )
+      check(
+        '正文分片都能归属到已 START 的消息',
+        contents.every(event => starts.some(start => start.messageId === event.messageId)),
+        [...new Set(contents.map(event => event.messageId))]
+      )
+      const text = contents.map(chunk => chunk.delta || '').join('')
       check('正文增量拼接后非空', text.trim().length > 0, text)
 
       const phases = phaseUpdates(res.events)
@@ -758,8 +775,9 @@ const cases = [
         trimNotice?.value
       )
 
-      const chunks = res.events.filter(event => event.type === 'TEXT_MESSAGE_CHUNK')
-      const text = chunks.map(chunk => chunk.delta || '').join('')
+      // 裁剪只影响上下文，正文仍应走标准三连（CONTENT 承载增量）
+      const contents = res.events.filter(event => event.type === 'TEXT_MESSAGE_CONTENT')
+      const text = contents.map(chunk => chunk.delta || '').join('')
       check('裁剪后仍有正文输出', text.trim().length > 0, text.slice(0, 80))
 
       const phases = phaseUpdates(res.events)

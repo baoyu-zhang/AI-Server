@@ -2,7 +2,8 @@
  * auth.js —— 注册 / 登录 / 会话校验
  *
  * ===== 为什么是"库里的 opaque token"而不是 JWT =====
- * JWT 的唯一好处是免查库，代价是签发后无法撤销——登出、封号都拦不住已发的 token。
+ * JWT 是无状态的，一旦签发，就无法撤销，需要额外维护一个黑名单。好处是不查库。
+ * express-session 虽然存数据库，实际上还是存内存中的，重启就没有了。
  * 内部工具的正确取舍是反过来的：每次请求查一次 SQLite（微秒级），换"登出立即生效"。
  * 也不用引入 jsonwebtoken 依赖，签发就是 crypto.randomBytes 一行。
  *
@@ -26,18 +27,36 @@ const LOGIN_LOCK_MS = Number(process.env.LOGIN_LOCK_MS || 15 * 60 * 1000) // 锁
 const LOGIN_WINDOW_MS = Number(process.env.LOGIN_WINDOW_MS || 15 * 60 * 1000) // 失败计数多久自动清零（防止偶发错密码永久累积）
 const REGISTER_MAX_PER_HOUR = Number(process.env.REGISTER_MAX_PER_HOUR || 60) // 同 IP 每小时注册上限（对外部署建议调成 5~10）
 
+/**
+ * 生成密码哈希。
+ * 每次都用新的随机 salt，同样密码得到不同哈希；输出格式 `scrypt$<salt>$<hash>`，
+ * 把参数和 salt 一起存进库里，校验时才能复现同一计算。
+ *
+ * @param {string} password 明文密码
+ * @returns {string} 可直接入库的哈希串
+ */
 function hashPassword(password) {
   const salt = crypto.randomBytes(16).toString('hex')
   const hash = crypto.scryptSync(password, salt, SCRYPT_KEYLEN).toString('hex')
   return `scrypt$${salt}$${hash}`
 }
 
+/**
+ * 校验明文密码与库中哈希是否匹配。
+ * 脏数据/旧格式一律返回 false 而不是抛异常；比对走 timingSafeEqual 防计时攻击。
+ *
+ * @param {string} password 用户本次输入的明文密码
+ * @param {string} stored 库里的 `scrypt$<salt>$<hash>` 串
+ * @returns {boolean} 是否匹配
+ */
 function verifyPassword(password, stored) {
+  //String(stored || '').为了避免是null和undefined，导致split方法报错，所以要先转换成字符串
   const [scheme, salt, hash] = String(stored || '').split('$')
   if (scheme !== 'scrypt' || !salt || !hash) return false
-  const candidate = crypto.scryptSync(password, salt, SCRYPT_KEYLEN)
-  const expected = Buffer.from(hash, 'hex')
+  const candidate = crypto.scryptSync(password, salt, SCRYPT_KEYLEN) // 1. 算出来的结果是 Buffer（二进制），假设长度为 64 字节
+  const expected = Buffer.from(hash, 'hex') // 2. 从库里取出的 hash 是字符串，通过 Buffer.from 还原成了 Buffer（二进制），长度也是 64 字节
   // 长度不一致时 timingSafeEqual 会抛异常，先判长度再比
+  //timingSafeEqual对比的必须是两个Buffer且长度必须完全一致，不能是字符串
   return candidate.length === expected.length && crypto.timingSafeEqual(candidate, expected)
 }
 
@@ -153,6 +172,10 @@ const authRouter = express.Router()
 const attempts = new Map() // `${ip}|${username}` -> { fails, firstAt, lockedUntil }
 
 /** 用户名统一小写：否则换 Baoyu / BAOYU 轮着试就能绕过计数 */
+//生成一个唯一标识，用来精准区分是谁在尝试登录那个账号，从而实现精准的防爆破技术
+//为什么是ip|username
+//如果只用IP，那么如果是公司或者学校的公共出口IP，黑客故意输错密码，那么整个公司的员工都无法登录了，
+// 如果只用用户名锁：黑客可以恶意疯狂的输错密码，导致真正的用户侧底锁死无法登录。
 function attemptKey(req, username) {
   return `${req.ip || 'unknown'}|${String(username).toLowerCase()}`
 }
@@ -166,24 +189,49 @@ function pruneAttempts() {
 }
 setInterval(pruneAttempts, 5 * 60 * 1000).unref() // unref：别让定时器拖住进程退出
 
+/**
+ * 把锁定记录的剩余时间换算成秒，供 Retry-After 响应头和前端提示使用。
+ * 至少返回 1，避免向下取整成 0 让客户端误以为已解锁。
+ *
+ * @param {{lockedUntil: number}} rec 登录失败计数记录
+ * @returns {number} 还需等待的秒数
+ */
 function retryAfterSeconds(rec) {
   return Math.max(1, Math.ceil((rec.lockedUntil - Date.now()) / 1000))
 }
 
 // 注册按 IP 小时窗口限流：验证脚本一次跑会注册好几个账号，所以上限给得比较宽松，
 // 目的是挡住脚本批量刷号，不是挡住正常用户
+//为什么用 Map 而不用 {} ？因为如果IP是'__proto__'，那么{}会报错，因为__proto__是保留字，不能作为键名
+// 所以用Map可以避免这个问题，因为Map的键可以是任意类型，包括字符串
 const registerHits = new Map() // ip -> 时间戳数组
+/**
+ * 判断该 IP 本轮小时窗口内是否还能注册。
+ * 顺带把过期时间戳过滤掉（滑动窗口），保证 Map 里的数组不会无限增长。
+ *
+ * @param {string} ip 请求来源 IP
+ * @returns {boolean} true = 未超上限，允许注册
+ */
 function registerAllowed(ip) {
   const now = Date.now()
+  //从Map中取出该IP的所有注册时间戳，过滤掉过期的，保留当前小时窗口内的注册时间戳
   const hits = (registerHits.get(ip) || []).filter(t => now - t < 3600 * 1000)
+  //把过滤过期后的新数组，重新塞回去,保证了registerHits这个Map占用的内存不回无限膨胀
   registerHits.set(ip, hits)
+  //返回该IP是否还能注册
   return hits.length < REGISTER_MAX_PER_HOUR
 }
 
 
 // 用户名规则收紧：它将来会出现在文件归属、日志里，自由放行会塞进各种脏字符
+//a-z是允许a-z的小写字母，A-Z是允许A-Z的大写字母，0-9是允许0-9的数字，_是允许_的下划线，-是允许-的短横线，{3,32}是允许3~32个字符
 const USERNAME_RE = /^[a-zA-Z0-9_-]{3,32}$/
 
+/**
+ * POST /api/auth/register —— 注册并直接下发登录 token。
+ * 校验顺序：IP 限流 → 用户名格式 → 密码长度 → 重名，任何一步失败都提前返回；
+ * 成功后立即建会话，省掉前端再调一次登录。
+ */
 authRouter.post('/register', (req, res) => {
   const username = String(req.body?.username || '').trim()
   const password = String(req.body?.password || '')
@@ -197,19 +245,30 @@ authRouter.post('/register', (req, res) => {
   if (password.length < 6) {
     return res.status(400).json({ error: '密码至少 6 位' })
   }
+  // 校验用户名是否已被占用
   const exists = db.prepare('SELECT id FROM users WHERE username = ?').get(username)
   if (exists) return res.status(409).json({ error: '用户名已被占用' })
+    //randomUUID生成一个全局唯一的UUID，作为用户的ID，比自增的数字ID更安全
   const id = crypto.randomUUID()
   db.prepare('INSERT INTO users (id, username, password_hash, created_at) VALUES (?, ?, ?, ?)')
     .run(id, username, hashPassword(password), Date.now())
+    //注册成功之后才将这个IP的这次请求的时间戳添加到Map中
   registerHits.get(req.ip || 'unknown')?.push(Date.now())
+  // 记录注册事件，用于统计
   recordAudit({ userId: id, actor: username, action: 'auth.register', target: username, ip: req.ip })
+  //注册成功并签发凭证
   res.json({ ok: true, token: createSession(id), user: { userId: id, username, role: 'user' } })
 })
 
+/**
+ * POST /api/auth/login —— 账号密码登录。
+ * 流程：先查锁定状态（锁定期内正确密码也拒绝）→ 校验密码 → 失败累加计数/成功清零并发 token。
+ * 用户不存在与密码错误返回同一句提示，避免暴露哪些用户名真实存在。
+ */
 authRouter.post('/login', (req, res) => {
   const username = String(req.body?.username || '').trim()
   const password = String(req.body?.password || '')
+  //生成一个IP|用户名的键，作为登录失败计数记录的键,用于接下来查询和更新登录失败计数
   const key = attemptKey(req, username)
 
   // 1) 先看是否在锁定期：锁定期间连正确密码也拒绝，
@@ -230,11 +289,15 @@ authRouter.post('/login', (req, res) => {
   // 用户不存在和密码错误返回同一句话：提示"用户不存在"等于告诉攻击者哪些用户名是真实的
   if (!user || !verifyPassword(password, user.password_hash)) {
     const now = Date.now()
+    //如果还是被锁定期，并且第一次失败的时间在锁定期窗口内，直接返回。如果不在创建一个新的清零的记录
     const next = rec && now - rec.firstAt <= LOGIN_WINDOW_MS
       ? rec
       : { fails: 0, firstAt: now, lockedUntil: 0 }
+      //失败次数+1
     next.fails += 1
+    //如果失败次数超限，则锁定
     if (next.fails >= LOGIN_MAX_FAILS) {
+      //新的锁定时间是当前时间加上锁定时间
       next.lockedUntil = now + LOGIN_LOCK_MS
       log.warn('[auth] 登录失败次数超限，已锁定', { ip: req.ip, username, fails: next.fails, lockMs: LOGIN_LOCK_MS })
       recordAudit({
@@ -257,6 +320,11 @@ authRouter.post('/login', (req, res) => {
   res.json({ ok: true, token: createSession(user.id), user: { userId: user.id, username: user.username, role: user.role } })
 })
 
+/**
+ * POST /api/auth/logout —— 登出。
+ * 不要求已登录（token 无效也照样返回 ok），只是把出示的 session 行删掉，
+ * 删完该 token 立即失效；API Key 不在 sessions 表，这里不处理。
+ */
 authRouter.post('/logout', (req, res) => {
   const header = req.headers.authorization || ''
   const token = header.startsWith('Bearer ') ? header.slice(7) : ''
@@ -264,6 +332,10 @@ authRouter.post('/logout', (req, res) => {
   res.json({ ok: true })
 })
 
+/**
+ * GET /api/auth/me —— 回显当前登录身份，前端启动时用它判断是否还有效登录。
+ * 挂在 requireAuth 后面，能走到这里说明凭证（session 或 API Key）已通过闸门。
+ */
 authRouter.get('/me', requireAuth, (req, res) => {
   // role 一并返回：前端据此决定是否显示「管理」页签，不用再猜
   res.json({ ok: true, user: { userId: req.user.userId, username: req.user.username, role: req.user.role } })
