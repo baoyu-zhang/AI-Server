@@ -1,0 +1,284 @@
+{
+  "_meta": {
+    "name": "应用行为 Golden Set",
+    "version": "1.0.0",
+    "updated": "2026-11-17",
+    "purpose": "把本轮踩过的坑（图片挂载、计划状态机、天气降级）固化成确定性用例。不调模型、不联网，每次改动后毫秒级回归，防止老 bug 复活。与 eval-dataset.json（RAG 检索层）平行：那份测'检索对不对'，这份测'业务逻辑对不对'。",
+    "howToRun": "node eval/run-behavior.js [tag]",
+    "expectOperators": {
+      "eq": "严格相等（=== / 基本类型）",
+      "deepEq": "JSON 结构相等",
+      "contains": "字符串或数组包含",
+      "match": "正则匹配（字符串）",
+      "type": "typeof 结果",
+      "gt": "大于（数字）",
+      "len": "数组/字符串长度等于"
+    },
+    "pathSyntax": "用点号取返回值的字段，数组下标也用点号，如 messages.0.content.1.type；空路径 '' 表示整个返回值"
+  },
+  "cases": [
+    {
+      "id": "IMG-01",
+      "group": "图片挂载",
+      "name": "纯文本会话不误判为视觉任务",
+      "fn": "countImageParts",
+      "input": [
+        [{ "role": "user", "content": "你好" }, { "role": "assistant", "content": "你好呀" }]
+      ],
+      "expect": { "": { "eq": 0 } }
+    },
+    {
+      "id": "IMG-02",
+      "group": "图片挂载",
+      "name": "历史消息里的图片计入 imageCount（决定选视觉模型）",
+      "fn": "countImageParts",
+      "input": [
+        [
+          { "role": "user", "content": [{ "type": "file", "mediaType": "image/png" }] },
+          { "role": "assistant", "content": "看到了" },
+          { "role": "user", "content": [{ "type": "file", "mediaType": "image/jpeg" }, { "type": "text", "text": "再看这张" }] }
+        ]
+      ],
+      "expect": { "": { "eq": 2 } }
+    },
+    {
+      "id": "IMG-03",
+      "group": "图片挂载",
+      "name": "最后一条 user 无图时不弹'已切换模型'（即使历史有图）",
+      "fn": "countLastUserImages",
+      "input": [
+        [
+          { "role": "user", "content": [{ "type": "file", "mediaType": "image/png" }] },
+          { "role": "assistant", "content": "看到了" },
+          { "role": "user", "content": "这张图是什么颜色" }
+        ]
+      ],
+      "expect": { "": { "eq": 0 } }
+    },
+    {
+      "id": "IMG-04",
+      "group": "图片挂载",
+      "name": "最后一条 user 带图时计为 1（本轮真的传了图）",
+      "fn": "countLastUserImages",
+      "input": [
+        [
+          { "role": "assistant", "content": "请发图" },
+          { "role": "user", "content": [{ "type": "text", "text": "看图" }, { "type": "file", "mediaType": "image/png" }] }
+        ]
+      ],
+      "expect": { "": { "eq": 1 } }
+    },
+    {
+      "id": "IMG-05",
+      "group": "图片挂载",
+      "name": "消息里已有图 → 原样放行、一张不加、不兜底",
+      "fn": "planImageMount",
+      "input": [
+        [{ "role": "user", "content": [{ "type": "file", "mediaType": "image/png", "data": { "type": "data", "data": "AAA" } }] }],
+        [{ "mimeType": "image/png", "base64": "BBB" }]
+      ],
+      "expect": {
+        "imageCount": { "eq": 1 },
+        "usedFallback": { "eq": false }
+      }
+    },
+    {
+      "id": "IMG-06",
+      "group": "图片挂载",
+      "name": "新会话（消息和会话都无图）→ 什么都不做",
+      "fn": "planImageMount",
+      "input": [
+        [{ "role": "user", "content": "纯文本问题" }],
+        []
+      ],
+      "expect": {
+        "imageCount": { "eq": 0 },
+        "usedFallback": { "eq": false }
+      }
+    },
+    {
+      "id": "IMG-07",
+      "group": "图片挂载",
+      "name": "本轮不想带图 + allowFallback=false → 不把旧图硬塞回来",
+      "fn": "planImageMount",
+      "input": [
+        [{ "role": "user", "content": "今天天气怎么样" }],
+        [{ "mimeType": "image/png", "base64": "OLD" }],
+        { "allowFallback": false }
+      ],
+      "expect": {
+        "imageCount": { "eq": 0 },
+        "usedFallback": { "eq": false }
+      }
+    },
+    {
+      "id": "IMG-08",
+      "group": "图片挂载",
+      "name": "裁剪丢图 + 允许兜底 → 补最近一张并附说明",
+      "fn": "planImageMount",
+      "input": [
+        [{ "role": "user", "content": "这张图里是什么" }],
+        [
+          { "mimeType": "image/png", "base64": "FIRST" },
+          { "mimeType": "image/png", "base64": "LATEST" }
+        ],
+        { "allowFallback": true }
+      ],
+      "expect": {
+        "imageCount": { "eq": 1 },
+        "usedFallback": { "eq": true },
+        "messages.0.content.1.type": { "eq": "text" },
+        "messages.0.content.1.text": { "contains": "此前上传" },
+        "messages.0.content.2.type": { "eq": "file" },
+        "messages.0.content.2.data.type": { "eq": "data" }
+      }
+    },
+    {
+      "id": "IMG-09",
+      "group": "图片挂载",
+      "name": "兜底挂的是最近一张（不是第一张）",
+      "fn": "planImageMount",
+      "input": [
+        [{ "role": "user", "content": "问" }],
+        [
+          { "mimeType": "image/png", "base64": "FIRST" },
+          { "mimeType": "image/png", "base64": "LATEST" }
+        ],
+        { "allowFallback": true }
+      ],
+      "expect": {
+        "messages.0.content.2.data.data": { "eq": "LATEST" }
+      }
+    },
+    {
+      "id": "IMG-10",
+      "group": "图片挂载",
+      "name": "content 为数组时不被 String() 毁掉（曾经的静默 bug）",
+      "fn": "attachImagesToLastUserMessage",
+      "input": [
+        [{ "role": "user", "content": [{ "type": "text", "text": "原话不能丢" }] }],
+        [{ "mimeType": "image/png", "base64": "IMG" }]
+      ],
+      "expect": {
+        "0.content.0.type": { "eq": "text" },
+        "0.content.0.text": { "eq": "原话不能丢" },
+        "0.content.1.type": { "eq": "file" }
+      }
+    },
+    {
+      "id": "PLAN-01",
+      "group": "计划状态机",
+      "name": "buildPlan：首步 running、其余 pending、id 递增",
+      "fn": "buildPlan",
+      "input": ["杭州两日游", [{ "title": "查天气", "tool": "getWeather" }, { "title": "排行程", "tool": "" }]],
+      "expect": {
+        "goal": { "eq": "杭州两日游" },
+        "steps.0.id": { "eq": "s1" },
+        "steps.0.status": { "eq": "running" },
+        "steps.0.tool": { "eq": "getWeather" },
+        "steps.1.id": { "eq": "s2" },
+        "steps.1.status": { "eq": "pending" }
+      }
+    },
+    {
+      "id": "PLAN-02",
+      "group": "计划状态机",
+      "name": "buildPlan：模型把 tool 填成 planSteps 自引用 → 挡成空串",
+      "fn": "buildPlan",
+      "input": ["x", [{ "title": "排行程", "tool": "planSteps" }, { "title": "画图", "tool": "renderChart" }]],
+      "expect": {
+        "steps.0.tool": { "eq": "" },
+        "steps.1.tool": { "eq": "renderChart" }
+      }
+    },
+    {
+      "id": "PLAN-03",
+      "group": "计划状态机",
+      "name": "advancePlan：同名工具完成 → 当前 step done、下一步转 running",
+      "fn": "advancePlan",
+      "input": [
+        { "goal": "g", "steps": [{ "id": "s1", "title": "查", "tool": "getWeather", "status": "running" }, { "id": "s2", "title": "排", "tool": "", "status": "pending" }] },
+        "getWeather",
+        false
+      ],
+      "expect": {
+        "steps.0.status": { "eq": "done" },
+        "steps.1.status": { "eq": "running" }
+      }
+    },
+    {
+      "id": "PLAN-04",
+      "group": "计划状态机",
+      "name": "advancePlan：旁支工具（renderChart）不推进主流程",
+      "fn": "advancePlan",
+      "input": [
+        { "goal": "g", "steps": [{ "id": "s1", "title": "查", "tool": "getWeather", "status": "running" }, { "id": "s2", "title": "排", "tool": "", "status": "pending" }] },
+        "renderChart",
+        false
+      ],
+      "expect": { "": { "eq": null } }
+    },
+    {
+      "id": "PLAN-05",
+      "group": "计划状态机",
+      "name": "advancePlan：失败则当前 step failed 且不启动下一步",
+      "fn": "advancePlan",
+      "input": [
+        { "goal": "g", "steps": [{ "id": "s1", "title": "查", "tool": "getWeather", "status": "running" }, { "id": "s2", "title": "排", "tool": "", "status": "pending" }] },
+        "getWeather",
+        true
+      ],
+      "expect": {
+        "steps.0.status": { "eq": "failed" },
+        "steps.1.status": { "eq": "pending" }
+      }
+    },
+    {
+      "id": "PLAN-06",
+      "group": "计划状态机",
+      "name": "settlePlan：无工具但有正文的步骤 → done（不误判 skipped）",
+      "fn": "settlePlan",
+      "input": [
+        { "goal": "g", "steps": [{ "id": "s1", "title": "查", "tool": "getWeather", "status": "done" }, { "id": "s2", "title": "排", "tool": "", "status": "running" }, { "id": "s3", "title": "输出", "tool": "", "status": "pending" }] },
+        true
+      ],
+      "expect": {
+        "steps.1.status": { "eq": "done" },
+        "steps.2.status": { "eq": "done" }
+      }
+    },
+    {
+      "id": "PLAN-07",
+      "group": "计划状态机",
+      "name": "settlePlan：声明了工具却没执行 → skipped",
+      "fn": "settlePlan",
+      "input": [
+        { "goal": "g", "steps": [{ "id": "s1", "title": "查", "tool": "getWeather", "status": "running" }] },
+        true
+      ],
+      "expect": { "steps.0.status": { "eq": "skipped" } }
+    },
+    {
+      "id": "PLAN-08",
+      "group": "计划状态机",
+      "name": "settlePlan：全部已终态 → 返回 null（不下发无意义的 STATE_DELTA）",
+      "fn": "settlePlan",
+      "input": [
+        { "goal": "g", "steps": [{ "id": "s1", "title": "查", "tool": "getWeather", "status": "done" }] },
+        false
+      ],
+      "expect": { "": { "eq": null } }
+    },
+    {
+      "id": "PLAN-09",
+      "group": "计划状态机",
+      "name": "settlePlan：无工具且无正文 → skipped",
+      "fn": "settlePlan",
+      "input": [
+        { "goal": "g", "steps": [{ "id": "s1", "title": "排", "tool": "", "status": "pending" }] },
+        false
+      ],
+      "expect": { "steps.0.status": { "eq": "skipped" } }
+    }
+  ]
+}

@@ -150,13 +150,16 @@ function buildAttachmentSystemPrompt(sessionId) {
     .map((file, index) => {
       const size = `${(file.size / 1024).toFixed(1)} KB`
       if (file.kind === 'image') {
-        return `【附件${index + 1}】${file.fileName}（${size}，图片）\n说明：图片已随消息一起提供，可直接查看图片内容回答。`
+        // 措辞必须准确：图片挂在"它上传时的那条消息"上，不在当前这句话里。
+        // 写成"已随消息一起提供"会引导模型把图当成本轮的附件，
+        // 于是用户聊别的事，它也要先声明一句"图和这个问题无关"。
+        return `【附件${index + 1}】${file.fileName}（${size}，图片）\n说明：图片挂在它上传时的那条用户消息上，可回看；若本轮提问与图片无关，不要提及它。`
       }
       return `【附件${index + 1}】${file.fileName}（${size}，共 ${file.chunkCount} 个片段）\n内容预览：${file.preview}`
     })
     .join('\n\n')
   return `用户在本次对话中上传了以下附件（仅本次会话有效）：\n\n${list}\n\n处理规则：
-1. 用户询问“这是什么”“总结一下”“帮我看看”等涉及附件的问题时，文本附件必须先调用 searchKnowledgeBase 工具检索原文，再基于检索结果回答；图片附件已随消息提供，直接查看图片回答即可。
+1. 用户询问“这是什么”“总结一下”“帮我看看”等涉及附件的问题时，文本附件必须先调用 searchKnowledgeBase 工具检索原文，再基于检索结果回答；图片附件挂在其上传的那条消息上，直接查看图片回答即可。
 2. 回答附件内容时以原文或图片实际内容为准，说明内容来自哪个附件，不要编造。
 3. 如果文本附件解析不到有效文本（例如扫描版 PDF），如实告诉用户，并建议提供文字版。
 4. 用户明确要求删除某个附件时，调用 deleteSessionFile 并在入参里传完整文件名；该工具会先暂停等待用户确认。`
@@ -223,14 +226,98 @@ function toContentParts(content) {
 }
 
 /**
- * 把本次会话的图片附件挂到最后一条 user 消息上。
+ * 数一数这组消息里到底挂了几张图（file part 个数）。
+ *
+ * 为什么单独写一个函数而不是用 images.length：
+ * 图片现在挂在"它上传时的那条消息"上，所以"本轮带不带图"和"会话里存了几张图"
+ * 是两个不同的问题。模型选择、日志里的 imageCount 都必须用前者，
+ * 否则就会出现"用户早就不聊图了，模型却一直被当成视觉任务"。
+ */
+function countImageParts(messages) {
+  let total = 0
+  for (const message of messages || []) {
+    if (!Array.isArray(message?.content)) continue
+    for (const part of message.content) {
+      if (part?.type === 'file') total += 1
+    }
+  }
+  return total
+}
+
+/**
+ * 数"最后一条 user 消息"里挂了几张图 —— 也就是"这一轮用户真正新带来的图"。
+ *
+ * 和 countImageParts 的区别只在用途：
+ *   countImageParts     → 决定用哪个模型（历史里有图也必须视觉模型，否则图看不见）
+ *   countLastUserImages → 决定要不要给用户弹"已切换模型"提示
+ * 历史里躺着旧图时，模型确实得用视觉的，但用户这轮没传图，
+ * 跟他说"本轮已自动切换"只会让人以为系统搞错了。
+ */
+function countLastUserImages(messages) {
+  const list = messages || []
+  for (let i = list.length - 1; i >= 0; i--) {
+    if (list[i]?.role !== 'user') continue
+    return countImageParts([list[i]])
+  }
+  return 0
+}
+
+/**
+ * 决定本轮把哪些图片交给模型，以及"本轮算不算带图"（选模型、日志口径都用它）。
+ *
+ * 三种情况，只有第一种是常态：
+ *   ① 消息里已经有图（aguiToChatMessages 按上传位置挂好的）→ 原样放行，一张不加；
+ *   ② 消息里没图、会话里也没存过图 → 什么也不做（新会话就该是纯文本）；
+ *   ③ 消息里没图、会话里存过图 → 只可能是"带图那条历史消息被裁剪删了"，
+ *      把最近一张补挂到最后一条 user，并附一行说明它不是本条消息自带的。
+ *
+ * 为什么只补"最近一张"而不是全部：用户追问的几乎总是最后发的那张；
+ * 把历史里所有图都塞回来，等于用裁剪省下的 token 又花回去，还会让模型分不清在问哪张。
+ *
+ * @param {Array} messages 已经裁剪过的 AI SDK 消息
+ * @param {Array} sessionImages 该会话存过的图片（getSessionImages 的返回值）
+ * @param {{allowFallback?: boolean}} [options] allowFallback=false 时禁用兜底（见下方"裁剪才兜底"）
+ * @returns {{messages: Array, imageCount: number, usedFallback: boolean}}
+ */
+function planImageMount(messages, sessionImages = [], options = {}) {
+  const imagesInMessages = countImageParts(messages)
+  if (imagesInMessages > 0) return { messages, imageCount: imagesInMessages, usedFallback: false }
+  if (!sessionImages.length) return { messages, imageCount: 0, usedFallback: false }
+  // 兜底只在"确实发生了裁剪"时才允许。
+  //
+  // 为什么加这道闸：兜底原本的假设是"图本来在消息里，被裁剪删掉了"。
+  // 但实际还有另一种情况——这个会话早先传过图，本轮提问压根不想带图，
+  // 于是"消息里没图 + 会话里有图"同样成立，兜底就把旧图硬塞回最后一条 user，
+  // 结果是：每轮都被判成视觉任务、每轮都弹"已切换视觉模型"，用户觉得莫名其妙。
+  // 用 isTrimmed 区分这两者最可靠：没裁剪还找不到图，说明这轮本来就不该有图。
+  if (options.allowFallback === false) return { messages, imageCount: 0, usedFallback: false }
+  const latest = sessionImages[sessionImages.length - 1]
+  return {
+    messages: attachImagesToLastUserMessage(messages, [latest], {
+      note: '（注：这张图是用户此前上传的，不在本条消息里；如果本轮问题与它无关，不要提及它。）'
+    }),
+    imageCount: 1,
+    usedFallback: true
+  }
+}
+
+/**
+ * 把图片挂到最后一条 user 消息上。
+ *
+ * 现在的唯一用途是**裁剪兜底**（见 prepareChatStream）：正常情况下图片由
+ * index.js 的 aguiToChatMessages 按"哪条消息传的图就挂回哪条"就地挂好。
+ * 只有"带图的那条历史消息被 token 裁剪整条删掉"时，才用这个函数把最近一张图补回来，
+ * 否则用户追问"这张图里是什么"时模型会突然说看不见图。
  *
  * 为什么必须挂"最后一条 user"：DeepSeek 只接受 user 消息携带图片，挂到 assistant 上会被拒。
- * 为什么是"最后一条"而不是每条：图片是本次提问的上下文，重复挂会浪费 token，
- * 还会改变历史语义（模型会以为你每轮都在问同一张图）。
  * 为什么用 type:'file' 而不是 'image'：AI SDK v7 已废弃 image part，统一用 file part 承载。
+ *
+ * @param {Array} messages AI SDK 消息
+ * @param {Array} images 要挂的图片（含 mimeType / base64）
+ * @param {{note?: string}} [options] note 会作为一行文本追加在正文后，用来告诉模型
+ *        "这张图是之前传的，不是这句话带的"，避免它反过来曲解本轮问题
  */
-function attachImagesToLastUserMessage(messages, images) {
+function attachImagesToLastUserMessage(messages, images, options = {}) {
   if (!images.length) return messages
   const list = messages.map(message => ({ ...message })) // 浅拷贝：只替换元素，不改原数组和原对象
   const lastUserIndex = list.map(message => message.role).lastIndexOf('user')
@@ -239,6 +326,7 @@ function attachImagesToLastUserMessage(messages, images) {
   // ⚠️ 这里曾经是 String(content)：一旦 content 是数组，会变成 "[object Object]"，
   // 带图片时用户说的话会整段消失（且不报错）。现在统一走 toContentParts 归一化。
   const contentParts = toContentParts(list[lastUserIndex].content)
+  if (options.note) contentParts.push({ type: 'text', text: options.note })
   const imageParts = images.map(image => ({
     type: 'file',
     mediaType: image.mimeType,
@@ -337,11 +425,20 @@ function prepareChatStream({
     buildMemorySystemPrompt(userId), // 记忆放附件清单前面：身份类信息比"上传了什么"更靠前
     buildAttachmentSystemPrompt(sessionId)
   ].filter(Boolean).join('\n\n')
-  const images = getSessionImages(sessionId) // 图片附件（多模态）
-  const modelMessages = attachImagesToLastUserMessage(trimmedMessages, images) // 图片挂到最后一条 user 消息
+  // ===== 图片：正常情况已经由 aguiToChatMessages 挂好了，这里只剩"裁剪兜底" =====
+  // 抽成 planImageMount 是为了能脱离模型 API 单测：这段的错法都很隐蔽
+  // （多挂一张 = 多花钱还污染语义，少挂一张 = 追问旧图时突然"看不见"）。
+  const { messages: modelMessages, imageCount } = planImageMount(trimmedMessages, getSessionImages(sessionId), {
+    // 没发生裁剪 → 消息里找不到图就是这轮本来没图，不要拿会话里的旧图来凑
+    allowFallback: isTrimmed
+  })
   // 选模型：带图强制视觉模型、显式指定优先、否则由深度思考开关决定（规则细节见 models.js）
-  // 放在 attach 之后，正是因为要依赖 images.length
-  const picked = resolveModel({ requested: model, thinking, hasImages: images.length > 0 })
+  // 依赖的是上面算出来的 imageCount，而不是"会话里有没有图"
+  const picked = resolveModel({ requested: model, thinking, hasImages: imageCount > 0 })
+  // 提示只在"本轮最后一条 user 消息确实带了图"时给。
+  // 历史里的旧图也会让 imageCount > 0（必须走视觉模型，否则看不见图），
+  // 但那不是"用户这轮上传了图片"，照原样提示会变成"我没传图，怎么说我切了视觉模型"。
+  const modelNotice = countLastUserImages(modelMessages) > 0 ? picked.notice : ''
   const modelId = picked.modelId
   // 备用模型：主用快速模型时备份到思考模型（可能是"这类问题快速模型处理不了"），
   // 其他情况一律备份到最便宜的快速模型。固定两档，不会原地打转。
@@ -382,11 +479,12 @@ function prepareChatStream({
       // reasoning 让协议层/前端知道"这轮到底思不思考"：思考模型才会有 reasoning 流，
       // 前端据此决定要不要预留"思考中"的占位，而不是等第一条 reasoning-delta 出现才反应过来
       reasoning: picked.reasoning,
-      // 用户选了不支持图片的模型时，这里带着"已自动切换"的原因，由协议层下发成一条提示
-      modelNotice: picked.notice,
+      // 用户这轮确实传了图、但他选的模型不支持图片时，这里带着"已自动切换"的原因，
+      // 由协议层下发成一条提示。历史旧图导致的切换不走这里（见上面 modelNotice 的说明）
+      modelNotice,
       isTrimmed,
       droppedCount,
-      imageCount: images.length,
+      imageCount,
       inputCount: messages.length,
       tokenCount: countMessagesToken(modelMessages)
     }
@@ -400,6 +498,9 @@ module.exports = {
   getTextToken,
   toContentParts, // 导出供单测：数组/字符串两种形态都要覆盖
   attachImagesToLastUserMessage, // 导出供单测
+  countImageParts, // 导出供单测：判断"消息里挂了几张图"
+  countLastUserImages, // 导出供单测：判断"本轮新带来几张图"（决定要不要提示切模型）
+  planImageMount, // 导出供单测：正常挂载 / 裁剪兜底 / 干脆没图，三种分支都要覆盖
   buildAttachmentSystemPrompt,
   buildMemorySystemPrompt,
   MODEL_REASONING,

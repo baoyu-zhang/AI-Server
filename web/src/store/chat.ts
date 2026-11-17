@@ -30,10 +30,39 @@ export interface ToolStep {
   output?: string // 工具执行结果（统一转成文本）
   error?: string // 工具执行错误信息
   status: 'running' | 'waiting' | 'done' | 'error' // 执行状态；waiting 表示等待用户确认
+  progress?: string // 执行中的阶段播报（服务端 tool_progress 事件下发，仅 running 时展示，不持久化）
   approval?: {
     interruptId: string // AG-UI interrupt id，resume 时回传
     message?: string // 服务端给出的确认提示
   }
+}
+
+// 多步骤计划：服务端通过 STATE_DELTA 的 replace /plan 整数组下发（不做逐项 patch）。
+// 与 ToolStep 的区别：ToolStep 是"某一次工具调用"的过程记录，由前端从事件里自己拼；
+// PlanStep 是"模型声明的任务步骤"，进度由服务端按工具执行结果推进，前端只负责画。
+export type PlanStepStatus = 'pending' | 'running' | 'done' | 'failed' | 'skipped'
+
+export interface PlanStep {
+  id: string // 服务端生成，如 s1 / s2，按顺序稳定不变
+  title: string // 这一步做什么
+  tool?: string // 该步预期调用的工具名；空字符串表示不调工具
+  status: PlanStepStatus // pending 未开始 / running 进行中 / done 完成 / failed 失败 / skipped 未执行
+}
+
+export interface PlanState {
+  goal: string // 整个任务的目标，显示在面板标题
+  steps: PlanStep[]
+}
+
+/**
+ * 运行时类型守卫：agentState 是 Record<string, unknown>（服务端可以往里放任何东西），
+ * 展示层要把它当作 PlanState 用，必须先过这一道，否则模板里全是 any。
+ * 放在 store 里共享：PlanPanel 和 App.vue 的判断口径必须一致。
+ */
+export function isPlanState(value: unknown): value is PlanState {
+  if (!value || typeof value !== 'object') return false
+  const candidate = value as PlanState
+  return typeof candidate.goal === 'string' && Array.isArray(candidate.steps)
 }
 
 // 聊天消息类型（展示模型；消息真相在引擎 messages 里）
@@ -58,6 +87,7 @@ export interface ChatMessage {
   stopped?: boolean // 是否被用户主动停止生成（下一轮上下文要显式标注，避免被当成未回答）
   thinkingCollapsed?: boolean // 思考过程折叠状态（受控模式用）
   toolSteps?: ToolStep[] // 本轮 AI 回复中的工具调用步骤
+  plan?: PlanState // 本轮 AI 回复中声明的多步骤计划（挂在发起 planSteps 的那条消息上）
   notices?: string[] // 服务端提示（如上下文被裁剪）
   files?: ChatFile[] // 用户消息附带的文件列表
   sources?: RagSource[] // 知识库检索命中的引用来源

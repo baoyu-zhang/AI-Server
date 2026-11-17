@@ -9,7 +9,7 @@
 
 ---
 
-## 一、总览（按层分组，共 34 个模块、9346 行）
+## 一、总览（按层分组，共 34 个模块、9601 行）
 
 > 阅读策略：**先纵向（跟着一次请求走），再横向（按层读）**。下面四层从上到下，正好是请求穿过服务的顺序。
 
@@ -17,7 +17,7 @@
 
 | 文件 | 行数 | 一句话职责 |
 |---|---|---|
-| `index.js` | 2325 | 唯一入口：Express 挂载顺序、全部路由、AG-UI 协议适配、工具定义 |
+| `index.js` | 2580 | 唯一入口：Express 挂载顺序、全部路由、AG-UI 协议适配、工具定义 |
 | `security.js` | 136 | 生产配置硬校验、CORS、安全响应头、请求体限制（最先挂） |
 | `auth.js` | 272 | session + API Key 双凭证、登录/注册/登出、登录失败限流 |
 | `rate-limit.js` | 63 | 内存滑动窗口限流（按 IP） |
@@ -47,6 +47,7 @@
 | `session-files.js` | 301 | 会话附件入口（磁盘为准 + 内存缓存） |
 | `session-files-store.js` | 210 | 附件持久化（session_files 表 + uploads/session-files/） |
 | `score-resume.js` | 450 | 简历×JD 评分（维度+门槛+证据链，独立于协议层可直调） |
+| `weather.js` | 156 | 天气查询（专用 Agent 禁用 keep-alive 根治坏连接复用 + 两次 3.5 秒重试 + 并发去重 + 5 分钟缓存 + 阶段播报 onStage，失败抛中文指引；`npm run test:weather`） |
 | `candidates-store.js` | 254 | 候选人池（cand 字段级增删改查） |
 
 ### 第 4 层：数据与状态（落在哪里）
@@ -79,7 +80,7 @@
 
 ## 二、运行时文件详解
 
-### 1. `index.js`（855 → 现 2325 行）— 入口与协议层
+### 1. `index.js`（855 → 现 2580 行）— 入口与协议层
 
 **职责**：Express 服务、工具定义、AG-UI 协议事件编码、RAG 管理端点。
 
@@ -114,8 +115,9 @@
 ```
 trimMessages          裁剪超长上下文（保留最近 10 条以内，清掉悬空 tool 消息）
 buildAttachmentSystemPrompt  把本次会话附件清单拼成 system 提示
-attachImagesToLastUserMessage  图片挂到最后一条 user 消息（多模态）
-选模型                 有图 → MODEL_VISION，无图 → MODEL_REASONING
+countImageParts       数本轮消息里实际挂了几张图（决定选不选视觉模型）
+attachImagesToLastUserMessage  仅作裁剪兜底：最近一张图补挂到最后一条 user
+选模型                 本轮有图 → MODEL_VISION，无图 → MODEL_REASONING
 streamText            发起流式请求
 ```
 
@@ -206,7 +208,7 @@ node test-agui-protocol.mjs --list  # 列出用例
 node test-agui-protocol.mjs --case=text,rag
 ```
 
-9 个用例覆盖的能力：
+10 个用例覆盖的能力：
 
 | 用例 | 断言什么 |
 |---|---|
@@ -217,6 +219,7 @@ node test-agui-protocol.mjs --case=text,rag
 | `resume_allow` | resume 允许：执行工具、回传结果、重复 resume 幂等 |
 | `resume_reject` | resume 拒绝：不产生副作用 |
 | `rag` | 检索工具：TOOL_CALL_RESULT 与 `/sources` 状态增量 |
+| `plan` | 多步骤计划：`/plan` 走整数组 replace、status 取值合法、同一时刻最多一个 running、收尾全部进入终态、声明了 tool 的步骤确实被调用过 |
 | `long_context` | 历史超过 token 上限时触发裁剪（`CUSTOM:trim_notice`）且仍能正常完成 |
 | `bad_request` | 缺 messages 返回 400 |
 
@@ -230,14 +233,24 @@ node test-agui-protocol.mjs --case=text,rag
 
 ## 四、评测工具（`eval/`）
 
-这一组回答的是"改了检索到底有没有变好"，而不是"我觉得变好了"。
+这一组回答的是"改完到底有没有变好 / 有没有弄坏老功能"，而不是"我觉得变好了"。
+共四层，全部**离线可跑**（不调模型、不联网、不需要服务启动）；统一入口 `npm run eval:all`
+一次跑完四层，改完代码最快反馈用 `npm run eval:quick`（只跑业务逻辑层①②）。
 
-| 脚本 | 用法 | 作用 |
-|---|---|---|
-| `ingest-corpus.js` | `npm run eval:ingest` / `--list` | 从固定语料重建向量库，保证每次评测的语料一致 |
-| `run-eval.js` | `npm run eval -- <tag> [--topk N]` | 跑 20 题，输出 hit@1/3/5、MRR、分类统计，落 `results/<tag>.json` |
-| `compare.js` | `node eval/compare.js <a> <b>` | 逐题对比两次结果，列出名次变化与"改善/退化"条数 |
-| `inspect.js` | `npm run inspect [-- query]` | 单条查询透视 / 整体双路参与率体检 |
+| 层 | 脚本 | 用法 | 作用 |
+|---|---|---|---|
+| ① 业务逻辑 | `run-behavior.js` + `behavior-golden.json` | `npm run eval:behavior -- <tag>` | 19 条确定性用例：图片挂载（10）+ 计划状态机（9），按声明式 expect 校验，落 `results/behavior-<tag>.json` |
+| ② 工具降级 | `test-weather.cjs` | `npm run test:weather` | 8 条：超时重试 / 连续失败 / 并发去重 / 缓存 / 阶段播报 / keep-alive 实测 |
+| ③ 检索质量 | `run-eval.js` + `eval-dataset.json` | `npm run eval -- <tag>` | 20 题，hit@1/3/5、MRR、分类统计，落 `results/<tag>.json` |
+| ③ 对照 | `compare.js` | `node eval/compare.js <a> <b>` | 逐题对比两次结果，列出名次变化与"改善/退化"条数 |
+| ③ 语料 | `ingest-corpus.js` | `npm run eval:ingest` / `--list` | 从固定语料重建向量库，保证检索评测语料一致 |
+| ④ 生成式 UI | `web/src/ui/spec.selftest.ts` | `node --experimental-strip-types ...` | 18 条：`normalizeBarChart` 脏数据鲁棒性 |
+| 统一入口 | `eval-all.js` | `npm run eval:all` / `eval:quick` | 串起四层，任一层失败则整体退出码 1 |
+
+**为什么要分层、且业务层必须确定性**：检索质量用 hit@k/MRR（有排序、有灰度），但图片挂错、
+计划乱跳这类 bug 是"输入确定、输出也该确定"的——用模型去测只会引入随机性，反而测不出回归。
+所以把它们固化成毫秒级断言（`plan-core.js` 抽成纯函数模块，index.js 与评测共用同一份，
+保证"跑的代码"和"测的代码"是同一份，不会漂移）。
 
 **指标定义**
 
@@ -245,10 +258,13 @@ node test-agui-protocol.mjs --case=text,rag
 - **严格口径**：文件名匹配 **且** 片段包含 `expectKeywords` 里**任一**关键词，两个条件都满足才算命中。只用文件名匹配会自我欺骗——文件对了但片段是无关段落，模型照样答不出来。
 - `MRR`：`1/正确排名` 的平均值，衡量"排得有多靠前"，比 hit@k 更细。
 - `文件级 hit@3` 与 `严格 hit@3` 的差值 = "文件找到了但片段没对上"的数量。
+- 行为层用**通过率**（19/19）+ 按分组统计，失败时打印具体断言路径与实际值（如 `steps.0.status 实际 skipped / 期望 done`）。
 
-**知识点**：检索评测方法（hit@k / MRR / 严格口径）、对照组思维（baseline → cleaned → rrf 三份快照）、数据治理优先于算法调参。
+**知识点**：检索评测方法（hit@k / MRR / 严格口径）、对照组思维（baseline → cleaned → rrf 三份快照）、
+Golden Set 分层（确定性业务逻辑 vs 概率性检索质量）、单一事实源（纯函数抽出给生产与评测共用）、
+数据治理优先于算法调参。
 
-**解决的问题**：改检索最怕"感觉变好了"。这批数据上就验证过一次：只删掉一篇 21 段同质链接的"磁铁文档"，hit@3 从 80% 涨到 95%，比改任何参数都有效。
+**解决的问题**：改检索最怕"感觉变好了"。这批数据上就验证过一次：只删掉一篇 21 段同质链接的"磁铁文档"，hit@3 从 80% 涨到 95%，比改任何参数都有效。业务逻辑层则锁住了本轮踩过的全部坑——历史图误挂、纯文本误判视觉、计划自引用、旁支工具乱推进、有正文被判 skipped——以后任何改动一跑就知道老 bug 有没有复活。
 
 ---
 
@@ -300,12 +316,14 @@ index.js  启动段（挂载顺序 = 安全边界，顺序错了就是 3.10 那�
 index.js  /agui 路由
    ├─ 限流（rate-limit）→ 配额检查（quota）→ prompt 注入防护（prompt-guard）
    ├─ 会话归属校验 claimSession（sessionOwners，防止用别人的 sessionId）
-   ├─ aguiToChatMessages()      扁平事件 → AI SDK 消息结构
+   ├─ hydrateSessionImages()    先按 fileId 回填会话图片（必须在下面这步之前）
+   ├─ aguiToChatMessages()      扁平事件 → AI SDK 消息结构；图片挂回它上传时的那条消息
    ├─ 历史回填（threads-store：threadId → 历史消息 + state）
    ├─ prepareChatStream()       chat-core.js
    │     ├─ trimMessages()                超长则裁剪
    │     ├─ buildAttachmentSystemPrompt() 注入附件清单
-   │     ├─ attachImagesToLastUserMessage() 图片挂载
+   │     ├─ countImageParts()             数本轮挂了几张图（选模型用）
+   │     ├─ attachImagesToLastUserMessage() 仅在裁剪把图删掉时兜底补一张
    │     └─ streamText({ stopWhen: stepCountIs(5) })
    │           │
    │           ├─ 模型决定调用 searchKnowledgeBase
@@ -362,6 +380,12 @@ npm run test:agui
 
 **哪些文件别动**：`chat-core.js` 里 `streamText` 不能加 `await`；`rag-vector.js` 里新增/删除片段必须调 `invalidateBm25()`；`index.js` 里前端工具同名必须以服务端为准。这三处都是"改错了不报错、但功能静默失效"的位置。
 
+**如果用 AI 辅助开发（跨编辑器通用）**：项目在 `.workbuddy/skills/` 固化了可复用工作流，目前有 `add-tool`（新增一个工具的五步流程 + 上面三个雷区 + 验收清单）。这套 skill 遵循 Agent Skills 规范（`SKILL.md` = YAML frontmatter + Markdown 指令），Trae 等编辑器也认，只是发现目录不同（Trae 是 `.trae/skills/`）。
+
+- `.workbuddy/skills/` 是**唯一事实源**，要改 skill 只改这里；
+- 改完跑 `bash scripts/sync-skills.sh`，一键同步到 `.trae/skills/`（幂等，可反复跑）；
+- skill 内容属于"怎么开发这个项目"的元信息，不参与运行时，也不影响 3000 端口。
+
 ---
 
 ## 八、知识点速查
@@ -373,7 +397,7 @@ npm run test:agui
 | 工具为什么分三类 | `index.js` `createTools` / `createFrontendTools` / `createApprovalTools` 的注释 |
 | 中断与恢复怎么做的 | `index.js` `INTERRUPT_PREFIX` / `executeApprovalTool` + 测试用例 `interrupt`/`resume_*` |
 | 上下文裁剪怎么做的 | `chat-core.js` `trimMessages` |
-| 图片怎么发给模型的 | `chat-core.js` `toContentParts` / `attachImagesToLastUserMessage` |
+| 图片怎么发给模型的 | `index.js` `aguiToChatMessages(resolveImage)` 按消息就地挂 + `chat-core.js` `toContentParts` / `countImageParts` / `attachImagesToLastUserMessage`（裁剪兜底） |
 | RAG 索引怎么建的 | `rag-utils.js` `splitTextIntoChunks` + `rag-vector.js` `batchInsertEmbedding` |
 | 为什么 BM25 能救精确串 | `rag-vector.js` `tokenize` / `bm25Search` |
 | 两路怎么融合的 | `rag-vector.js` `fuseRRF` |

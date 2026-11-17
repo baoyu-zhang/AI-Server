@@ -1,0 +1,440 @@
+{
+  "tag": "first",
+  "timestamp": "2026-11-17T02:33:03.160Z",
+  "goldenVersion": "1.0.0",
+  "summary": {
+    "total": 19,
+    "passed": 19,
+    "passRate": 1
+  },
+  "byGroup": {
+    "图片挂载": {
+      "total": 10,
+      "passed": 10
+    },
+    "计划状态机": {
+      "total": 9,
+      "passed": 9
+    }
+  },
+  "cases": [
+    {
+      "id": "IMG-01",
+      "group": "图片挂载",
+      "name": "纯文本会话不误判为视觉任务",
+      "fn": "countImageParts",
+      "ok": true,
+      "error": null,
+      "expectResults": [
+        {
+          "path": "(返回值)",
+          "op": "eq",
+          "ok": true,
+          "detail": "实际 0 / 期望 0"
+        }
+      ]
+    },
+    {
+      "id": "IMG-02",
+      "group": "图片挂载",
+      "name": "历史消息里的图片计入 imageCount（决定选视觉模型）",
+      "fn": "countImageParts",
+      "ok": true,
+      "error": null,
+      "expectResults": [
+        {
+          "path": "(返回值)",
+          "op": "eq",
+          "ok": true,
+          "detail": "实际 2 / 期望 2"
+        }
+      ]
+    },
+    {
+      "id": "IMG-03",
+      "group": "图片挂载",
+      "name": "最后一条 user 无图时不弹'已切换模型'（即使历史有图）",
+      "fn": "countLastUserImages",
+      "ok": true,
+      "error": null,
+      "expectResults": [
+        {
+          "path": "(返回值)",
+          "op": "eq",
+          "ok": true,
+          "detail": "实际 0 / 期望 0"
+        }
+      ]
+    },
+    {
+      "id": "IMG-04",
+      "group": "图片挂载",
+      "name": "最后一条 user 带图时计为 1（本轮真的传了图）",
+      "fn": "countLastUserImages",
+      "ok": true,
+      "error": null,
+      "expectResults": [
+        {
+          "path": "(返回值)",
+          "op": "eq",
+          "ok": true,
+          "detail": "实际 1 / 期望 1"
+        }
+      ]
+    },
+    {
+      "id": "IMG-05",
+      "group": "图片挂载",
+      "name": "消息里已有图 → 原样放行、一张不加、不兜底",
+      "fn": "planImageMount",
+      "ok": true,
+      "error": null,
+      "expectResults": [
+        {
+          "path": "imageCount",
+          "op": "eq",
+          "ok": true,
+          "detail": "实际 1 / 期望 1"
+        },
+        {
+          "path": "usedFallback",
+          "op": "eq",
+          "ok": true,
+          "detail": "实际 false / 期望 false"
+        }
+      ]
+    },
+    {
+      "id": "IMG-06",
+      "group": "图片挂载",
+      "name": "新会话（消息和会话都无图）→ 什么都不做",
+      "fn": "planImageMount",
+      "ok": true,
+      "error": null,
+      "expectResults": [
+        {
+          "path": "imageCount",
+          "op": "eq",
+          "ok": true,
+          "detail": "实际 0 / 期望 0"
+        },
+        {
+          "path": "usedFallback",
+          "op": "eq",
+          "ok": true,
+          "detail": "实际 false / 期望 false"
+        }
+      ]
+    },
+    {
+      "id": "IMG-07",
+      "group": "图片挂载",
+      "name": "本轮不想带图 + allowFallback=false → 不把旧图硬塞回来",
+      "fn": "planImageMount",
+      "ok": true,
+      "error": null,
+      "expectResults": [
+        {
+          "path": "imageCount",
+          "op": "eq",
+          "ok": true,
+          "detail": "实际 0 / 期望 0"
+        },
+        {
+          "path": "usedFallback",
+          "op": "eq",
+          "ok": true,
+          "detail": "实际 false / 期望 false"
+        }
+      ]
+    },
+    {
+      "id": "IMG-08",
+      "group": "图片挂载",
+      "name": "裁剪丢图 + 允许兜底 → 补最近一张并附说明",
+      "fn": "planImageMount",
+      "ok": true,
+      "error": null,
+      "expectResults": [
+        {
+          "path": "imageCount",
+          "op": "eq",
+          "ok": true,
+          "detail": "实际 1 / 期望 1"
+        },
+        {
+          "path": "usedFallback",
+          "op": "eq",
+          "ok": true,
+          "detail": "实际 true / 期望 true"
+        },
+        {
+          "path": "messages.0.content.1.type",
+          "op": "eq",
+          "ok": true,
+          "detail": "实际 \"text\" / 期望 \"text\""
+        },
+        {
+          "path": "messages.0.content.1.text",
+          "op": "contains",
+          "ok": true,
+          "detail": "实际 \"（注：这张图是用户此前上传的，不在本条消息里；如果本轮问题与它无关，不要提及它。）\" 是否含 \"此前上传\""
+        },
+        {
+          "path": "messages.0.content.2.type",
+          "op": "eq",
+          "ok": true,
+          "detail": "实际 \"file\" / 期望 \"file\""
+        },
+        {
+          "path": "messages.0.content.2.data.type",
+          "op": "eq",
+          "ok": true,
+          "detail": "实际 \"data\" / 期望 \"data\""
+        }
+      ]
+    },
+    {
+      "id": "IMG-09",
+      "group": "图片挂载",
+      "name": "兜底挂的是最近一张（不是第一张）",
+      "fn": "planImageMount",
+      "ok": true,
+      "error": null,
+      "expectResults": [
+        {
+          "path": "messages.0.content.2.data.data",
+          "op": "eq",
+          "ok": true,
+          "detail": "实际 \"LATEST\" / 期望 \"LATEST\""
+        }
+      ]
+    },
+    {
+      "id": "IMG-10",
+      "group": "图片挂载",
+      "name": "content 为数组时不被 String() 毁掉（曾经的静默 bug）",
+      "fn": "attachImagesToLastUserMessage",
+      "ok": true,
+      "error": null,
+      "expectResults": [
+        {
+          "path": "0.content.0.type",
+          "op": "eq",
+          "ok": true,
+          "detail": "实际 \"text\" / 期望 \"text\""
+        },
+        {
+          "path": "0.content.0.text",
+          "op": "eq",
+          "ok": true,
+          "detail": "实际 \"原话不能丢\" / 期望 \"原话不能丢\""
+        },
+        {
+          "path": "0.content.1.type",
+          "op": "eq",
+          "ok": true,
+          "detail": "实际 \"file\" / 期望 \"file\""
+        }
+      ]
+    },
+    {
+      "id": "PLAN-01",
+      "group": "计划状态机",
+      "name": "buildPlan：首步 running、其余 pending、id 递增",
+      "fn": "buildPlan",
+      "ok": true,
+      "error": null,
+      "expectResults": [
+        {
+          "path": "goal",
+          "op": "eq",
+          "ok": true,
+          "detail": "实际 \"杭州两日游\" / 期望 \"杭州两日游\""
+        },
+        {
+          "path": "steps.0.id",
+          "op": "eq",
+          "ok": true,
+          "detail": "实际 \"s1\" / 期望 \"s1\""
+        },
+        {
+          "path": "steps.0.status",
+          "op": "eq",
+          "ok": true,
+          "detail": "实际 \"running\" / 期望 \"running\""
+        },
+        {
+          "path": "steps.0.tool",
+          "op": "eq",
+          "ok": true,
+          "detail": "实际 \"getWeather\" / 期望 \"getWeather\""
+        },
+        {
+          "path": "steps.1.id",
+          "op": "eq",
+          "ok": true,
+          "detail": "实际 \"s2\" / 期望 \"s2\""
+        },
+        {
+          "path": "steps.1.status",
+          "op": "eq",
+          "ok": true,
+          "detail": "实际 \"pending\" / 期望 \"pending\""
+        }
+      ]
+    },
+    {
+      "id": "PLAN-02",
+      "group": "计划状态机",
+      "name": "buildPlan：模型把 tool 填成 planSteps 自引用 → 挡成空串",
+      "fn": "buildPlan",
+      "ok": true,
+      "error": null,
+      "expectResults": [
+        {
+          "path": "steps.0.tool",
+          "op": "eq",
+          "ok": true,
+          "detail": "实际 \"\" / 期望 \"\""
+        },
+        {
+          "path": "steps.1.tool",
+          "op": "eq",
+          "ok": true,
+          "detail": "实际 \"renderChart\" / 期望 \"renderChart\""
+        }
+      ]
+    },
+    {
+      "id": "PLAN-03",
+      "group": "计划状态机",
+      "name": "advancePlan：同名工具完成 → 当前 step done、下一步转 running",
+      "fn": "advancePlan",
+      "ok": true,
+      "error": null,
+      "expectResults": [
+        {
+          "path": "steps.0.status",
+          "op": "eq",
+          "ok": true,
+          "detail": "实际 \"done\" / 期望 \"done\""
+        },
+        {
+          "path": "steps.1.status",
+          "op": "eq",
+          "ok": true,
+          "detail": "实际 \"running\" / 期望 \"running\""
+        }
+      ]
+    },
+    {
+      "id": "PLAN-04",
+      "group": "计划状态机",
+      "name": "advancePlan：旁支工具（renderChart）不推进主流程",
+      "fn": "advancePlan",
+      "ok": true,
+      "error": null,
+      "expectResults": [
+        {
+          "path": "(返回值)",
+          "op": "eq",
+          "ok": true,
+          "detail": "实际 null / 期望 null"
+        }
+      ]
+    },
+    {
+      "id": "PLAN-05",
+      "group": "计划状态机",
+      "name": "advancePlan：失败则当前 step failed 且不启动下一步",
+      "fn": "advancePlan",
+      "ok": true,
+      "error": null,
+      "expectResults": [
+        {
+          "path": "steps.0.status",
+          "op": "eq",
+          "ok": true,
+          "detail": "实际 \"failed\" / 期望 \"failed\""
+        },
+        {
+          "path": "steps.1.status",
+          "op": "eq",
+          "ok": true,
+          "detail": "实际 \"pending\" / 期望 \"pending\""
+        }
+      ]
+    },
+    {
+      "id": "PLAN-06",
+      "group": "计划状态机",
+      "name": "settlePlan：无工具但有正文的步骤 → done（不误判 skipped）",
+      "fn": "settlePlan",
+      "ok": true,
+      "error": null,
+      "expectResults": [
+        {
+          "path": "steps.1.status",
+          "op": "eq",
+          "ok": true,
+          "detail": "实际 \"done\" / 期望 \"done\""
+        },
+        {
+          "path": "steps.2.status",
+          "op": "eq",
+          "ok": true,
+          "detail": "实际 \"done\" / 期望 \"done\""
+        }
+      ]
+    },
+    {
+      "id": "PLAN-07",
+      "group": "计划状态机",
+      "name": "settlePlan：声明了工具却没执行 → skipped",
+      "fn": "settlePlan",
+      "ok": true,
+      "error": null,
+      "expectResults": [
+        {
+          "path": "steps.0.status",
+          "op": "eq",
+          "ok": true,
+          "detail": "实际 \"skipped\" / 期望 \"skipped\""
+        }
+      ]
+    },
+    {
+      "id": "PLAN-08",
+      "group": "计划状态机",
+      "name": "settlePlan：全部已终态 → 返回 null（不下发无意义的 STATE_DELTA）",
+      "fn": "settlePlan",
+      "ok": true,
+      "error": null,
+      "expectResults": [
+        {
+          "path": "(返回值)",
+          "op": "eq",
+          "ok": true,
+          "detail": "实际 null / 期望 null"
+        }
+      ]
+    },
+    {
+      "id": "PLAN-09",
+      "group": "计划状态机",
+      "name": "settlePlan：无工具且无正文 → skipped",
+      "fn": "settlePlan",
+      "ok": true,
+      "error": null,
+      "expectResults": [
+        {
+          "path": "steps.0.status",
+          "op": "eq",
+          "ok": true,
+          "detail": "实际 \"skipped\" / 期望 \"skipped\""
+        }
+      ]
+    }
+  ]
+}

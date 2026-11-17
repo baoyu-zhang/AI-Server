@@ -736,6 +736,106 @@ const cases = [
   },
 
   {
+    name: 'plan',
+    title: '多步骤计划：STATE_DELTA 的 /plan 下发、推进与收敛',
+    async run() {
+      // 这个用例天然依赖模型行为（愿不愿意先声明计划），所以"没调 planSteps"走 skip 而不是 fail。
+      // 断言只覆盖协议与状态契约：状态取值、同一时刻只有一个 running、最终全部进入终态。
+      const res = await requestAgui({
+        threadId: newSessionId('t_plan'),
+        messages: [
+          {
+            id: 'm1',
+            role: 'user',
+            content:
+              '帮我规划杭州两日游：先查一下杭州未来两天的天气，再根据天气安排每天的行程，最后给我一份行程表。请用 planSteps 工具把步骤列出来。'
+          }
+        ]
+      })
+
+      if (res.networkError) {
+        check('请求 /agui 成功', false, res.networkError)
+        return
+      }
+      if (!assertRunBasics(res)) return
+
+      const planCalls = toolCalls(res.events).filter(call => call.name === 'planSteps')
+      if (!planCalls.length) {
+        skip('模型声明了执行计划', `本轮未调用 planSteps：${brief(res.events)}`)
+        return
+      }
+      check('模型调用了 planSteps', true)
+
+      const planOps = res.events
+        .filter(event => event.type === 'STATE_DELTA' && Array.isArray(event.delta))
+        .flatMap(event => event.delta)
+        .filter(op => op?.path === '/plan' && op.value)
+      if (!planOps.length) {
+        check('通过 STATE_DELTA 下发 /plan', false, '没有 path=/plan 的 replace 操作')
+        return
+      }
+      check('通过 STATE_DELTA 下发 /plan', true, `${planOps.length} 次`)
+
+      // 整数组替换：如果某次下发用了逐项 patch，前端会把 key 认成 "plan/steps/0/status"
+      check(
+        '/plan 使用整数组 replace',
+        planOps.every(op => op.op === 'replace'),
+        planOps.map(op => op.op)
+      )
+
+      const first = planOps[0].value
+      check('plan 带 goal', typeof first?.goal === 'string' && first.goal.length > 0, first?.goal)
+      check('steps 至少 2 步', Array.isArray(first?.steps) && first.steps.length >= 2, first?.steps?.length)
+      check(
+        'step 结构包含 id / title / status',
+        (first?.steps || []).every(
+          step => typeof step.id === 'string' && typeof step.title === 'string' && typeof step.status === 'string'
+        ),
+        first?.steps?.[0]
+      )
+
+      const allowed = ['pending', 'running', 'done', 'failed', 'skipped']
+      const everyPlan = planOps.map(op => op.value)
+      check(
+        'status 取值在约定集合内',
+        everyPlan.every(plan => plan.steps.every(step => allowed.includes(step.status))),
+        everyPlan.map(plan => plan.steps.map(step => step.status))
+      )
+      check(
+        '首次下发第一步即为 running',
+        first.steps[0].status === 'running',
+        first.steps.map(step => step.status)
+      )
+      check(
+        '同一时刻最多一个 running',
+        everyPlan.every(plan => plan.steps.filter(step => step.status === 'running').length <= 1),
+        everyPlan.map(plan => plan.steps.filter(step => step.status === 'running').length)
+      )
+
+      // 收尾必须是"稳定态"：留着 pending / running 说明 settlePlan 没跑到
+      const last = planOps[planOps.length - 1].value
+      check(
+        '收尾时全部步骤进入终态',
+        last.steps.every(step => ['done', 'failed', 'skipped'].includes(step.status)),
+        last.steps.map(step => `${step.title}:${step.status}`)
+      )
+
+      // 声明了 tool 的步骤，对应工具必须真的被调用过；否则说明推进链断了（或模型给了不存在的工具名）
+      const calledNames = new Set(toolCalls(res.events).map(call => call.name))
+      const toolSteps = first.steps.filter(step => step.tool)
+      if (toolSteps.length) {
+        check(
+          '声明了 tool 的步骤都真的调用过对应工具',
+          toolSteps.every(step => calledNames.has(step.tool)),
+          { declared: toolSteps.map(step => step.tool), called: [...calledNames] }
+        )
+      } else {
+        skip('步骤绑定了工具名', '模型没有填写任何 step.tool，无法校验推进链')
+      }
+    }
+  },
+
+  {
     name: 'long_context',
     title: '长上下文：历史超过 token 上限，裁剪后仍正常完成（替代原 test-long-chat.js）',
     async run() {

@@ -11,5 +11,8 @@
     "erasableSyntaxOnly": true,
     "noFallthroughCasesInSwitch": true
   },
-  "include": ["src/**/*.ts", "src/**/*.tsx", "src/**/*.vue"]
+  "include": ["src/**/*.ts", "src/**/*.tsx", "src/**/*.vue"],
+  // 自测脚本是跑在 node 里的（node --experimental-strip-types），不属于浏览器构建产物，
+  // 也不该把 node 类型塞进前端工程的 types 里
+  "exclude": ["src/ui/spec.selftest.ts"]
 }

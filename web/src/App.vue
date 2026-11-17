@@ -78,6 +78,11 @@
               <div style="padding: 0 12px 12px;"> {{ msg.reasonContent }}</div>
             </t-chat-thinking>
           </div>
+          <!-- 多步骤计划：模型为本轮任务声明的执行步骤。
+               挂在这条 AI 回复内部（发起 planSteps 的那一条），而不是列表顶部——
+               计划属于这一轮对话，往下读别的消息时它跟着滚走，不再像全局横幅。
+               进度仍由服务端 STATE_DELTA 推进，前端只负责画。 -->
+          <PlanPanel v-if="msg.role === 'assistant' && msg.plan" :plan="msg.plan" class="msg-plan" />
           <!-- 工具调用步骤：展示本轮 AI 调用了哪些工具、入参、结果与执行状态 -->
           <div v-if="msg.role === 'assistant' && msg.toolSteps?.length" class="tool-steps">
             <div v-for="step in msg.toolSteps" :key="step.id" class="tool-step">
@@ -89,7 +94,20 @@
                   {{ step.status === 'waiting' ? '待确认' : step.status === 'running' ? '执行中' : step.status === 'error' ? '失败' : '完成' }}
                 </span>
               </div>
-              <div v-if="hasToolInput(step.input)" class="tool-step__row">
+              <!-- 执行中的阶段播报：天气这类外部调用最长可到 7 秒（两次 3.5 秒尝试），
+                   有这句"正在查询…/正在重试…"，用户看到的是"在干活"而不是"卡死了" -->
+              <div v-if="step.status === 'running' && step.progress" class="tool-step__row">
+                <span class="tool-step__label">进度</span>
+                <span class="tool-step__value is-progress">{{ step.progress }}</span>
+              </div>
+              <!-- 生成式 UI：这个工具的参数就是一份 UI spec，交给注册表渲染成组件。
+                   校验不过时降级成一行提示（并保留下面的原始入参），绝不留白。 -->
+              <component v-if="specView(step)?.ok" :is="specView(step)?.component" v-bind="specView(step)?.props" />
+              <div v-else-if="specView(step)?.ok === false" class="tool-step__row">
+                <span class="tool-step__label">降级</span>
+                <code class="tool-step__value is-error">{{ specView(step)?.error }}</code>
+              </div>
+              <div v-if="hasToolInput(step.input) && !specView(step)?.ok" class="tool-step__row">
                 <span class="tool-step__label">入参</span>
                 <code class="tool-step__value">{{ formatToolValue(step.input) }}</code>
               </div>
@@ -266,13 +284,15 @@ import { useMediaQuery } from '@vueuse/core'
 // 第二阶段：品牌单例。窄屏顶栏不再写死「知识库助手」，改由数据卷里的 branding.json 决定
 import { branding } from './config/branding'
 // 引入聊天 store（管理消息列表、loading 状态等）
-import { useChatStore, USER_META, ASSISTANT_META } from './store/chat'
+import { useChatStore, USER_META, ASSISTANT_META, isPlanState } from './store/chat'
 // AG-UI 事件里的消息 / 中断类型（真正的请求由 chatEngine 发出）
 import type { Message, Interrupt, ResumeEntry } from '@ag-ui/core'
 // 左侧栏（文档 / 候选人两个页签）
 import SidePanel from './components/SidePanel.vue'
 // 登录门：未登录时替代整个主界面
 import LoginGate from './components/LoginGate.vue'
+// 多步骤计划面板：自己订阅 agentState.plan，不接收任何 props
+import PlanPanel from './components/PlanPanel.vue'
 // 鉴权：token 存取、请求头、401 统一处理
 import { isLoggedIn, currentUser, authHeaders, logout as apiLogout, setUnauthorizedHandler, request } from './api/auth'
 // 引入文件上传组件类型定义
@@ -281,11 +301,13 @@ import { useChat } from '@tdesign-vue-next/chat/es/chat-engine'
 import { MessagePlugin } from 'tdesign-vue-next'
 import { SystemSumIcon, InfoCircleIcon, MenuIcon, BookmarkIcon, ChevronDownIcon, FileIcon, CopyIcon, FileMarkdownIcon, FileWordIcon, PrintIcon } from 'tdesign-icons-vue-next';
 // 引入消息类型定义
-import type { ChatMessage, ChatFile, ToolStep, RagSource } from './store/chat'
+import type { ChatMessage, ChatFile, ToolStep, RagSource, PlanState } from './store/chat'
 // AG-UI 共享状态维护（STATE_SNAPSHOT 替换 / STATE_DELTA 增量合并）
 import { applyStateDelta, applyStateSnapshot, cloneAgentState } from './agui/agentState'
 // 回答导出：Markdown → HTML（下载 .md/.doc 与打印共用同一套版式）
 import { buildHtmlDocument, downloadBlob, printHtml, suggestTitle } from './utils/export-markdown'
+// 生成式 UI：工具参数 → 已注册组件（白名单 + props 校验，未登记的一律不渲染）
+import { isUiSpecTool, resolveUiSpec } from './ui/registry'
 
 // 发送区附件项：在 TDesign 附件项基础上补充后端文件 id 与原始 File（失败重试需要）
 type SenderFile = TdAttachmentItem & {
@@ -473,6 +495,9 @@ const errorByMessageId = reactive(new Map<string, string>())
 const disconnectedByMessageId = reactive(new Set<string>())
 const toolOutputById = reactive(new Map<string, string>())
 const toolErrorById = reactive(new Map<string, string>())
+// 工具执行中的阶段播报（如「正在查询天气…」）：来自服务端 tool_progress 自定义事件。
+// 只在步骤还是 running 时展示，结果一到状态就变 done，模板自然不再显示它
+const toolProgressById = reactive(new Map<string, string>())
 const approvalByToolCallId = reactive(new Map<string, { interruptId: string; message?: string }>())
 
 // 展示用：引擎同步给 Vue 的响应式副本（滞后一个微任务，但会触发重渲染）
@@ -588,6 +613,8 @@ function toolStepsOf(message: EngineMessage, toolData: Map<string, Record<string
       input: parseToolArgs(data.args),
       output: engineOutput ?? localOutput,
       error,
+      // 阶段播报只在"还没结果也没报错"（即仍在执行）时才有意义
+      progress: !error && engineOutput === undefined && localOutput === undefined ? toolProgressById.get(id) : undefined,
       status: approval ? 'waiting' : error ? 'error' : engineOutput !== undefined || localOutput !== undefined ? 'done' : 'running',
       approval: approval ? { interruptId: approval.interruptId, message: approval.message } : undefined
     })
@@ -601,6 +628,59 @@ function hasFollowingAssistant(list: EngineMessage[], index: number): boolean {
     if (list[i].role === 'assistant') return true
   }
   return false
+}
+
+// ===== 多步骤计划的归属 =====
+// 计划要挂在「发起 planSteps 调用、也就是声明了这份计划的那条 AI 回复」里，
+// 而不是钉在整个会话滚动区顶部——后者会让它看起来像全局横幅，而不是这一轮对话的一部分。
+//
+// 怎么认出是哪条消息：planSteps 工具调用本身就在引擎消息的 toolcall 块里，
+// 所以只要记住「哪个 toolCallId 对应当前 agentState.plan」，在 viewMessages 里按步骤反查即可。
+// 为什么不记消息 id：只有工具调用、没有正文的 AI 消息会被合并到下一条（保持单气泡），
+// 消息 id 会消失，而 toolCallId 始终跟着步骤走。
+
+// 当前 agentState.plan 属于哪次 planSteps 调用。
+// 计划一到就用当时已知的最近一次 planSteps 调用落定；落不定（引擎还没同步到 Vue）也没关系，
+// resolvePlanOwner 会在渲染时懒解析，见下面的注释。
+const planOwnerToolCallId = ref('')
+
+// 扫引擎消息找最近一次 planSteps 调用的 id。必须从后往前：
+// 一个会话里可能做过多次计划，只有最后一次的 id 才配得上当前 agentState.plan
+function latestPlanToolCallId(list: EngineMessage[] = engineList()): string {
+  for (let i = list.length - 1; i >= 0; i -= 1) {
+    const message = list[i]
+    if (message.role !== 'assistant') continue
+    for (const block of message.content || []) {
+      if (!block.type.startsWith('toolcall')) continue
+      if (block.data?.toolCallName === 'planSteps' && typeof block.data?.toolCallId === 'string') {
+        return block.data.toolCallId
+      }
+    }
+  }
+  return ''
+}
+
+// 计划的改动按"整数组 replace"下发，可能在 TOOL_CALL_* 事件之后才到，
+// 也可能在引擎把消息同步给 Vue 之前就到（同步走 queueMicrotask，存在时序竞态）。
+// 所以这里只做「能落定就落定」，落不定交给渲染时的懒解析兜底，绝不依赖事件顺序。
+function syncPlanOwner() {
+  const owner = latestPlanToolCallId()
+  if (owner) planOwnerToolCallId.value = owner
+}
+
+// 解析当前应该由哪次 planSteps 调用认领 agentState.plan。
+// 已记录的 id 失效（切会话 / 重放 / 刷新换了一批消息）时回退到"最近一次调用"，
+// 保证任何恢复路径下计划都能找到自己的位置，不会因为 id 过期就消失。
+function resolvePlanOwner(list: EngineMessage[]): string {
+  const stored = planOwnerToolCallId.value
+  if (stored) {
+    for (const message of list) {
+      for (const block of message.content || []) {
+        if (block.type.startsWith('toolcall') && block.data?.toolCallId === stored) return stored
+      }
+    }
+  }
+  return latestPlanToolCallId(list)
 }
 
 function mergeSources(base: RagSource[], extra: RagSource[]): RagSource[] {
@@ -635,7 +715,8 @@ function assistantView(
   index: number,
   steps: ToolStep[],
   sources: RagSource[],
-  notices: string[]
+  notices: string[],
+  plan?: PlanState
 ): ChatMessage {
   const errorMsg = errorByMessageId.get(message.id)
   const streaming = message.status === 'pending' || message.status === 'streaming'
@@ -662,6 +743,7 @@ function assistantView(
     reasonContent: reasonOf(message) || undefined,
     thinkingCollapsed: collapsedByMessageId.get(message.id) ?? false,
     toolSteps: steps.length ? steps : undefined,
+    plan,
     notices: notices.length ? notices : undefined,
     sources: sources.length ? sources : undefined,
     stopped: stoppedByMessageId.has(message.id) || undefined,
@@ -679,6 +761,19 @@ const viewMessages = computed<ChatMessage[]>(() => {
   let pendingSteps: ToolStep[] = []
   let pendingSources: RagSource[] = []
   let pendingNotices: string[] = []
+
+  // 多步骤计划：只挂给"认领它的那条 AI 回复"。
+  // 认领规则 —— 该消息的步骤里有 planSteps，且 id 就是当前计划的主人。
+  // 读 chatStore.agentState 是刻意的：计划每次整数组 replace 都会触发这个 computed 重算，
+  // 面板因此能跟着 STATE_DELTA 实时更新（和 PlanPanel 里的订阅是同一份数据）。
+  const planOwner = resolvePlanOwner(list)
+  const rawPlan = (chatStore.agentState as Record<string, unknown>).plan
+  const currentPlan = isPlanState(rawPlan) ? rawPlan : null
+  const planOf = (steps: ToolStep[]): PlanState | undefined => {
+    if (!currentPlan || !planOwner) return undefined
+    return steps.some(step => step.name === 'planSteps' && step.id === planOwner) ? currentPlan : undefined
+  }
+
   const flushPending = () => {
     pendingSteps = []
     pendingSources = []
@@ -709,13 +804,21 @@ const viewMessages = computed<ChatMessage[]>(() => {
         pendingNotices = mergedNotices
         continue
       }
-      result.push(assistantView(message, index, mergedSteps, mergedSources, mergedNotices))
+      result.push(assistantView(message, index, mergedSteps, mergedSources, mergedNotices, planOf(mergedSteps)))
       flushPending()
       continue
     }
 
+    const mergedSteps = [...pendingSteps, ...steps]
     result.push(
-      assistantView(message, index, [...pendingSteps, ...steps], mergeSources(pendingSources, sources), [...pendingNotices, ...notices])
+      assistantView(
+        message,
+        index,
+        mergedSteps,
+        mergeSources(pendingSources, sources),
+        [...pendingNotices, ...notices],
+        planOf(mergedSteps)
+      )
     )
     flushPending()
   }
@@ -730,7 +833,9 @@ function persistViewSnapshot() {
     .map(msg => ({
       ...msg,
       content: msg.content.map(item => ({ ...item })),
-      toolSteps: msg.toolSteps?.map(step => ({ ...step, approval: step.approval ? { ...step.approval } : undefined }))
+      toolSteps: msg.toolSteps?.map(step => ({ ...step, approval: step.approval ? { ...step.approval } : undefined })),
+      // 计划也要拷一份：它来自 agentState 的响应式对象，直接存引用会让快照跟着后续 delta 漂移
+      plan: msg.plan ? { goal: msg.plan.goal, steps: msg.plan.steps.map(step => ({ ...step })) } : undefined
     }))
 }
 
@@ -802,7 +907,10 @@ function clearSidecars() {
   disconnectedByMessageId.clear()
   toolOutputById.clear()
   toolErrorById.clear()
+  toolProgressById.clear()
   approvalByToolCallId.clear()
+  // 计划归属也要一起作废：换了会话/账号后，旧的 toolCallId 对新消息毫无意义
+  planOwnerToolCallId.value = ''
 }
 
 function pruneSidecars(keepIds: Set<string>) {
@@ -1006,7 +1114,8 @@ const TOOL_LABELS: Record<string, string> = {
   searchKnowledgeBase: '知识库检索',
   getSelectedText: '读取选中文本',
   getClientTime: '浏览器本地时间',
-  deleteSessionFile: '删除会话附件'
+  deleteSessionFile: '删除会话附件',
+  renderChart: '生成图表'
 }
 function getToolLabel(name: string) {
   if (TOOL_LABELS[name]) return TOOL_LABELS[name]
@@ -1039,6 +1148,31 @@ function getToolResultText(msg: ChatMessage, step: ToolStep) {
     return count ? `检索到 ${count} 条片段，已展示在下方引用来源` : '未检索到相关内容'
   }
   return step.output || ''
+}
+
+// ========== 生成式 UI：工具参数 → 组件 ==========
+// 命中注册表的工具（renderChart 等），它的入参就是一份 UI spec，直接渲染成组件；
+// 没登记的组件一律不渲染——这是整个能力的安全边界（见 ui/registry.ts）。
+//
+// 返回类型刻意写成"字段全可选"的宽松形状，而不是 ok 的联合类型：
+// 模板里 v-if 无法把函数调用结果跨表达式收窄（每次 specView(step) 都是新调用），
+// 用联合类型会逼出 TS2531「对象可能为 null」和 TS2339「component 不存在」两串报错。
+type SpecView = { ok: boolean; component?: any; props?: Record<string, unknown>; error?: string } | null
+
+// 缓存键带上 status：流式过程中参数可能还没到齐（running），落定（done）要重新校验一次。
+const specViewCache = new Map<string, SpecView>()
+
+function specView(step: ToolStep): SpecView {
+  if (!isUiSpecTool(step.name)) return null
+  const key = `${step.id}|${step.status}`
+  if (specViewCache.has(key)) return specViewCache.get(key) ?? null
+  // 参数没到齐时先不急着判失败，等它落定；否则流式途中会闪一下"数据不可用"
+  if (step.status === 'running') return null
+  const view = resolveUiSpec(step.name, step.input) as SpecView
+  // 简单防泄漏：会话很长时不让缓存无限涨
+  if (specViewCache.size > 400) specViewCache.clear()
+  specViewCache.set(key, view)
+  return view
 }
 
 // ========== 引用来源手风琴 ==========
@@ -1207,11 +1341,15 @@ function setupAgentEvents() {
       if (raw.type === 'STATE_SNAPSHOT') {
         // 全量状态：整体替换客户端持有的 state
         chatStore.agentState = applyStateSnapshot(raw.snapshot)
+        // 计划的主人可能还没落定（快照可能先于引擎消息同步到达），尽力记录，渲染时还有懒解析兜底
+        syncPlanOwner()
         return
       }
       if (raw.type === 'STATE_DELTA') {
         // 增量状态：先按 JSON Patch 合并，再挑出 sources 挂到当前 AI 消息上展示
         chatStore.agentState = applyStateDelta(chatStore.agentState, raw.delta ?? [])
+        // /plan 是整数组 replace，合并后顺手确认它该挂在哪次 planSteps 调用上
+        syncPlanOwner()
         const sources = (raw.delta ?? [])
           .filter((p: any) => p.op === 'add' && p.path === '/sources/-' && p.value)
           .map((p: any) => p.value as RagSource)
@@ -1235,6 +1373,9 @@ function setupAgentEvents() {
           if (!list.includes(text)) noticesByMessageId.set(id, [...list, text])
         } else if (raw.name === 'tool_error' && value.toolCallId) {
           toolErrorById.set(value.toolCallId, value.message || '工具执行失败')
+        } else if (raw.name === 'tool_progress' && value.toolCallId) {
+          // 阶段播报：覆盖写即可——同一调用只会有"查询中 → 重试中"两段，后者语义更新
+          toolProgressById.set(value.toolCallId, value.message || '')
         }
         return
       }
@@ -2173,7 +2314,9 @@ onUnmounted(() => teardownAgentEvents())
   height: 100%;
   display: flex;
   flex-direction: column;
-  padding: 16px;
+  /* 顶部留 48px：右上角账号角标是 position:fixed（top:10px + 约 32px 高），
+     不给它让位的话，滚到顶时的第一条消息会被压在角标下面 */
+  padding: 48px 16px 16px;
   box-sizing: border-box;
 }
 
@@ -2188,6 +2331,10 @@ onUnmounted(() => teardownAgentEvents())
 /* 消息列表区域：占满剩余空间 */
 .chat-list {
   flex: 1;
+  /* flex 子项的 min-height 默认是 auto，等于"内容多高就多高"：
+     消息一长它就不肯让位，反过来把上面的计划面板压扁。
+     显式给 0，滚动交给它自己，兄弟节点不再被挤。 */
+  min-height: 0;
   margin-bottom: 16px;
 }
 
@@ -2454,6 +2601,22 @@ onUnmounted(() => teardownAgentEvents())
 
   &.is-error {
     color: var(--td-error-color);
+  }
+
+  /* 阶段播报用品牌色 + 呼吸动画：和"执行中"圆点呼应，一眼看出这一行是动态的 */
+  &.is-progress {
+    color: var(--td-brand-color);
+    animation: tool-progress-pulse 1.6s ease-in-out infinite;
+  }
+}
+
+@keyframes tool-progress-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.45;
   }
 }
 

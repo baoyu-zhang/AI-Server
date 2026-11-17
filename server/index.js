@@ -12,12 +12,14 @@ const fs = require('fs') // 用于清理解析后的临时文件
 const path = require('path') // 用于解析上传文件的后缀名
 const { UPLOAD_DIR, ALLOWED_EXTS, LEGACY_EXTS, IMAGE_EXTS, extractFileText, splitTextIntoChunks } = require('./rag-utils')
 const { initVectorStore, batchInsertEmbedding, searchVector, getDocuments, getDocumentContext, getCandidates, getJobs, deleteDocument } = require('./rag-vector')
-const { addSessionFile, addSessionImage, hydrateSessionImages, deleteSessionFile, getSessionFiles, searchSessionFiles, getSessionFileContext } = require('./session-files')
+const { addSessionFile, addSessionImage, hydrateSessionImages, deleteSessionFile, getSessionFiles, getSessionImages, searchSessionFiles, getSessionFileContext } = require('./session-files')
 const { saveImage, readImage, deleteImage, pruneImages, urlFor, verify: verifyImageSig } = require('./image-store') // 会话图片落盘 + 签名 URL
 const { prepareChatStream, MAX_CONTEXT_TOKENS } = require('./chat-core') // 聊天主链路（裁剪/附件/选模型/streamText）
+const { buildPlan, advancePlan, settlePlan } = require('./plan-core') // 多步骤计划状态机（纯函数，离线 golden set 共用同一份）
 const { listModels, isKnownModel, DEFAULT_MODEL } = require('./models') // 可选模型注册表（前端下拉的数据源）
 const { scanInjection, injectionWarning } = require('./prompt-guard') // 检索片段的注入扫描与就地警告
 const { scoreResumeAgainstJD } = require('./score-resume') // 招聘场景的领域能力：简历 × JD 匹配度评估
+const { weatherReport } = require('./weather') // 天气查询：短超时 + 换连接重试 + 去重缓存（单测 test-weather.cjs）
 const { authRouter, requireAuth, hashPassword } = require('./auth') // 注册/登录 + 全局鉴权闸门
 const { recordAudit, listAudit } = require('./audit') // 操作审计：谁批准了什么写操作
 const { startAutoBackup } = require('./backup') // SQLite 定时备份（VACUUM INTO）
@@ -282,6 +284,15 @@ function mergeByRank(lists, topK) {
     .slice(0, topK)
 }
 
+// ========== 多步骤计划（plan）：数据结构与推进规则 ==========
+// buildPlan / advancePlan / settlePlan 已抽到 ./plan-core（本文件顶部 require）。
+// 为什么整数组 replace 而不做逐项 JSON Patch：
+//   ① 计划最多 6 步，全量下发的载荷约 200 字节，比 path 拼接方案更省心；
+//   ② server 端 applyStateOps 只实现了 add /sources/- 和 replace /<key> 两种 op，
+//      逐项更新会写出 /plan/steps/0/status 这种三段路径，它会把 key 认成 "plan/steps/0/status"；
+//   ③ 前端 agui/agentState.ts 的 replace 分支已经支持，不用动。
+// 结论：replace /plan 是当前架构下改动面最小的做法。
+
 // ========== 工具集合：按会话构建 ==========
 // 工具分三类，差别不在"功能"，而在"谁执行、什么时候执行"：
 //   ① 服务端工具（本函数）：有 execute，流内立即执行，结果自动回填给模型继续生成
@@ -292,7 +303,12 @@ function mergeByRank(lists, topK) {
 // 附件检索需要 sessionId。若做成常量，这个 id 只能靠全局变量传递，
 // 多请求并发时会串号（A 用户检索到 B 用户的附件）。工厂函数把状态收进闭包，天然隔离。
 // userId 同理：检索、候选人清单、评分都必须圈定在"当前登录用户"的可见范围内。
-function createTools(sessionId, userId) {
+//
+// hooks 是为"工具执行要影响 UI 状态"准备的出口。为什么不在这里直接 send STATE_DELTA：
+// 这个函数同时被 /v1（纯 OpenAI 兼容，没有 AG-UI 事件流）和 /agui 使用，
+// 把 SSE 编码逻辑塞进工具层会让 /v1 也依赖一套它不需要的东西。
+// 端点通过 hooks 注入自己的实现，/v1 不传就是空对象，行为不变。
+function createTools(sessionId, userId, hooks = {}) {
   return {
     // ---- ① 服务端工具：模型调完立刻拿到结果 ----
     getCurrentTime: tool({
@@ -330,6 +346,108 @@ function createTools(sessionId, userId) {
             return '错误：运算符仅支持 + - * /'
         }
         return `计算结果：${a} ${op} ${b} = ${res}`
+      }
+    }),
+
+    // ---- 生成式 UI：让模型"点菜"一个图表 ----
+    // 这个工具不产生任何数据、不落库、不查库，它的唯一作用是把模型的意图变成结构化 UI spec。
+    // 三个关键设计：
+    //   ① spec 就是工具参数（args），不是返回值。
+    //      前端读 step.input 渲染组件，所以大 JSON 不必塞回模型上下文（tool-result 会进下一轮），
+    //      省 token 也避免模型把同一份数据用表格再复述一遍。
+    //   ② 返回值只写"已经画好了 + 别重复"，这是给模型看的一句提示，不是给用户看的。
+    //   ③ 为什么走工具而不是让模型直接吐 JSON 到正文：工具参数天然是 JSON、有 inputSchema 约束，
+    //      而正文里塞 JSON 会把 markdown 渲染搞乱，还得再写一层解析。
+    // 注意：这里只做轻校验，真正的 props 校验在前端 web/src/ui/spec.ts ——
+    // 前端必须假设工具参数不可信（模型完全可能给出 "1,234"、"3万"、null 这类值）。
+    renderChart: tool({
+      description: `把数据画成图表展示给用户。以下情况调用：
+            1. 用户明确要求"画个图/做个图表/可视化一下"；
+            2. 你的回答里出现可比较的多组数值（如多月营收、各渠道人数、各环节耗时），
+               用表格列出来很啰嗦、看图更直观时。
+            不要调用：只有单个数值（一句话说清即可）、数据不来自用户提供的内容或检索结果（禁止编数据）。
+            调用后不要再用表格或列表重复同样的数字，用一两句话说明结论即可。`,
+      inputSchema: z.object({
+        title: z.string().min(1).max(30).describe('图表标题，如"近 6 个月营收"'),
+        // 用宽松的 string 而不是写死 enum：写死的话模型给个 "line" 会直接让工具调用报错、
+        // 整轮回答中断；宽松处理最多是"画成柱状图"，前端只认 bar。
+        type: z.string().optional().describe('图表类型，目前仅支持 bar（柱状图），省略即 bar'),
+        unit: z.string().max(8).optional().describe('数值单位，如"万元""人"；没有就省略'),
+        data: z
+          .array(
+            z.object({
+              label: z.string().min(1).max(20).describe('这一项的名称，如"1月""研发部"'),
+              value: z.number().describe('这一项的数值，必须是数字，不要带单位')
+            })
+          )
+          .min(1)
+          .max(24)
+          .describe('数据项，1~24 条；超出会被截断')
+      }),
+      async execute({ title, data }) {
+        // 只打日志，方便排查"用户说没看到图"到底是模型没调、还是前端没渲染
+        console.log(`[chart] 生成图表：${title}，${data.length} 项`)
+        return `已生成柱状图「${title}」（${data.length} 项数据）。不要再用表格或列表重复这些数字，用一两句话说明结论。`
+      }
+    }),
+
+    // ---- 外部数据：天气。真实 HTTP 调用（open-meteo，免费且无需 key）----
+    // 存在的意义有两个：① 真实回答"那边天气怎么样"；② 给多步骤计划一个能被推进的实义步骤——
+    // 没有这类工具，"查天气"那一步永远等不到 tool-result，进度条就会卡在 running 上。
+    //
+    // 超时/重试/缓存都收在 weather.js 里（有单测 server/test-weather.cjs）：
+    // 旧实现是单次 8 秒硬超时，长跑进程复用坏连接时会干等满 8 秒，模型再重试一次又是 8 秒，
+    // 用户体感就是"工具一失败，对话卡十几秒"。现在切成两次 3.5 秒，首次超时换连接重试，
+    // 失败文案还会明确告诉模型别再调用，直接把降级结论给用户。
+    getWeather: tool({
+      description: `查询某个城市未来几天的天气。用户要做出行/活动安排、问"那边天气怎么样""会不会下雨"时调用。
+            只支持未来 1~7 天，查不到历史天气。`,
+      inputSchema: z.object({
+        city: z.string().min(2).max(20).describe('城市名，如"杭州""Beijing"'),
+        days: z.number().int().min(1).max(7).optional().describe('查几天，默认 3 天')
+      }),
+      async execute({ city, days = 3 }, execCtx) {
+        // 阶段播报带上 toolCallId：前端靠它把播报挂到对应的工具卡片上。
+        // execCtx 由 AI SDK 提供，拿不到 toolCallId 时静默跳过（不影响查询本身）。
+        const toolCallId = typeof execCtx?.toolCallId === 'string' ? execCtx.toolCallId : undefined
+        // 成功返回可读文本；多次尝试仍失败会抛中文错误，由 ReAct 层转成 tool-error 卡片
+        return weatherReport(city, days, {
+          onStage: text => toolCallId && hooks.onToolProgress?.({ toolCallId, message: text })
+        })
+      }
+    }),
+
+    // ---- 多步骤计划：把任务拆成步骤，进度通过共享 state 推给前端 ----
+    // 为什么做成工具而不是让服务端自动拆分：
+    //   拆分依据是"这个任务需要几步"，只有模型知道；服务端拿不到意图，硬拆只能按字数切。
+    // 为什么进度不靠模型自己反复上报：
+    //   多一次上报就多一次模型幻觉的机会（漏报、重复报）。这里让模型只声明一次，
+    //   之后由"工具执行完成"这个客观事件驱动推进，模型无论如何都改不动进度。
+    planSteps: tool({
+      description: `把需要多步完成的任务拆成 2~6 个步骤，展示在界面上让用户看到进度。以下情况调用：
+            1. 用户的任务天然分阶段（如"规划一次三日游""从筛选简历到安排面试""先调研再给方案"）；
+            2. 你预计要连续调用 2 个以上工具才能答完。
+            不要调用：一句话能答完的问题、单次查询（查时间、算个数、单独画个图）。
+            每步的 tool 字段填这一步会用到的工具名（必须与真实工具名完全一致），进度才能自动推进；
+            这一步只是纯思考/整理、不调工具，就省略 tool。`,
+      inputSchema: z.object({
+        goal: z.string().min(2).max(40).describe('整个任务要达成的目标，如"规划杭州三日游"'),
+        steps: z
+          .array(
+            z.object({
+              title: z.string().min(2).max(24).describe('这一步做什么，如"查询杭州三天天气"'),
+              tool: z.string().optional().describe('这一步将调用的工具名；不调工具则省略')
+            })
+          )
+          .min(2)
+          .max(6)
+          .describe('步骤列表，按执行顺序排列')
+      }),
+      async execute({ goal, steps }) {
+        // 只声明，不产出内容：真正的推进由 tool-result 事件驱动（见 advancePlan）
+        hooks.onPlan?.({ goal, steps })
+        console.log(`[plan] 声明计划「${goal}」，${steps.length} 步`)
+        return `已向用户展示 ${steps.length} 步计划。请立刻开始执行第一步，不要重复声明计划，也不要在正文里再抄一遍步骤清单。`
       }
     }),
 
@@ -870,11 +988,18 @@ function collectImageFileIds(messages) {
  * AG-UI messages -> AI SDK messages（P2）。
  * 直接消费 AG-UI 的结构化历史：assistant 的 toolCalls 还原成 tool-call part，
  * role='tool' 的结果还原成 tool-result part，模型因此能看到上一轮的工具调用与结果。
+ *
+ * @param {Array} messages AG-UI 历史（客户端传入）
+ * @param {(fileId: string) => {mimeType: string, base64: string}|undefined} [resolveImage]
+ *        按 fileId 取图片。传了才会把图片还原成 file part，不传则退化成"只还原文本"。
  */
-function aguiToChatMessages(messages) {
+function aguiToChatMessages(messages, resolveImage) {
   const chatMessages = []
   // toolCallId -> toolName：AG-UI 的 tool 消息只有 toolCallId，AI SDK 的结果 part 需要 toolName
   const toolNames = new Map()
+  // 已经挂过的图片：同一张图在历史里出现两次（恢复会话会重建 attachment 块）时只挂一次，
+  // 否则同一张图被付费算两遍，模型还会把两个 file part 当成两张不同的图
+  const attachedImageIds = new Set()
 
   for (const message of messages || []) {
     if (!message) continue
@@ -919,7 +1044,37 @@ function aguiToChatMessages(messages) {
 
     if (message.role === 'user') {
       const text = aguiMessageText(message)
-      if (text.trim()) chatMessages.push({ role: 'user', content: text })
+      // 图片挂回"它上传时的那条消息"，而不是每轮都挂到最后一句。
+      //
+      // 旧做法（会话图片池 → 全量挂到最后一条 user）的后果：
+      //   ① 用户很久以前传过一张图，之后每一句提问都变成"这条消息带图"，
+      //      模型于是每轮都要先声明"图和当前问题无关，我没参考它"；
+      //   ② hasImages 恒为真，模型被永久钉在视觉模型上，推理质量按视觉模型跑；
+      //   ③ 挂的位置是"当前这句话"，语义上就不对——图从来不属于这句话。
+      // 挂回原位后：追问"这张图里是什么"照样看得见（图还在它那条消息上），
+      // 但与图无关的新提问干净了，不会被池子里的旧图污染。
+      const parts = []
+      if (text.trim()) parts.push({ type: 'text', text })
+      for (const fileId of collectImageFileIds([message])) {
+        if (attachedImageIds.has(fileId)) continue
+        const image = resolveImage?.(fileId)
+        // 取不到就静默跳过：图片有 30 天清理（image-store.pruneImages），
+        // 历史里留着 fileId 但磁盘已清的情况真实存在。宁可少一张图，
+        // 也不能让整轮请求因为拿不到 base64 而失败。
+        if (!image) continue
+        attachedImageIds.add(fileId)
+        parts.push({
+          type: 'file',
+          mediaType: image.mimeType,
+          data: { type: 'data', data: image.base64 } // AI SDK v7 用 file part 承载图片（image part 已废弃）
+        })
+      }
+      if (parts.length === 1 && parts[0].type === 'text') {
+        // 纯文本仍保持字符串形态，与改动前逐字节一致：少一层解析，日志也更好读
+        chatMessages.push({ role: 'user', content: text })
+      } else if (parts.length) {
+        chatMessages.push({ role: 'user', content: parts })
+      }
     }
   }
 
@@ -1027,6 +1182,9 @@ app.post('/agui', aguiRateLimit, async (req, res) => {
   let hasError = false
   // 本轮出现的审批类工具调用：不在流内执行，收尾时转成 interrupt
   const pendingApprovals = []
+  // toolCallId → 工具名。tool-result 事件只带 id，而计划推进需要拿名字与 step.tool 比对，
+  // 所以在 tool-call 时先记下来，比事后反查消息历史省事也更可靠
+  const toolCallNames = new Map()
   // 会话落库：正文与工具结果是服务端产出的，客户端历史里没有，必须自己收集。
   // 按"真实发生顺序"记成本轮消息数组，而不是事后再拼：
   // 一轮里可能有多段正文（工具调用前后的两段），合并成一条会出现
@@ -1146,7 +1304,20 @@ app.post('/agui', aguiRateLimit, async (req, res) => {
       console.log('[agui] resume 处理中断 %s，approved=%s', interruptId, approved)
     }
 
-    const serverTools = createTools(sessionId, userId)
+    const serverTools = createTools(sessionId, userId, {
+      // 模型声明计划时立刻下发：整数组 replace，理由见 buildPlan 上方注释
+      onPlan: ({ goal, steps }) => {
+        // 上一轮的计划不能残留：用户换了个任务时，旧步骤留在界面上会让人以为并行跑了两件事
+        const plan = buildPlan(goal, steps)
+        finalState.plan = plan
+        send({ type: 'STATE_DELTA', delta: [{ op: 'replace', path: '/plan', value: plan }] })
+      },
+      // 工具执行中的阶段播报：天气查询最长可到 7 秒（两次 3.5 秒尝试），
+      // 期间一个事件都不发的话，前端只剩"执行中"圆点在转，体感就是卡死
+      onToolProgress: ({ toolCallId, message }) => {
+        send({ type: 'CUSTOM', name: 'tool_progress', value: { toolCallId, message } })
+      }
+    })
     const approvalTools = createApprovalTools()
     const frontendTools = createFrontendTools(input.tools, { ...serverTools, ...approvalTools })
     // MCP 工具（外部 server 暴露的）：等初始化完成再取，避免首个请求拿到空集合。
@@ -1162,13 +1333,18 @@ app.post('/agui', aguiRateLimit, async (req, res) => {
     if (mcpToolNames.length) console.log('[agui] MCP 工具：%s', mcpToolNames.join(', '))
     const frontendToolNames = Object.keys(frontendTools)
     if (frontendToolNames.length) console.log('[agui] 前端工具：%s', frontendToolNames.join(', '))
-    // AG-UI 结构化历史还原成 AI SDK 消息，再交给 chat-core 统一处理
-    const chatMessages = aguiToChatMessages(aguiMessages)
     // 会话图片回填：内存会话重启即空，但历史消息里带着 fileId。
     // 缺了这一步，刷新/重启后追问"这张图里是什么"时视觉模型收不到图。
     // 按 sessionId 回填（会话归属已在附件上传时 claim 过），不信任客户端传的 userId。
+    //
+    // ⚠️ 这一步必须排在"历史还原"之前：还原时要按 fileId 就地取 base64 拼 file part，
+    // 顺序反了，服务重启后的第一个请求取不到图——而且是静默跳过，用户只觉得"模型看不见图"。
     const restoredImages = hydrateSessionImages(sessionId, collectImageFileIds(aguiMessages))
     if (restoredImages) console.log('[agui] 已从图片仓库回填 %d 张图片到会话 %s', restoredImages, sessionId)
+    // fileId -> 图片，供还原历史时"哪条消息传的图就挂回哪条"
+    const imageByFileId = new Map(getSessionImages(sessionId).map(image => [image.fileId, image]))
+    // AG-UI 结构化历史还原成 AI SDK 消息，再交给 chat-core 统一处理
+    const chatMessages = aguiToChatMessages(aguiMessages, fileId => imageByFileId.get(fileId))
     // 裁剪上下文 + 注入附件清单 + 挂载图片 + 选模型
     // 同一个对象赋给 chatStream：finally 里要拿它 await usage 记账
     const { result, meta } = chatStream = prepareChatStream({
@@ -1264,6 +1440,8 @@ app.post('/agui', aguiRateLimit, async (req, res) => {
         if (needsApproval(part.toolName)) {
           pendingApprovals.push({ toolCallId: part.toolCallId, toolName: part.toolName, input: part.input })
         }
+        // 记住 id→名字：tool-result 里只有 id，而推进计划要拿名字跟 step.tool 对
+        toolCallNames.set(part.toolCallId, part.toolName)
         send({
           type: 'TOOL_CALL_START',
           toolCallId: part.toolCallId,
@@ -1298,6 +1476,17 @@ app.post('/agui', aguiRateLimit, async (req, res) => {
           applyStateOps(finalState, ops) // 与下发同步：跟踪的 state 也要长出这些来源
           send({ type: 'STATE_DELTA', delta: ops })
         }
+        // 计划推进：这一步要用的工具执行完了，当前步骤标 done，并启动下一步。
+        // 必须排除 planSteps 自己（它也走 tool-result），否则"声明完计划"就等于"做完第一步"。
+        // 也不是所有工具都推进：advancePlan 内部会比对 step.tool，旁支工具（如 renderChart）不会顶流程。
+        const finishedTool = toolCallNames.get(part.toolCallId) || ''
+        if (finishedTool && finishedTool !== 'planSteps') {
+          const nextPlan = advancePlan(finalState.plan, finishedTool)
+          if (nextPlan) {
+            finalState.plan = nextPlan
+            send({ type: 'STATE_DELTA', delta: [{ op: 'replace', path: '/plan', value: nextPlan }] })
+          }
+        }
         // 工具结果之后，模型下一段文本属于新的 assistant 消息
         currentAssistantId = null
         assistantTextStarted = false
@@ -1325,6 +1514,15 @@ app.post('/agui', aguiRateLimit, async (req, res) => {
           name: 'tool_error',
           value: { toolCallId: part.toolCallId, message: errorMessage }
         })
+        // 计划里对应的那一步标 failed：用户需要知道"卡在哪一步"，而不是看到进度条原地打转
+        const failedTool = toolCallNames.get(part.toolCallId) || ''
+        if (failedTool && failedTool !== 'planSteps') {
+          const failedPlan = advancePlan(finalState.plan, failedTool, true)
+          if (failedPlan) {
+            finalState.plan = failedPlan
+            send({ type: 'STATE_DELTA', delta: [{ op: 'replace', path: '/plan', value: failedPlan }] })
+          }
+        }
         currentAssistantId = null
         assistantTextStarted = false
         currentTextMsg = null
@@ -1382,7 +1580,18 @@ app.post('/agui', aguiRateLimit, async (req, res) => {
         // fire-and-forget 不 await：通知不能拖慢本次响应的收尾
         dispatchWebhook(userId, 'approval.pending', { threadId, runId, interrupts })
       } else {
+        // 收尾：模型说完了，但计划里可能还有没轮到的步骤。
+        // hasText 决定"纯写作步骤"算不算做完——判据是本轮有没有产出非空正文。
+        const hasText = runMessages.some(
+          msg => msg.role === 'assistant' && typeof msg.content === 'string' && msg.content.trim()
+        )
+        const settledPlan = settlePlan(finalState.plan, hasText)
         const doneOps = [{ op: 'replace', path: '/phase', value: 'done' }]
+        if (settledPlan) {
+          finalState.plan = settledPlan
+          // 顺序有意义：先下发 plan 再下发 phase，前端看到 phase=done 时计划已经是最终态
+          doneOps.unshift({ op: 'replace', path: '/plan', value: settledPlan })
+        }
         applyStateOps(finalState, doneOps)
         send({ type: 'STATE_DELTA', delta: doneOps })
         send({ type: 'RUN_FINISHED', threadId, runId })
